@@ -94,7 +94,7 @@ atravessam a spec inteira:
 | AD-30 | Criptografia | Coluna sensível cifrada na aplicação + TLS + disco | Protege contra dump de banco e backup vazado, não só contra roubo de máquina. Custo: campo cifrado não é agregável em SQL (§22.2). |
 | AD-31 | Avaliação | LLM-as-judge desde a primeira PR de código; bloqueia apenas segurança e fidelidade numérica | Judge tem variância; bloquear tudo produziria CI vermelho por ruído e corroeria a confiança no sinal. |
 | AD-32 | Eval de recomendação | Validadores determinísticos + judge só para o qualitativo | Restrição (equipamento, lesão, catálogo, volume) é verificável por código. Judge só onde não há gabarito. |
-| AD-33 | Clarificação | Exercício + carga + reps obrigatórios em musculação; uma pergunta agregada | Sem reps ou carga a série não entra em nenhum cálculo. Peso corporal e outros `set_type` têm requisitos próprios (§9.7). |
+| AD-33 | Clarificação | Carga obrigatória **só** em musculação com peso externo; peso corporal exige reps, corrida exige duração | Exigir carga em barra fixa ou corrida seria pergunta sem informação. Uma pergunta agregada quando falta mais de um campo (§9.7). |
 | AD-34 | Formato de saída | Split por unidade de ideia, máx. 3 bolhas | Conversa, não relatório. Teto de 3 porque cada bolha é uma notificação (§13.6). |
 | AD-35 | Retry de envio | Política por classe de erro, não retry cego | Metade dos erros da Cloud API não melhora com repetição e alguns duplicam mensagem (§18.5). |
 | AD-36 | Progressão | Texto sob demanda + gráfico PNG + resumo semanal | Três formatos, as mesmas tools; nenhum recalcula (§16.3). |
@@ -466,7 +466,7 @@ CREATE TABLE exercise_set (
 
     CONSTRAINT ck_set_payload CHECK (
         (set_type = 'strength'  AND reps IS NOT NULL)
-     OR (set_type = 'cardio'    AND (distance_m IS NOT NULL OR duration_s IS NOT NULL))
+     OR (set_type = 'cardio'    AND duration_s IS NOT NULL)   -- distância é opcional (§9.7)
      OR (set_type = 'isometric' AND hold_s IS NOT NULL)
      OR (set_type = 'interval'  AND rounds IS NOT NULL)
     ),
@@ -1383,42 +1383,54 @@ linha morta no banco.
 A regra é a mesma que o `CHECK ck_set_payload` (§5.2) já impõe no banco — o agente apenas a aplica
 antes, com uma pergunta em vez de um erro.
 
-| `set_type` | Obrigatórios | Opcionais |
-| --- | --- | --- |
-| `strength` | exercício, **carga**, **reps** | RPE, descanso, técnica, lado |
-| `cardio` | exercício, **distância ou duração** | pace, elevação, FC |
-| `isometric` | exercício, **duração da isometria** | carga (lastro), RPE |
-| `interval` | exercício, **rounds** | duração por round, descanso |
+**A carga só é obrigatória em musculação com peso externo.** Ela não faz sentido em peso corporal
+nem em corrida, e exigi-la ali produziria pergunta sem informação.
 
-**Recorte de peso corporal.** Em exercício cujo `equipment = 'peso_corporal'` (barra fixa, flexão,
-paralela), `load_kg` nulo **é** a resposta — o peso é o do próprio usuário. Perguntar "qual o
-peso?" a cada barra fixa seria atrito sem informação. Se o usuário usou lastro, ele diz
-("barra fixa com 10kg"), e aí a carga é registrada como lastro.
+| Caso | `set_type` | Obrigatórios | Opcionais |
+| --- | --- | --- | --- |
+| Musculação com peso externo | `strength` | exercício, **carga**, **reps** | RPE, descanso, técnica, lado |
+| Peso corporal (barra fixa, flexão) | `strength` | exercício, **reps** | lastro, RPE, descanso |
+| Corrida e cardio | `cardio` | exercício, **duração** | distância, pace, elevação, FC |
+| Isometria (prancha) | `isometric` | exercício, **duração da isometria** | lastro, RPE |
+| Intervalado | `interval` | exercício, **rounds** | duração por round, descanso |
+
+**Como o sistema sabe que é peso corporal.** Pelo catálogo: o exercício resolvido tem
+`equipment = 'peso_corporal'` (§5.2). Não é inferência do LLM — é consulta ao dado já resolvido
+pelo `exercise_resolver`, que roda antes da clarificação. Se o usuário usou lastro, ele diz
+("barra fixa com 10kg"), e a carga é registrada como lastro em vez de peso movido.
 
 #### Exemplos
 
 ```
 "Supino com 80 kg"
-   strength, falta reps                      → PERGUNTA
+   peso externo, falta reps                  → PERGUNTA
    "Quantas repetições?"
 
 "Supino 3x8"
-   strength, falta carga                     → PERGUNTA
+   peso externo, falta carga                 → PERGUNTA
    "Qual o peso?"
 
 "Fiz supino"
-   strength, faltam carga E reps             → PERGUNTA ÚNICA
+   peso externo, faltam carga E reps         → PERGUNTA ÚNICA
    "Quantos kg e quantas repetições?"
 
 "Barra fixa 8 reps"
-   strength, equipment=peso_corporal         → GRAVA
-   carga nula é legítima
+   equipment=peso_corporal, tem reps         → GRAVA
+   carga não é pedida
+
+"Fiz barra fixa"
+   equipment=peso_corporal, falta reps       → PERGUNTA
+   "Quantas repetições?"        (nunca pergunta o peso)
 
 "Prancha 60 segundos"
    isometric, tem hold_s                     → GRAVA
 
+"Corri 40 minutos"
+   cardio, tem duração                       → GRAVA
+
 "Corri 5km"
-   cardio, tem distância                     → GRAVA
+   cardio, tem distância mas falta duração   → PERGUNTA
+   "Em quanto tempo?"          (nunca pergunta o peso)
 ```
 
 #### Uma pergunta, não uma sequência
