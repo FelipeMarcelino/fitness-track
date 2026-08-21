@@ -2880,7 +2880,8 @@ fitness-track/
 ## 24. Roadmap de entrega
 
 O desenho completo está nesta spec. As fases abaixo são uma sugestão de ordem de construção —
-nada sai do escopo, apenas se distribui no tempo.
+nada sai do escopo, apenas se distribui no tempo. Cada fase é fatiada em sprints de 2 semanas
+em `doc/sprints/`; uma fase só é dada por concluída quando seu critério de saída é atingido.
 
 ### Fase 1.0 — Registro confiável (fundação)
 
