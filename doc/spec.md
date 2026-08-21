@@ -419,7 +419,8 @@ CREATE INDEX ix_session_tenant_date ON workout_session(tenant_id, local_date DES
 CREATE INDEX ix_session_open_activity
     ON workout_session(last_activity_at) WHERE status = 'open';
 
-CREATE TYPE set_type AS ENUM ('strength', 'cardio', 'isometric', 'interval');
+CREATE TYPE set_type   AS ENUM ('strength', 'cardio', 'isometric', 'interval');
+CREATE TYPE set_status AS ENUM ('complete', 'incomplete');
 
 CREATE TABLE exercise_set (
     id              BIGSERIAL PRIMARY KEY,
@@ -455,6 +456,10 @@ CREATE TABLE exercise_set (
     technique       TEXT,                       -- dropset | restpause | cluster | normal
 
     -- proveniência e auditoria
+    status          set_status NOT NULL DEFAULT 'complete',
+    -- Copiado de exercise.equipment na gravação. Denormalizado porque um
+    -- CHECK não pode consultar outra tabela, e a regra da §9.7 depende dele.
+    is_bodyweight   BOOLEAN NOT NULL DEFAULT false,
     inferred        BOOLEAN NOT NULL DEFAULT false,  -- expandido de "3x10", não dito série a série
     confidence      NUMERIC(3,2) NOT NULL DEFAULT 1.00,
     low_confidence  BOOLEAN GENERATED ALWAYS AS (confidence < 0.75) STORED,
@@ -464,8 +469,13 @@ CREATE TABLE exercise_set (
     deleted_at      TIMESTAMPTZ,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
 
+    -- O CHECK só vale para linhas COMPLETAS. Série cujo esclarecimento expirou
+    -- (§8.6) entra como 'incomplete' e fica de fora das análises — o dado do
+    -- usuário nunca é descartado, mas também nunca contamina cálculo.
     CONSTRAINT ck_set_payload CHECK (
-        (set_type = 'strength'  AND reps IS NOT NULL)
+        status = 'incomplete'
+     OR (set_type = 'strength'  AND reps IS NOT NULL
+                                AND (is_bodyweight OR load_kg IS NOT NULL))
      OR (set_type = 'cardio'    AND duration_s IS NOT NULL)   -- distância é opcional (§9.7)
      OR (set_type = 'isometric' AND hold_s IS NOT NULL)
      OR (set_type = 'interval'  AND rounds IS NOT NULL)
@@ -481,6 +491,10 @@ CREATE INDEX ix_set_tenant_exercise ON exercise_set(tenant_id, exercise_id, crea
 -- Idempotência de reprocessamento (§17.4). NULLS NOT DISTINCT (PG15+) é
 -- obrigatório: sem ele, séries com source_message_id nulo escapariam da
 -- unicidade e o retry de um batch duplicaria o volume do treino.
+-- Fila de revisão: séries que ficaram incompletas por timeout de esclarecimento
+CREATE INDEX ix_set_incomplete ON exercise_set(tenant_id, created_at DESC)
+    WHERE status = 'incomplete' AND deleted_at IS NULL;
+
 CREATE UNIQUE INDEX ux_set_idempotency
     ON exercise_set (session_id, exercise_id, set_index, source_message_id)
     NULLS NOT DISTINCT
@@ -494,7 +508,9 @@ SELECT s.*,
        CASE WHEN s.reps BETWEEN 1 AND 12 AND s.load_kg > 0
             THEN s.load_kg * (1 + s.reps::numeric / 30) END AS e1rm_epley
 FROM exercise_set s
-WHERE s.deleted_at IS NULL AND s.is_warmup = false;
+WHERE s.deleted_at IS NULL
+  AND s.is_warmup = false
+  AND s.status = 'complete';   -- incompletas nunca entram em cálculo
 
 CREATE TABLE session_summary (
     session_id      BIGINT PRIMARY KEY REFERENCES workout_session(id) ON DELETE CASCADE,
@@ -709,16 +725,36 @@ CREATE TABLE usage_ledger (
 CREATE INDEX ix_usage_tenant_time ON usage_ledger(tenant_id, occurred_at DESC);
 
 CREATE TABLE outbound_queue (
-    id           BIGSERIAL PRIMARY KEY,
-    tenant_id    BIGINT NOT NULL REFERENCES tenant(id) ON DELETE CASCADE,
-    kind         TEXT NOT NULL,      -- text | reaction | interactive | template
-    payload      JSONB NOT NULL,
-    scheduled_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    sent_at      TIMESTAMPTZ,
-    attempts     SMALLINT NOT NULL DEFAULT 0,
-    last_error   TEXT
+    id            BIGSERIAL PRIMARY KEY,
+    tenant_id     BIGINT NOT NULL REFERENCES tenant(id) ON DELETE CASCADE,
+    kind          TEXT NOT NULL,      -- text | reaction | interactive | template | media
+    payload       JSONB NOT NULL,
+
+    -- Split em bolhas (§13.6): as bolhas de uma mesma resposta compartilham
+    -- group_id e são enviadas em ordem de seq. Sem isso, um restart do worker
+    -- não saberia quais já saíram, e o retry reenviaria o prefixo ou perderia
+    -- o sufixo.
+    group_id      UUID NOT NULL,
+    seq           SMALLINT NOT NULL DEFAULT 0,
+
+    -- scheduled_at = quando PODE sair pela primeira vez (agendamento).
+    -- next_retry_at = quando pode ser TENTADA de novo após falha (backoff).
+    -- Elegível para envio quando ambas já passaram.
+    scheduled_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    next_retry_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    sent_at       TIMESTAMPTZ,
+    attempts      SMALLINT NOT NULL DEFAULT 0,
+    error_code    TEXT,               -- código da Cloud API na última falha
+    retryable     BOOLEAN,            -- classificação do erro (§18.5)
+    last_error    TEXT,
+    dead_at       TIMESTAMPTZ,        -- desistiu; não tenta mais
+
+    UNIQUE (group_id, seq)
 );
-CREATE INDEX ix_outbound_pending ON outbound_queue(scheduled_at) WHERE sent_at IS NULL;
+-- Pendente e elegível: nada agendado para o futuro, nada em backoff, nada morto
+CREATE INDEX ix_outbound_pending
+    ON outbound_queue(scheduled_at, next_retry_at, group_id, seq)
+    WHERE sent_at IS NULL AND dead_at IS NULL;
 
 -- Janela de 24h da Cloud API: última mensagem recebida do usuário.
 -- `timestamptz + interval` é STABLE (sensível a fuso/DST) e coluna gerada
@@ -1077,8 +1113,10 @@ que carreguem região com `health_report` ativo, ou que exijam equipamento fora 
   é entregue via `Command(resume=...)` no próximo batch.
 - **TTL de interrupt:** ao pausar, grava-se `interrupt_expires_at` em Redis
   (`interrupt:{tenant_id}`, TTL 20min). O scheduler varre expirados a cada minuto, retoma o grafo
-  com `Command(resume={"timeout": True})` e o `persistence` grava com `confidence` do melhor
-  palpite e `low_confidence = true`.
+  com `Command(resume={"timeout": True})` e o `persistence` grava a série com
+  `status = 'incomplete'`. Ela fica fora de toda análise (a view `v_set_volume` filtra por
+  `status = 'complete'`) e entra na fila de revisão, onde o usuário pode completá-la depois
+  ("aquele supino era 8 reps"). O dado nunca é descartado, mas também nunca contamina cálculo.
 - **Colisão:** se chegar uma mensagem que **não** responde ao esclarecimento enquanto há interrupt
   pendente, o supervisor detecta (o estado tem `pending_clarification`) e decide: se a nova
   mensagem contém o dado faltante, retoma; senão, descarta o interrupt com o melhor palpite e
@@ -1380,8 +1418,10 @@ linha morta no banco.
 
 #### Campos obrigatórios por tipo de série
 
-A regra é a mesma que o `CHECK ck_set_payload` (§5.2) já impõe no banco — o agente apenas a aplica
-antes, com uma pergunta em vez de um erro.
+A regra do agente e o `CHECK ck_set_payload` (§5.2) são **a mesma regra em dois pontos**: o agente
+pergunta antes; o banco recusa depois. A carga entra no CHECK via `is_bodyweight`, coluna
+denormalizada do catálogo na gravação — um CHECK não pode consultar `exercise.equipment`, então a
+condição de peso corporal precisa viajar junto com a linha.
 
 **A carga só é obrigatória em musculação com peso externo.** Ela não faz sentido em peso corporal
 nem em corrida, e exigi-la ali produziria pergunta sem informação.
@@ -1444,8 +1484,8 @@ uma interrupção. Perguntar campo a campo dobraria o atrito no pior momento pos
 | Regra | Valor | Motivo |
 | --- | --- | --- |
 | Perguntas por rajada | máx. 1 | Rajada com 4 séries incompletas gera **uma** pergunta agregada, não quatro |
-| Tentativas por série | 1 | Se a resposta ainda não resolver, grava `low_confidence` e segue |
-| TTL do `interrupt` | 20 min | §8.6; expirou, grava o melhor palpite marcado |
+| Tentativas por série | 1 | Se a resposta ainda não resolver, grava `status='incomplete'` e segue |
+| TTL do `interrupt` | 20 min | §8.6; expirou, grava `status='incomplete'` com o que veio |
 | Durante sessão ativa | pergunta curta, sem preâmbulo | O usuário está entre séries |
 
 Se a mesma rajada trouxer séries completas e incompletas, **as completas são gravadas de imediato**
@@ -1617,17 +1657,19 @@ tools SQL têm o `tenant_id` injetado pelo código — nunca vindo do LLM.
 {"kind": "error",        "code": "quota_exceeded"}
 {"kind": "health_notice","region": "ombro_direito"}
 {"kind": "celebration",  "pr": {"exercise": "...", "old": 60, "new": 65}}
+{"kind": "progress",     "series": [...], "chart_path": "/tmp/progress_<uuid>.png"}
 ```
 
 **Saída:**
 
 ```python
 class VoiceOutput(BaseModel):
-    mode: Literal["reaction","text","interactive","silent"]
+    mode: Literal["reaction","text","interactive","image","silent"]
     emoji: str | None            # quando mode="reaction"
-    text: str | None             # quando mode="text"
+    text: str | None             # quando mode="text"; legenda quando mode="image"
     buttons: list[str] | None    # quando mode="interactive", máx. 3
-    split: list[str] | None      # quando o texto exceder 1 mensagem
+    image_path: str | None       # quando mode="image": caminho local do PNG (§16.3)
+    split: list[str] | None      # bolhas do split (§13.6)
 ```
 
 ### 13.2 Regra de decisão do `ack_mode` (AD-13)
@@ -1737,7 +1779,7 @@ usuário responder (o que reabre a janela).
 | --- | --- | --- | --- |
 | `retomada_treino` | UTILITY | "Oi {{1}}! Faz {{2}} dias desde seu último treino. Quer retomar?" | Ausência ≥ 7 dias |
 | `insight_disponivel` | UTILITY | "Oi {{1}}, preparei uma análise do seu último ciclo de treino. Quer ver?" | Platô, deload, auditoria de volume |
-| `resumo_semanal` | UTILITY | "Seu resumo da semana está pronto: {{1}} treinos, {{2}} kg de volume. Quer os detalhes?" | Domingo à noite (opt-in) |
+| `resumo_semanal` | UTILITY | "Seu resumo da semana está pronto: {{1}} treinos, {{2}} kg de volume. Quer os detalhes?" | Segunda de manhã, no fuso do tenant (opt-in) — ver §16.3 |
 | `checkin_lesao` | UTILITY | "Oi {{1}}, como está o {{2}}? Melhorou?" | 7 dias após `health_report` |
 
 ### 14.3 Fluxo proativo
@@ -2108,6 +2150,29 @@ Authorization: Bearer {WABA_TOKEN}
    "components":[{"type":"body","parameters":[{"type":"text","text":"Felipe"},...]}]}}
 ```
 
+#### Envio de mídia
+
+O gráfico da §16.3 exige dois passos, porque a Cloud API não aceita bytes inline: primeiro sobe a
+imagem e recebe um `media_id`, depois envia a mensagem referenciando esse id.
+
+```python
+# 1. upload — multipart, expira em 30 dias do lado da Meta
+POST https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/media
+     messaging_product=whatsapp, type=image/png, file=@progress_<uuid>.png
+     → {"id": "<media_id>"}
+
+# 2. envio, com legenda
+{"messaging_product":"whatsapp","to":bsuid,"type":"image",
+ "image":{"id":"<media_id>","caption":"Supino reto — 12 semanas"}}
+```
+
+O `deliver` faz o upload e só então enfileira o `kind = 'media'` com o `media_id` no payload —
+nunca o caminho local, que não sobrevive a restart do worker. O PNG em `/tmp` é apagado logo após
+o upload; se o envio falhar depois disso, o retry reusa o `media_id`, que continua válido.
+
+Falha no upload degrada para texto: o `voice_agent` já produziu a legenda, e uma resposta sem
+gráfico é melhor que nenhuma.
+
 ### 18.5 Falha e retry
 
 "A mensagem falhou" quer dizer duas coisas diferentes, com tratamentos opostos.
@@ -2136,21 +2201,36 @@ melhora com repetição, e alguns pioram (mensagem duplicada). A política é po
 | `5xx` / timeout | Falha transitória da Meta | Repete com backoff, até 5 tentativas |
 | `100` / `132000` | Payload inválido, template malformado | **Não** repete. Bug nosso; loga com o payload e alerta |
 
-```sql
-ALTER TABLE outbound_queue
-    ADD COLUMN error_code   TEXT,
-    ADD COLUMN retryable    BOOLEAN,
-    ADD COLUMN next_retry_at TIMESTAMPTZ,
-    ADD COLUMN dead_at      TIMESTAMPTZ;   -- desistiu; não tenta mais
-CREATE INDEX ix_outbound_retry
-    ON outbound_queue(next_retry_at) WHERE sent_at IS NULL AND dead_at IS NULL;
-```
+As colunas que sustentam isso (`error_code`, `retryable`, `next_retry_at`, `dead_at`, `group_id`,
+`seq`) já fazem parte da definição canônica de `outbound_queue` na §5.2 — não há migração a
+aplicar. `scheduled_at` responde "quando pode sair pela primeira vez"; `next_retry_at` responde
+"quando pode ser tentada de novo". Uma mensagem é elegível quando **ambas** já passaram.
 
 **Backoff:** 2s, 8s, 32s, 2min, 8min, com jitter de ±25% para não sincronizar retries de tenants
 diferentes após uma queda da Meta.
 
-**Ordem preservada.** Se uma bolha de um split falha, as seguintes **não** são enviadas — sairiam
-fora de ordem e sem contexto. Todas ficam pendentes e o lote inteiro é retomado do ponto que falhou.
+**Ordem preservada, e persistida.** As bolhas de uma resposta compartilham `group_id` e têm `seq`
+crescente. A bolha `seq = n+1` só é elegível quando a `seq = n` do mesmo grupo tem `sent_at`
+preenchido. Isso sobrevive a restart do worker: o estado de entrega está no banco, não em
+memória, então o retry retoma exatamente do ponto que falhou sem reenviar o prefixo nem perder
+o sufixo.
+
+```sql
+-- Próxima bolha elegível de um grupo
+SELECT * FROM outbound_queue q
+ WHERE q.sent_at IS NULL AND q.dead_at IS NULL
+   AND q.scheduled_at <= now() AND q.next_retry_at <= now()
+   AND NOT EXISTS (SELECT 1 FROM outbound_queue prev
+                    WHERE prev.group_id = q.group_id
+                      AND prev.seq < q.seq
+                      AND prev.sent_at IS NULL
+                      AND prev.dead_at IS NULL)
+ ORDER BY q.group_id, q.seq
+   FOR UPDATE SKIP LOCKED;
+```
+
+Se uma bolha vira `dead`, as seguintes do grupo também são marcadas `dead` — metade de uma
+resposta é pior que nenhuma.
 
 **Dead letter.** Mensagem que esgota as tentativas ou recebe erro não repetível ganha `dead_at` e
 sai da fila. Um job diário reporta os `dead` por `error_code`: uma classe crescendo é sintoma de
