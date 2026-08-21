@@ -21,6 +21,8 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 KEY_BYTES: Final = 32  # AES-256
 NONCE_BYTES: Final = 12  # GCM standard; 96 bits is what the mode is built for
+VERSION_BYTES: Final = 2  # big-endian key version, prefixed to every blob
+MIN_BLOB_BYTES: Final = VERSION_BYTES + NONCE_BYTES + 16  # + GCM tag
 
 
 class DecryptionError(Exception):
@@ -80,26 +82,54 @@ class Encryptor:
     def encrypt(self, plaintext: str) -> tuple[bytes, int]:
         """Returns the stored blob and the key version that produced it.
 
+        Layout: version (2 bytes, big endian) || nonce (12) || ciphertext+tag.
+        The version travels inside the blob so decryption never depends on a
+        caller passing the right one. The key_version column still exists,
+        for a different job: it is what the rotation query filters on to find
+        rows that still need rewriting.
+
         The nonce is random per call and prefixed to the ciphertext. A fixed or
         counter nonce would make ciphertext deterministic, and then anyone with
         read access could tell which rows share a value -- how many users
         reported the same injury, say -- without decrypting anything. Under GCM
         a repeated nonce is worse than that: it breaks the mode outright.
         """
+        version = self._ring.current_version
         nonce = os.urandom(NONCE_BYTES)
         cipher = AESGCM(self._ring.current)
-        blob = nonce + cipher.encrypt(nonce, plaintext.encode("utf-8"), None)
-        return blob, self._ring.current_version
+        body = cipher.encrypt(nonce, plaintext.encode("utf-8"), None)
+        return version.to_bytes(VERSION_BYTES, "big") + nonce + body, version
 
-    def decrypt(self, blob: bytes, key_version: int) -> str:
-        key = self._ring.get(key_version)
-        nonce, ciphertext = blob[:NONCE_BYTES], blob[NONCE_BYTES:]
+    def decrypt(self, blob: bytes, key_version: int | None = None) -> str:
+        """`key_version` is accepted for callers that hold the column value,
+        but the blob's own prefix wins: a row written under key 1 must decrypt
+        after the ring advances to 2, and trusting the caller made that fail.
+        """
+        if len(blob) < MIN_BLOB_BYTES:
+            raise DecryptionError(
+                f"blob is {len(blob)} bytes, too short to be a valid value; "
+                f"the column is truncated or corrupt"
+            )
+
+        embedded = int.from_bytes(blob[:VERSION_BYTES], "big")
+        if key_version is not None and key_version != embedded:
+            raise DecryptionError(
+                f"key version mismatch: column says {key_version}, blob says "
+                f"{embedded}; the row was rewritten without updating the column"
+            )
+
+        key = self._ring.get(embedded)
+        nonce = blob[VERSION_BYTES : VERSION_BYTES + NONCE_BYTES]
+        ciphertext = blob[VERSION_BYTES + NONCE_BYTES :]
         try:
             plaintext = AESGCM(key).decrypt(nonce, ciphertext, None)
         except InvalidTag as exc:
             raise DecryptionError(
                 "ciphertext failed authentication: wrong key or tampered value"
             ) from exc
+        except ValueError as exc:
+            # AESGCM raises ValueError, not InvalidTag, for a malformed nonce.
+            raise DecryptionError(f"malformed ciphertext: {exc}") from exc
         return plaintext.decode("utf-8")
 
     def encrypt_json(self, value: Any) -> tuple[bytes, int]:
@@ -111,5 +141,5 @@ class Encryptor:
         """
         return self.encrypt(json.dumps(value, sort_keys=True, ensure_ascii=False))
 
-    def decrypt_json(self, blob: bytes, key_version: int) -> Any:
+    def decrypt_json(self, blob: bytes, key_version: int | None = None) -> Any:
         return json.loads(self.decrypt(blob, key_version))

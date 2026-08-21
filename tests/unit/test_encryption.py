@@ -115,3 +115,36 @@ def test_keyring_rejects_a_key_of_the_wrong_size() -> None:
 def test_keyring_requires_the_current_version_to_exist() -> None:
     with pytest.raises(ValueError, match="current_version"):
         KeyRing({1: KEY_V1}, current_version=2)
+
+
+def test_blob_carries_its_own_key_version() -> None:
+    """Decryption must not depend on the caller passing the right version.
+
+    The earlier design read the ring's current version, so every row written
+    before a rotation stopped decrypting the moment the ring advanced -- with
+    the old key still present and perfectly usable.
+    """
+    old = Encryptor(KeyRing({1: KEY_V1}, current_version=1))
+    blob, _ = old.encrypt("escrito sob a chave 1")
+
+    rotated = Encryptor(KeyRing({1: KEY_V1, 2: KEY_V2}, current_version=2))
+
+    assert rotated.decrypt(blob) == "escrito sob a chave 1"
+
+
+def test_column_version_disagreeing_with_the_blob_is_an_error(
+    encryptor: Encryptor,
+) -> None:
+    """Silence here would hide a half-finished rotation."""
+    blob, _ = encryptor.encrypt("x")
+
+    with pytest.raises(DecryptionError, match="mismatch"):
+        encryptor.decrypt(blob, 2)
+
+
+@pytest.mark.parametrize("size", [0, 1, 12, 25])
+def test_truncated_blob_raises_decryption_error(encryptor: Encryptor, size: int) -> None:
+    """A short blob makes AESGCM raise ValueError, not InvalidTag. Callers
+    catch DecryptionError, so an unnormalised ValueError escapes the contract."""
+    with pytest.raises(DecryptionError):
+        encryptor.decrypt(b"\x00" * size)
