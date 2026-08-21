@@ -2771,6 +2771,12 @@ UPDATE health_report
 2. **A RLS continua funcionando**, porque filtra por `tenant_id`, que não é cifrado.
 3. **Índice sobre campo cifrado é inútil** — remover qualquer um que exista sobre essas colunas.
 
+**Formato do blob.** `versão (2 bytes, big endian) || nonce (12) || ciphertext+tag`. A versão
+viaja **dentro** do blob para que a decifra nunca dependa de alguém passar a versão certa; a
+coluna `key_version` continua existindo, mas para outro trabalho — é por ela que o job de
+rotação filtra as linhas que ainda faltam reescrever. Divergência entre as duas é erro, não
+silêncio: indica rotação pela metade.
+
 **Gestão de chave.** Chave mestra em variável de ambiente (`FITTRACK_ENCRYPTION_KEY`, 32 bytes
 base64), carregada uma vez na inicialização e nunca logada. `key_version` na linha permite rotação
 progressiva: nova chave passa a cifrar escritas novas enquanto um job reescreve o histórico em
