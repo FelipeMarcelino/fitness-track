@@ -43,9 +43,9 @@ async def buffer(client: aioredis.Redis) -> BurstBuffer:
 
 
 async def test_one_message_becomes_one_batch(buffer: BurstBuffer) -> None:
-    await buffer.push("B1", {"message_id": "m1", "text": "supino 80x8"})
+    await buffer.push("B1", {"message_id": "m1", "text": "supino 80x8"}, now=0.0)
 
-    batch = await buffer.drain("B1", batch_id="b1")
+    batch = await buffer.drain("B1", batch_id="b1", now=WINDOW + 1)
 
     assert [m["message_id"] for m in batch] == ["m1"]
 
@@ -53,9 +53,9 @@ async def test_one_message_becomes_one_batch(buffer: BurstBuffer) -> None:
 async def test_a_burst_becomes_a_single_batch(buffer: BurstBuffer) -> None:
     """The case from §4: four fragments typed between sets."""
     for i, text in enumerate(["supino reto", "10kg", "8 reps", "foi facil"]):
-        await buffer.push("B2", {"message_id": f"m{i}", "text": text})
+        await buffer.push("B2", {"message_id": f"m{i}", "text": text}, now=i * 2.0)
 
-    batch = await buffer.drain("B2", batch_id="b2")
+    batch = await buffer.drain("B2", batch_id="b2", now=6.0 + WINDOW + 1)
 
     assert [m["text"] for m in batch] == ["supino reto", "10kg", "8 reps", "foi facil"]
 
@@ -77,7 +77,7 @@ async def test_the_window_renews_on_every_message(buffer: BurstBuffer) -> None:
     # 36 + 10: the window closed on the last message, not the first
     assert await buffer.is_ready("B3", now=now + 46)
 
-    batch = await buffer.drain("B3", batch_id="b3")
+    batch = await buffer.drain("B3", batch_id="b3", now=now + 46)
     assert len(batch) == 6
 
 
@@ -116,16 +116,25 @@ async def test_a_message_arriving_during_the_drain_is_not_lost(
             self._injected = False
 
         async def _inject(self, buffer_key: str) -> None:
-            """ingress writing while the worker drains."""
-            if not self._injected:
-                self._injected = True
-                await self._inner.rpush(buffer_key, json.dumps({"message_id": "late"}))
+            """ingress writing while the worker drains.
 
-        async def rename(self, source: str, target: str) -> object:
-            """The correct path: the write lands after an atomic move, so it
-            goes into a fresh buffer and is picked up by the next drain."""
-            result = await self._inner.rename(source, target)
-            await self._inject(source)
+            A real push, deadline included: a message whose deadline is missing
+            is never considered ready, so injecting the list entry alone would
+            make the assertion fail for the wrong reason.
+            """
+            if self._injected:
+                return
+            self._injected = True
+            bsuid = buffer_key.removeprefix("buffer:")
+            await self._inner.rpush(buffer_key, json.dumps({"message_id": "late"}))
+            await self._inner.set(f"deadline:{bsuid}", 0)
+
+        async def eval(self, script: str, numkeys: int, *args: object) -> object:
+            """The correct path: the claim is one atomic script, so the write
+            lands entirely before or entirely after it. Either way it survives
+            -- included in this batch, or waiting in a fresh buffer."""
+            result = await self._inner.eval(script, numkeys, *args)
+            await self._inject(str(args[0]))
             return result
 
         async def lrange(self, key: str, start: int, end: int) -> list[str]:
@@ -140,10 +149,10 @@ async def test_a_message_arriving_during_the_drain_is_not_lost(
             return getattr(self._inner, name)
 
     buffer = BurstBuffer(InterleavingRedis(client), window_seconds=WINDOW)  # type: ignore[arg-type]
-    await buffer.push("B5", {"message_id": "early"})
+    await buffer.push("B5", {"message_id": "early"}, now=0.0)
 
-    first = await buffer.drain("B5", batch_id="b5")
-    second = await buffer.drain("B5", batch_id="b5b")
+    first = await buffer.drain("B5", batch_id="b5", now=WINDOW + 1)
+    second = await buffer.drain("B5", batch_id="b5b", now=2 * WINDOW + 3)
 
     delivered = [m["message_id"] for m in first + second]
     assert "early" in delivered
@@ -153,26 +162,74 @@ async def test_a_message_arriving_during_the_drain_is_not_lost(
 async def test_draining_an_empty_buffer_yields_nothing(buffer: BurstBuffer) -> None:
     """A flush job that fires after another worker already drained must not
     create an empty batch, which would cost an LLM call to produce nothing."""
-    assert await buffer.drain("B6", batch_id="b6") == []
+    assert await buffer.drain("B6", batch_id="b6", now=WINDOW + 1) == []
 
 
 async def test_orphan_drain_keys_are_reclaimed(buffer: BurstBuffer, client: aioredis.Redis) -> None:
     """A worker that dies between RENAME and DEL leaves the batch in a drain
     key. Without reclamation those messages are stranded: they are out of the
     buffer, so no flush will ever pick them up again."""
-    await buffer.push("B7", {"message_id": "m1"})
+    await buffer.push("B7", {"message_id": "m1"}, now=0.0)
     await client.rename(buffer.buffer_key("B7"), buffer.drain_key("B7", "dead"))
 
     reclaimed = await buffer.reclaim_orphans()
 
     assert reclaimed == 1
-    batch = await buffer.drain("B7", batch_id="b7")
+    batch = await buffer.drain("B7", batch_id="b7", now=WINDOW + 1)
     assert [m["message_id"] for m in batch] == ["m1"]
 
 
 async def test_buffers_of_different_users_do_not_mix(buffer: BurstBuffer) -> None:
-    await buffer.push("A", {"message_id": "a1"})
-    await buffer.push("B", {"message_id": "b1"})
+    await buffer.push("A", {"message_id": "a1"}, now=0.0)
+    await buffer.push("B", {"message_id": "b1"}, now=0.0)
+    later = WINDOW + 1
 
-    assert [m["message_id"] for m in await buffer.drain("A", batch_id="x")] == ["a1"]
-    assert [m["message_id"] for m in await buffer.drain("B", batch_id="y")] == ["b1"]
+    assert [m["message_id"] for m in await buffer.drain("A", "x", now=later)] == ["a1"]
+    assert [m["message_id"] for m in await buffer.drain("B", "y", now=later)] == ["b1"]
+
+
+async def test_a_push_between_claim_and_cleanup_keeps_its_deadline(
+    buffer: BurstBuffer, client: aioredis.Redis
+) -> None:
+    """Claiming used to be three commands: check readiness, rename, delete the
+    deadline. A push landing between the rename and the delete had its
+    brand-new deadline deleted, and the message then sat in the buffer with
+    is_ready false forever -- drained only if some later message happened to
+    arrive. The claim is one script now, so nothing can land in the middle.
+    """
+    await buffer.push("B8", {"message_id": "first"}, now=100.0)
+
+    assert await buffer.drain("B8", batch_id="b8", now=120.0)
+
+    await buffer.push("B8", {"message_id": "second"}, now=121.0)
+    assert await buffer.is_ready("B8", now=132.0), "the new deadline was destroyed"
+    assert [m["message_id"] for m in await buffer.drain("B8", "b8b", now=132.0)] == ["second"]
+
+
+async def test_a_batch_is_not_claimed_before_its_window_closes(
+    buffer: BurstBuffer,
+) -> None:
+    """Readiness and the claim are checked together. Apart, a message arriving
+    between the two is swept into a batch whose own silence window has not
+    elapsed: the first fragment of the next burst gets processed alone and the
+    rest arrive as a second batch."""
+    await buffer.push("B9", {"message_id": "m1"}, now=200.0)
+
+    assert await buffer.drain("B9", batch_id="early", now=205.0) == []
+    assert len(await buffer.drain("B9", batch_id="ontime", now=211.0)) == 1
+
+
+async def test_reclaim_leaves_a_live_worker_alone(
+    buffer: BurstBuffer, client: aioredis.Redis
+) -> None:
+    """Maintenance runs while workers work. Without a lease the scan reclaims a
+    batch that is being processed right now, and the same sets are recorded
+    twice -- which for a workout log means doubled volume."""
+    await buffer.push("B10", {"message_id": "m1"}, now=300.0)
+
+    # Claimed but not yet collected: exactly the state a worker is in while it
+    # processes a batch, and the state reclaim_orphans must leave alone.
+    assert await buffer.claim("B10", batch_id="live", now=311.0)
+
+    assert await buffer.reclaim_orphans() == 0, "reclaimed a batch in flight"
+    assert len(await buffer.collect("B10", batch_id="live")) == 1
