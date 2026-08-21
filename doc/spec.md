@@ -94,6 +94,10 @@ atravessam a spec inteira:
 | AD-30 | Criptografia | Coluna sensível cifrada na aplicação + TLS + disco | Protege contra dump de banco e backup vazado, não só contra roubo de máquina. Custo: campo cifrado não é agregável em SQL (§22.2). |
 | AD-31 | Avaliação | LLM-as-judge desde a primeira PR de código; bloqueia apenas segurança e fidelidade numérica | Judge tem variância; bloquear tudo produziria CI vermelho por ruído e corroeria a confiança no sinal. |
 | AD-32 | Eval de recomendação | Validadores determinísticos + judge só para o qualitativo | Restrição (equipamento, lesão, catálogo, volume) é verificável por código. Judge só onde não há gabarito. |
+| AD-33 | Clarificação | Exercício + carga + reps obrigatórios em musculação; uma pergunta agregada | Sem reps ou carga a série não entra em nenhum cálculo. Peso corporal e outros `set_type` têm requisitos próprios (§9.7). |
+| AD-34 | Formato de saída | Split por unidade de ideia, máx. 3 bolhas | Conversa, não relatório. Teto de 3 porque cada bolha é uma notificação (§13.6). |
+| AD-35 | Retry de envio | Política por classe de erro, não retry cego | Metade dos erros da Cloud API não melhora com repetição e alguns duplicam mensagem (§18.5). |
+| AD-36 | Progressão | Texto sob demanda + gráfico PNG + resumo semanal | Três formatos, as mesmas tools; nenhum recalcula (§16.3). |
 
 ---
 
@@ -1368,6 +1372,76 @@ separadamente na §21.3, de modo que uma regressão em metas não se esconda atr
 
 ---
 
+### 9.7 Política de clarificação
+
+O `clarification_agent` só interrompe quando falta algo **sem o qual a série não entra em nenhum
+cálculo**. Interromper demais atrapalha quem está no meio do treino; interromper de menos produz
+linha morta no banco.
+
+#### Campos obrigatórios por tipo de série
+
+A regra é a mesma que o `CHECK ck_set_payload` (§5.2) já impõe no banco — o agente apenas a aplica
+antes, com uma pergunta em vez de um erro.
+
+| `set_type` | Obrigatórios | Opcionais |
+| --- | --- | --- |
+| `strength` | exercício, **carga**, **reps** | RPE, descanso, técnica, lado |
+| `cardio` | exercício, **distância ou duração** | pace, elevação, FC |
+| `isometric` | exercício, **duração da isometria** | carga (lastro), RPE |
+| `interval` | exercício, **rounds** | duração por round, descanso |
+
+**Recorte de peso corporal.** Em exercício cujo `equipment = 'peso_corporal'` (barra fixa, flexão,
+paralela), `load_kg` nulo **é** a resposta — o peso é o do próprio usuário. Perguntar "qual o
+peso?" a cada barra fixa seria atrito sem informação. Se o usuário usou lastro, ele diz
+("barra fixa com 10kg"), e aí a carga é registrada como lastro.
+
+#### Exemplos
+
+```
+"Supino com 80 kg"
+   strength, falta reps                      → PERGUNTA
+   "Quantas repetições?"
+
+"Supino 3x8"
+   strength, falta carga                     → PERGUNTA
+   "Qual o peso?"
+
+"Fiz supino"
+   strength, faltam carga E reps             → PERGUNTA ÚNICA
+   "Quantos kg e quantas repetições?"
+
+"Barra fixa 8 reps"
+   strength, equipment=peso_corporal         → GRAVA
+   carga nula é legítima
+
+"Prancha 60 segundos"
+   isometric, tem hold_s                     → GRAVA
+
+"Corri 5km"
+   cardio, tem distância                     → GRAVA
+```
+
+#### Uma pergunta, não uma sequência
+
+Faltando mais de um campo, a pergunta é **uma só**, pedindo tudo — "Quantos kg e quantas
+repetições?" — e o usuário responde numa mensagem ("80 por 8"). Isso é um `interrupt()`, um ciclo,
+uma interrupção. Perguntar campo a campo dobraria o atrito no pior momento possível.
+
+#### Limites
+
+| Regra | Valor | Motivo |
+| --- | --- | --- |
+| Perguntas por rajada | máx. 1 | Rajada com 4 séries incompletas gera **uma** pergunta agregada, não quatro |
+| Tentativas por série | 1 | Se a resposta ainda não resolver, grava `low_confidence` e segue |
+| TTL do `interrupt` | 20 min | §8.6; expirou, grava o melhor palpite marcado |
+| Durante sessão ativa | pergunta curta, sem preâmbulo | O usuário está entre séries |
+
+Se a mesma rajada trouxer séries completas e incompletas, **as completas são gravadas de imediato**
+e a pergunta cobre só as incompletas. O usuário nunca perde o que já informou por causa do que
+faltou.
+
+---
+
 ## 10. Resolver de exercícios
 
 Algoritmo determinístico de três camadas, com LLM apenas no desempate.
@@ -1592,6 +1666,49 @@ O `voice_agent` recebe três eixos e ajusta:
 Não decide conteúdo, não faz aritmética, não consulta o banco, não chama tools. Ele apenas
 **verbaliza** os blocos que recebe. Isso mantém o prompt pequeno, barato e testável isoladamente.
 
+### 13.6 Split por unidade de ideia
+
+Pessoas não mandam parágrafo no WhatsApp — mandam frases curtas em sequência. Uma resposta densa
+numa bolha só lê como e-mail, não como conversa.
+
+O `voice_agent` quebra a saída onde **muda a unidade de ideia**, não onde acaba o limite de
+caracteres:
+
+```
+UMA BOLHA (lê como relatório):
+  "Supino reto 80kg x8, anotado. Semana passada foi 75kg x8, então você
+   subiu 5kg mantendo as repetições. Quer que eu ajuste a próxima carga?"
+
+TRÊS BOLHAS (lê como conversa):
+  [0.0s]  "Supino reto 80kg x8, anotado"
+  [1.1s]  "Semana passada foi 75kg x8 — subiu 5kg mantendo as reps"
+  [2.4s]  "Quer que eu ajuste a próxima carga?"
+```
+
+**Regras:**
+
+| Regra | Valor |
+| --- | --- |
+| Fronteira de quebra | Confirmação → dado/análise → pergunta ou próximo passo |
+| Máximo de bolhas | 3 |
+| Delay entre bolhas | 0,8s a 2,0s, proporcional ao comprimento da bolha seguinte |
+| Mínimo por bolha | ~15 caracteres — não fragmentar em pedaços telegráficos |
+| Ordem | Sempre sequencial; a bolha *n+1* só sai após 200 da Meta na *n* |
+
+**Quando NÃO dividir:**
+
+- `ack_mode = "reaction"` — reação de emoji não tem texto para dividir.
+- Durante sessão ativa (§13.3) — o usuário está entre séries; uma frase, uma bolha.
+- Mensagem de erro ou de esclarecimento — dividir uma pergunta atrasa a resposta.
+- Mensagem proativa via template — o template é uma unidade aprovada pela Meta e não se divide.
+
+**Cada bolha é uma notificação no celular do usuário.** É por isso que o teto é 3 e o mínimo por
+bolha existe: sem eles, uma análise longa viraria sete vibrações seguidas, que é pior que o
+parágrafo que se queria evitar.
+
+O `split` continua servindo também ao limite técnico de 1024 caracteres (§13.4) — se após a quebra
+por ideia alguma bolha ainda exceder, ela é dividida de novo por sentença.
+
 ---
 
 ## 14. Coach proativo e a janela de 24 horas
@@ -1768,6 +1885,78 @@ backlog (fase 2), com whitelist de tabelas, `LIMIT` forçado, timeout e `tenant_
 
 ---
 
+### 16.3 Progressão visível ao usuário
+
+As tools da §16 produzem os números; esta seção define como o usuário **consome** progressão. Três
+formatos, os três alimentados pelas mesmas tools — nenhum recalcula nada.
+
+#### a) Relatório sob demanda (texto)
+
+Disparado por pergunta direta: "como estou evoluindo no supino?", "melhorei nas pernas?",
+"tô progredindo?". Rota `insight/progress_report`.
+
+```
+Supino reto — últimas 12 semanas
+
+Carga de topo   70 → 80 kg      +14%
+e1RM estimado   87 → 100 kg     +15%
+Volume/semana   2.400 → 2.880 kg
+RPE médio       7,8 → 7,4       ↓ (mesma carga, menos esforço)
+
+Tendência: subindo de forma consistente. As 3 últimas semanas
+avançaram 2,5kg cada, sem aumento de RPE — dá para manter o ritmo.
+```
+
+O `voice_agent` divide isso em bolhas por unidade de ideia (§13.6): números primeiro, leitura
+depois.
+
+#### b) Gráfico como imagem
+
+Quando a pergunta é sobre **tendência** (mais de 6 pontos no tempo), um gráfico comunica em um
+olhar o que o texto leva um parágrafo. Renderizado com matplotlib, enviado como mídia.
+
+| Regra | Valor |
+| --- | --- |
+| Quando | Série com ≥ 6 pontos e pergunta sobre evolução; abaixo disso, só texto |
+| Conteúdo | Carga de topo e e1RM por semana, com faixa de RPE em cor secundária |
+| Formato | PNG, 1080×720, tema escuro (a maioria usa WhatsApp em dark mode) |
+| Nome do arquivo | `progress_<uuid4>.png` — **nunca** contém `bsuid`, nome ou exercício |
+| Ciclo de vida | Gerado em `/tmp` (tmpfs), enviado, apagado imediatamente. Não persiste |
+| Acompanha | Sempre uma legenda em texto: o gráfico não substitui a leitura |
+| Falha | Se a renderização falhar, envia só o texto — nunca deixa o usuário sem resposta |
+
+O gráfico é imagem estática, sem interatividade e sem link — não abre superfície web nova, e nada
+de dado de saúde sai da infra além do envio ao próprio usuário via Meta.
+
+#### c) Resumo semanal automático
+
+Segunda-feira de manhã, no fuso do tenant. Exige consentimento `proactive_msg` e, fora da janela
+de 24h, o template `resumo_semanal` (§14.2).
+
+```
+Semana de 12 a 18 de agosto
+
+3 treinos · 14.200 kg de volume · aderência 75% da ficha
+
+↑ Supino reto: +5kg no top set
+↑ Agachamento: +2 séries de volume
+→ Remada: estável há 3 semanas
+↓ Posterior de coxa: nenhuma série (última: 16 dias)
+
+Quer que eu ajuste a ficha para cobrir posterior?
+```
+
+A última linha não é enfeite: o resumo termina propondo **uma** ação concreta derivada do próprio
+dado, e a resposta reabre a janela de 24h para a conversa continuar rica.
+
+#### Plano
+
+Relatório sob demanda e gráfico são capacidades **Pro** (§19.2) — carregam análise, que é o que
+custa LLM caro. O resumo semanal também é Pro. O usuário Free continua vendo o resumo de cada
+sessão no fechamento, que é gratuito e não usa tier de raciocínio.
+
+---
+
 ## 17. Fila, concorrência e debounce
 
 ### 17.1 Chaves Redis
@@ -1907,8 +2096,57 @@ Authorization: Bearer {WABA_TOKEN}
    "components":[{"type":"body","parameters":[{"type":"text","text":"Felipe"},...]}]}}
 ```
 
-Retry: 3 tentativas com backoff exponencial. Erro `131047` (fora da janela) faz o sistema
-converter automaticamente para template, se houver um adequado; senão, adia a mensagem.
+### 18.5 Falha e retry
+
+"A mensagem falhou" quer dizer duas coisas diferentes, com tratamentos opostos.
+
+#### Falha de processamento (antes de existir resposta)
+
+A rajada não chegou a virar resposta: LLM caiu, banco recusou, worker morreu. Tratada pela fila
+ARQ com `max_tries=3` e backoff exponencial, reprocessando o `processing_batch` persistido (§4.1).
+A idempotência do `ux_set_idempotency` (§17.4) garante que reprocessar não duplica séries.
+
+Esgotadas as tentativas, o batch vira `failed` e o usuário recebe uma mensagem de degradação —
+nunca silêncio. O texto original nunca se perde: fica em `raw_message`.
+
+#### Falha de envio (a resposta existe, mas não chegou)
+
+Tratada pelo `outbound_queue`, e **retry cego aqui é errado**: metade dos erros da Cloud API não
+melhora com repetição, e alguns pioram (mensagem duplicada). A política é por classe de erro:
+
+| Código | Significado | Ação |
+| --- | --- | --- |
+| `131047` | Fora da janela de 24h | **Não** repete. Converte para template equivalente se houver; senão adia até a janela reabrir |
+| `131026` | Destinatário não pode receber | **Não** repete. Marca `undeliverable`, suspende proativas para o tenant |
+| `130429` | Rate limit da Meta | Repete com backoff exponencial + jitter, até 5 tentativas |
+| `131056` | Par (de/para) em rate limit | Repete com backoff mais longo, até 3 tentativas |
+| `368` / `131031` | Conta restrita ou bloqueada | **Não** repete. Alerta operacional — é problema de conta, não de mensagem |
+| `5xx` / timeout | Falha transitória da Meta | Repete com backoff, até 5 tentativas |
+| `100` / `132000` | Payload inválido, template malformado | **Não** repete. Bug nosso; loga com o payload e alerta |
+
+```sql
+ALTER TABLE outbound_queue
+    ADD COLUMN error_code   TEXT,
+    ADD COLUMN retryable    BOOLEAN,
+    ADD COLUMN next_retry_at TIMESTAMPTZ,
+    ADD COLUMN dead_at      TIMESTAMPTZ;   -- desistiu; não tenta mais
+CREATE INDEX ix_outbound_retry
+    ON outbound_queue(next_retry_at) WHERE sent_at IS NULL AND dead_at IS NULL;
+```
+
+**Backoff:** 2s, 8s, 32s, 2min, 8min, com jitter de ±25% para não sincronizar retries de tenants
+diferentes após uma queda da Meta.
+
+**Ordem preservada.** Se uma bolha de um split falha, as seguintes **não** são enviadas — sairiam
+fora de ordem e sem contexto. Todas ficam pendentes e o lote inteiro é retomado do ponto que falhou.
+
+**Dead letter.** Mensagem que esgota as tentativas ou recebe erro não repetível ganha `dead_at` e
+sai da fila. Um job diário reporta os `dead` por `error_code`: uma classe crescendo é sintoma de
+mudança de comportamento da API, não de azar.
+
+**O que nunca é repetido automaticamente:** template proativo. Se falhou, o momento provavelmente
+passou, e reenviar horas depois é pior que não enviar. Volta para o `proactive_coach` decidir na
+próxima janela.
 
 ---
 
@@ -1976,6 +2214,8 @@ Notas:
 | Resumo de sessão | ✅ | ✅ |
 | Consultas simples ("quanto peguei no supino?") | ✅ 20/mês | ✅ ilimitado |
 | Análise de evolução | ❌ | ✅ |
+| Relatório de progressão e gráfico | ❌ | ✅ |
+| Resumo semanal automático | ❌ | ✅ |
 | Recomendação de ficha e progressão de carga | ❌ | ✅ |
 | Auditoria de volume e equilíbrio muscular | ❌ | ✅ |
 | Coach proativo | ❌ | ✅ |
@@ -2569,6 +2809,8 @@ Sem isso, nada mais tem dado para operar.
 - Criptografia de coluna (§22.2) — vem no schema inicial, não é retrofit
 - Observabilidade: Langfuse (SDK no `LLMGateway`) + Datadog (OTel, com lista de redação)
 - Métricas de agente e de tool (§20.3, §20.4)
+- Política de clarificação (§9.7) e split por unidade de ideia (§13.6)
+- Retry de envio por classe de erro (§18.5)
 
 **Critério de saída:** 20 usuários reais registrando treinos por 2 semanas com acurácia de
 extração ≥ 0.90 no golden set e nenhum vazamento entre tenants.
@@ -2578,6 +2820,7 @@ extração ≥ 0.90 no golden set e nenhum vazamento entre tenants.
 - Tools analíticas SQL (todas as 11)
 - Subgrafo `insight`: `analytics_planner` + `narrator`
 - `gamification_agent` (PRs, streaks) no fechamento de sessão
+- Progressão visível: relatório em texto, gráfico PNG e resumo semanal (§16.3)
 - Indexação de `user_sessions` no Qdrant
 - Comando "o que você anotou?" / revisão de séries
 - LLM-as-judge para as respostas de análise
