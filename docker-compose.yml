@@ -1,5 +1,5 @@
-# Infra do sprint 01 (§3.1). Apenas o caddy publica portas; o resto fica na
-# rede interna — Postgres, Redis e Qdrant nunca ficam expostos (§22).
+# Sprint 01 infrastructure (§3.1). Only caddy publishes ports; everything else
+# stays on the internal network -- Postgres, Redis and Qdrant are never exposed (§22).
 name: fittrack
 
 services:
@@ -59,7 +59,7 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    # appendonly: o buffer de rajada (§17.1) não pode evaporar num restart
+    # appendonly: the burst buffer (§17.1) must not evaporate on restart
     command: ["redis-server", "--appendonly", "yes"]
     volumes: [redis_data:/data]
     expose: ["6379"]
@@ -70,8 +70,8 @@ services:
       retries: 5
 
   qdrant:
-    # Sobe já no sprint 01 sem uso: infra é barata agora e cara no meio de
-    # outro sprint. As coleções chegam no sprint 04.
+    # Ships unused in sprint 01: infrastructure is cheap now and expensive in
+    # the middle of another sprint. Collections arrive in sprint 04.
     image: qdrant/qdrant:v1.19.0
     restart: unless-stopped
     volumes: [qdrant_data:/qdrant/storage]

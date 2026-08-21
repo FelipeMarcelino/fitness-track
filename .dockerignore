@@ -1,0 +1,27 @@
+# Keep secrets and local state out of the build context. Even when not COPYied
+# into the image, the context is uploaded to the builder, which on a remote or
+# CI builder means shipping the developer's .env off the machine.
+.env
+.env.*
+!.env.example
+*.pem
+
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+.git/
+.github/
+doc/
+tests/
+*.md
+
+.DS_Store
+.idea/
+.vscode/

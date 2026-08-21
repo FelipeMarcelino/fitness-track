@@ -20,7 +20,7 @@ REQUIRED = {
     "ANTHROPIC_API_KEY": "anthropic-key",
     "OPENAI_API_KEY": "openai-key",
     "GROQ_API_KEY": "groq-key",
-    "DATABASE_URL": "postgresql+asyncpg://u:p@localhost:5432/db",
+    "DATABASE_URL": "postgresql+asyncpg://u:sup3rs3cr3t@localhost:5432/db",
     "REDIS_URL": "redis://localhost:6379/0",
     "QDRANT_URL": "http://localhost:6333",
     "FITTRACK_ENCRYPTION_KEY": "MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=",  # 32 bytes exatos
@@ -51,8 +51,8 @@ def test_loads_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = _build()
 
     assert settings.waba_phone_number_id == "1234567890"
-    assert settings.database_url.startswith("postgresql+asyncpg://")
-    assert settings.redis_url == "redis://localhost:6379/0"
+    assert settings.database_url.get_secret_value().startswith("postgresql+asyncpg://")
+    assert settings.redis_url.get_secret_value() == "redis://localhost:6379/0"
 
 
 @pytest.mark.parametrize("missing", sorted(REQUIRED))
@@ -78,6 +78,9 @@ def test_secrets_are_not_repr_visible(monkeypatch: pytest.MonkeyPatch) -> None:
         REQUIRED["XAI_API_KEY"],
         REQUIRED["ANTHROPIC_API_KEY"],
         REQUIRED["FITTRACK_ENCRYPTION_KEY"],
+        # A connection URI embeds a password; it leaks like any other secret.
+        REQUIRED["DATABASE_URL"],
+        REQUIRED["REDIS_URL"],
     ):
         assert secret not in rendered
 
@@ -132,4 +135,50 @@ def test_database_url_must_be_async_driver(monkeypatch: pytest.MonkeyPatch) -> N
     _env(monkeypatch, DATABASE_URL="postgresql://u:p@localhost:5432/db")
 
     with pytest.raises(ValidationError, match="asyncpg"):
+        _build()
+
+
+def test_blank_credential_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """.env.example ships every variable empty. A blank token must not start
+    the app and defer the failure to the first API call."""
+    _env(monkeypatch, WABA_TOKEN="")
+
+    with pytest.raises(ValidationError, match="must not be empty"):
+        _build()
+
+
+def test_whitespace_only_credential_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _env(monkeypatch, ANTHROPIC_API_KEY="   ")
+
+    with pytest.raises(ValidationError, match="must not be empty"):
+        _build()
+
+
+def test_database_password_does_not_leak(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A connection URI carries a password. Plain str would print it in any
+    traceback that renders the settings object."""
+    _env(monkeypatch)
+    settings = _build()
+
+    assert "sup3rs3cr3t" not in repr(settings)
+    assert "sup3rs3cr3t" not in str(settings)
+    assert settings.database_url.get_secret_value().endswith("/db")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "postgresql://u:p@h:5432/db?note=+asyncpg",  # substring present, sync driver
+        "postgresql+asyncpgx://u:p@h:5432/db",  # typo, not a real driver
+        "postgresql+psycopg://u:p@h:5432/db",  # explicit sync driver
+        "mysql+asyncpg://u:p@h/db",  # right driver, wrong database
+    ],
+)
+def test_rejects_urls_that_only_look_async(monkeypatch: pytest.MonkeyPatch, url: str) -> None:
+    """A substring check would accept the first two."""
+    _env(monkeypatch, DATABASE_URL=url)
+
+    with pytest.raises(ValidationError, match="postgresql\\+asyncpg"):
         _build()

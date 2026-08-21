@@ -6,15 +6,14 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# Dependências primeiro: a camada só invalida quando o pyproject muda.
+# Dependencies first: this layer is only invalidated when pyproject changes.
 COPY pyproject.toml ./
 RUN pip install --no-cache-dir hatchling && \
-    pip install --no-cache-dir -e ".[dev]" 2>/dev/null || pip install --no-cache-dir -e .
+    pip install --no-cache-dir -e .
 
 COPY src/ ./src/
-COPY alembic.ini* ./
 
-# Nunca root: um exploit no processo não vira root no container.
+# Never root: an exploit in the process does not become root in the container.
 RUN useradd --create-home --uid 10001 fittrack && chown -R fittrack:fittrack /app
 USER fittrack
 
