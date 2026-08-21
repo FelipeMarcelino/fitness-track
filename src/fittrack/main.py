@@ -10,9 +10,11 @@ from typing import Literal
 
 from fastapi import FastAPI
 
+from fittrack.channels.whatsapp.webhook import router as whatsapp_router
 from fittrack.settings import get_settings
 
 app = FastAPI(title="FitTrack", docs_url=None, redoc_url=None)
+app.include_router(whatsapp_router)
 
 
 @app.get("/health")
