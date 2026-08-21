@@ -111,4 +111,8 @@ jobs:
       - name: Types
         run: mypy src
       - name: Tests
+        # testcontainers starts its own Postgres; the service containers
+        # above remain for suites that want a long-lived one.
         run: pytest -q
+        env:
+          TESTCONTAINERS_RYUK_DISABLED: "true"
