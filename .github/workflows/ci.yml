@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  markdown:
+    name: markdown
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Lint markdown
+        run: npx --yes markdownlint-cli2 "**/*.md"
+
+  # The spec is the source of truth; these guard invariants that are cheap to
+  # check and expensive to notice by hand. See doc/spec.md.
+  spec-guards:
+    name: spec guards
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: The tenant identifier is bsuid, never wa_id
+        run: |
+          # Passes on a tree with no matching files, so it does not block the
+          # bootstrap PR that introduces this workflow.
+          if grep -rn '\bwa_id\b' --include='*.md' --include='*.py' .; then
+            echo "::error::wa_id was replaced by bsuid (see doc/spec.md AD-02)"
+            exit 1
+          fi
+
+  # Activates on its own once the Phase 1.0 scaffold lands. Until pyproject.toml
+  # exists there is nothing to lint, type-check or test.
+  detect:
+    name: detect python
+    runs-on: ubuntu-latest
+    outputs:
+      has_python: ${{ steps.check.outputs.has_python }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        run: |
+          if [ -f pyproject.toml ]; then
+            echo "has_python=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_python=false" >> "$GITHUB_OUTPUT"
+            echo "No pyproject.toml yet; skipping Python jobs."
+          fi
+
+  python:
+    name: lint, types and tests
+    needs: detect
+    if: needs.detect.outputs.has_python == 'true'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: fittrack
+          POSTGRES_PASSWORD: fittrack
+          POSTGRES_DB: fittrack_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      qdrant:
+        image: qdrant/qdrant:latest
+        ports: ['6333:6333']
+    env:
+      DATABASE_URL: postgresql+asyncpg://fittrack:fittrack@localhost:5432/fittrack_test
+      REDIS_URL: redis://localhost:6379/0
+      QDRANT_URL: http://localhost:6333
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+      - name: Lint
+        run: ruff check .
+      - name: Format
+        run: ruff format --check .
+      - name: Types
+        run: mypy src
+      - name: Tests
+        run: pytest -q
