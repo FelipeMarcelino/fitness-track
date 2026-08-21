@@ -16,6 +16,10 @@ from evals.dataset import Case, load_cases
 from evals.report import SuiteResult
 
 Predictor = Callable[[Case], dict[str, Any]]
+Comparator = Callable[[str, str, Any, Any], None]
+
+# Where the §21.1 dataset keeps the per-set fields.
+SETS: Final = "sets"
 
 # §21.1. Exact-match accuracy unless noted.
 THRESHOLDS: Final[dict[str, float]] = {
@@ -51,23 +55,26 @@ def run_golden(path: Path, predict: Predictor) -> SuiteResult:
     rpe_errors: list[float] = []
     failures: list[str] = []
 
+    def compare(case_id: str, field_name: str, expected: Any, predicted: Any) -> None:
+        seen[field_name] = seen.get(field_name, 0) + 1
+        if predicted == expected:
+            hits[field_name] = hits.get(field_name, 0) + 1
+        else:
+            failures.append(f"{case_id}: {field_name} expected {expected!r}, got {predicted!r}")
+
     for case in cases:
         predicted = predict(case)
         for field_name, expected in case.expected.items():
+            if field_name == SETS:
+                _score_sets(case.id, expected, predicted.get(SETS), compare, rpe_errors)
+                continue
             if field_name == "rpe":
                 rpe_errors.append(_rpe_error(predicted.get("rpe"), expected))
                 continue
-            seen[field_name] = seen.get(field_name, 0) + 1
             # `predicted.get` rather than a membership check: a field the agent
             # stopped emitting has to count as wrong. Skipping it would score
             # the field perfectly over the cases it still answers.
-            if predicted.get(field_name) == expected:
-                hits[field_name] = hits.get(field_name, 0) + 1
-            else:
-                failures.append(
-                    f"{case.id}: {field_name} expected {expected!r}, "
-                    f"got {predicted.get(field_name)!r}"
-                )
+            compare(case.id, field_name, expected, predicted.get(field_name))
 
     below: list[str] = []
     for field_name, count in sorted(seen.items()):
@@ -93,6 +100,47 @@ def run_golden(path: Path, predict: Predictor) -> SuiteResult:
         summary=summary,
         failures=failures,
     )
+
+
+def _score_sets(
+    case_id: str,
+    expected_sets: Any,
+    predicted_sets: Any,
+    compare: Comparator,
+    rpe_errors: list[float],
+) -> None:
+    """Scores the rows inside `expected.sets` field by field (§21.1).
+
+    Compared as whole lists, a case is either perfectly right or perfectly
+    wrong, and every per-field floor in the §21.1 table stops applying: load_kg
+    at 0.96 passes under the generic floor while its own is 0.97, and nobody
+    sees which field slipped. So the sets are flattened and each field lands in
+    its own bucket.
+    """
+    expected_rows = expected_sets if isinstance(expected_sets, list) else []
+    predicted_rows = predicted_sets if isinstance(predicted_sets, list) else []
+
+    # "3x8" expands to three rows. An agent that emits one has not made a
+    # rounding error, it has lost two thirds of the workout -- and without this
+    # dropping rows would improve the score, since the ones it keeps are the
+    # easy ones.
+    compare(case_id, "set_count", len(expected_rows), len(predicted_rows))
+
+    for index, expected_row in enumerate(expected_rows):
+        if not isinstance(expected_row, dict):
+            continue
+        predicted_row = (
+            predicted_rows[index]
+            if index < len(predicted_rows) and isinstance(predicted_rows[index], dict)
+            else {}
+        )
+        for field_name, expected in expected_row.items():
+            if field_name == "rpe":
+                rpe_errors.append(_rpe_error(predicted_row.get("rpe"), expected))
+                continue
+            # A set the agent never produced counts against every field it
+            # should have carried, not as an absence.
+            compare(f"{case_id}[{index}]", field_name, expected, predicted_row.get(field_name))
 
 
 def _rpe_error(predicted: Any, expected: Any) -> float:

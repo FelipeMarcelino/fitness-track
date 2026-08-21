@@ -300,3 +300,175 @@ def test_a_judge_that_answers_the_same_thing_every_time_fails_calibration() -> N
 
     assert not outcome.calibrated
     assert outcome.errors == 10
+
+
+# --- the real §21.1 dataset shape ------------------------------------------
+
+
+def test_fields_inside_sets_are_scored_against_their_own_floors(
+    tmp_path: Path,
+) -> None:
+    """§21.1 puts exercise_slug, load_kg, reps and rpe inside `expected.sets`.
+
+    Compared as a whole list, a case is either perfectly right or wrong, and
+    every per-field floor in the table becomes decorative: load_kg at 0.96
+    would pass under the generic 0.95 while its own floor is 0.97, and nobody
+    would see which field slipped.
+    """
+    rows = [
+        {
+            "id": f"gs-{i}",
+            "input": "supino 80x8",
+            "expected": {
+                "is_workout_log": True,
+                "sets": [{"exercise_slug": "supino_reto_barra", "load_kg": 80, "reps": 8}],
+            },
+        }
+        for i in range(100)
+    ]
+    path = _write(tmp_path, "golden.jsonl", rows)
+
+    calls = {"n": 0}
+
+    def predict(case: Case) -> dict[str, Any]:
+        calls["n"] += 1
+        # 96/100 on load_kg: above the generic 0.95 floor, below its own 0.97.
+        load = 80 if calls["n"] <= 96 else 75
+        return {
+            "is_workout_log": True,
+            "sets": [{"exercise_slug": "supino_reto_barra", "load_kg": load, "reps": 8}],
+        }
+
+    result = run_golden(path, predict=predict)
+
+    assert not result.passed
+    assert "load_kg" in result.summary
+    assert "0.96" in result.summary
+
+
+def test_rpe_is_scored_as_mean_absolute_error(tmp_path: Path) -> None:
+    """§21.1 scores rpe on distance, not equality: being one point off on a
+    subjective 1-10 scale is not the same kind of wrong as inventing a load."""
+    rows = [{"id": f"gs-{i}", "input": "x", "expected": {"sets": [{"rpe": 8}]}} for i in range(10)]
+    path = _write(tmp_path, "golden.jsonl", rows)
+
+    # Every case off by exactly 1: never equal, always within the tolerance.
+    result = run_golden(path, predict=lambda _case: {"sets": [{"rpe": 7}]})
+    assert result.passed
+
+    off_by_three = run_golden(path, predict=lambda _case: {"sets": [{"rpe": 5}]})
+    assert not off_by_three.passed
+    assert "rpe" in off_by_three.summary
+
+
+def test_the_number_of_expanded_sets_is_scored(tmp_path: Path) -> None:
+    """ "3x8" expands to three rows. An agent that emits one has not made a
+    rounding error, it has lost two thirds of the workout."""
+    rows = [
+        {
+            "id": f"gs-{i}",
+            "input": "supino 3x8 80kg",
+            "expected": {
+                "sets": [
+                    {"exercise_slug": "supino_reto_barra", "reps": 8},
+                    {"exercise_slug": "supino_reto_barra", "reps": 8},
+                    {"exercise_slug": "supino_reto_barra", "reps": 8},
+                ]
+            },
+        }
+        for i in range(10)
+    ]
+    path = _write(tmp_path, "golden.jsonl", rows)
+
+    result = run_golden(
+        path,
+        predict=lambda _case: {"sets": [{"exercise_slug": "supino_reto_barra", "reps": 8}]},
+    )
+
+    assert not result.passed
+    assert "set_count" in result.summary
+
+
+def test_a_missing_set_counts_against_every_field_it_should_have_had(
+    tmp_path: Path,
+) -> None:
+    """Otherwise dropping sets improves the score: fewer rows, fewer chances to
+    be wrong, and the remaining ones are the easy ones."""
+    rows = [
+        {
+            "id": f"gs-{i}",
+            "input": "x",
+            "expected": {"sets": [{"reps": 8}, {"reps": 6}]},
+        }
+        for i in range(10)
+    ]
+    path = _write(tmp_path, "golden.jsonl", rows)
+
+    result = run_golden(path, predict=lambda _case: {"sets": [{"reps": 8}]})
+
+    assert not result.passed
+    assert any("reps" in failure for failure in result.failures)
+
+
+# --- malformed datasets ----------------------------------------------------
+
+
+def test_a_row_without_expected_results_is_rejected(tmp_path: Path) -> None:
+    """A misspelt `expected` would otherwise evaluate no fields, and a case
+    that scores nothing reports every floor as met."""
+    path = tmp_path / "bad.jsonl"
+    path.write_text('{"id":"gs-1","input":"x","expectd":{"reps":8}}\n')
+    with pytest.raises(ValueError, match="line 1"):
+        load_cases(path)
+
+
+def test_a_null_expected_is_rejected_too(tmp_path: Path) -> None:
+    path = tmp_path / "bad.jsonl"
+    path.write_text('{"id":"gs-1","input":"x","expected":null}\n')
+    with pytest.raises(ValueError, match="line 1"):
+        load_cases(path)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        '["not", "an", "object"]',
+        '{"input":"x","expected":{}}',
+        '{"id":"gs-1","expected":{}}',
+        '{"id":"gs-1","input":"x","expected":[1,2]}',
+        '{"id":"gs-1","input":"x","expected":{},"tags":"burst"}',
+    ],
+)
+def test_a_wrongly_shaped_row_names_its_line(tmp_path: Path, line: str) -> None:
+    """ "invalid dataset" in a file of three hundred lines is not an actionable
+    error message."""
+    path = tmp_path / "bad.jsonl"
+    path.write_text(line + "\n")
+    with pytest.raises(ValueError, match="line 1"):
+        load_cases(path)
+
+
+# --- calibration edge cases ------------------------------------------------
+
+
+def test_an_ambiguous_human_score_is_rejected_not_guessed() -> None:
+    """The set is deliberately half clearly good and half clearly bad. A 3 is
+    neither, and silently filing it under "bad" skews the very measurement the
+    set exists to make."""
+    cases = [Case(id="cal-0", input="...", expected={"human_score": 3})]
+    with pytest.raises(ValueError, match="cal-0"):
+        calibrate(cases, score=lambda _case: 3)
+
+
+def test_a_score_off_the_scale_is_a_mistake_not_a_pass() -> None:
+    """A judge returning 0 or 99 has stopped answering the question. Letting it
+    fall through the threshold comparison reads as agreement on the bad half.
+    """
+    cases = [
+        Case(id="cal-good", input="...", expected={"human_score": 5}),
+        Case(id="cal-bad", input="...", expected={"human_score": 1}),
+    ]
+    outcome = calibrate(cases, score=lambda _case: 0)
+
+    assert outcome.errors == 2
+    assert any("off the 1-5 scale" in mistake for mistake in outcome.mistakes)

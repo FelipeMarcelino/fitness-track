@@ -44,6 +44,10 @@ MAX_CALIBRATION_ERRORS: Final = 2
 GOOD_ENOUGH: Final = 4
 CLEARLY_BAD: Final = 2
 
+# The rubric scale of §21.2. Anything outside it is not a score.
+SCALE_MIN: Final = 1
+SCALE_MAX: Final = 5
+
 Scorer = Callable[[Case], int]
 
 
@@ -76,8 +80,23 @@ def calibrate(cases: list[Case], score: Scorer) -> Calibration:
     mistakes: list[str] = []
     for case in cases:
         human = int(case.expected["human_score"])
+        if CLEARLY_BAD < human < GOOD_ENOUGH:
+            # The set is half clearly good and half clearly bad by design. A
+            # middling label is neither, and filing it under "bad" would skew
+            # the very measurement this set exists to make -- quietly, since
+            # the judge would then be marked wrong for a reasonable answer.
+            raise ValueError(
+                f"{case.id}: human_score {human} is neither clearly good "
+                f"(>= {GOOD_ENOUGH}) nor clearly bad (<= {CLEARLY_BAD}); the "
+                f"calibration set has no room for ambiguous cases"
+            )
         given = score(case)
-        if not _agrees(human, given):
+        if not SCALE_MIN <= given <= SCALE_MAX:
+            # A judge answering 0 or 99 has stopped answering the question.
+            # Left to the threshold comparison, 0 would read as agreement with
+            # every bad case and inflate the calibration.
+            mistakes.append(f"{case.id}: judge returned {given}, off the 1-5 scale")
+        elif not _agrees(human, given):
             mistakes.append(f"{case.id}: human {human}, judge {given}")
 
     outcome = (
