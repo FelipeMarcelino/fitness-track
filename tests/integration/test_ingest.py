@@ -18,16 +18,6 @@ pytestmark = pytest.mark.integration
 ENCRYPTOR = Encryptor(KeyRing({1: os.urandom(32)}, current_version=1))
 
 
-class FakeDedup:
-    def __init__(self) -> None:
-        self._seen: set[str] = set()
-
-    async def seen(self, message_id: str) -> bool:
-        already = message_id in self._seen
-        self._seen.add(message_id)
-        return already
-
-
 class FakeBuffer:
     def __init__(self) -> None:
         self.pushed: list[tuple[str, dict[str, Any]]] = []
@@ -48,10 +38,16 @@ def _message(message_id: str = "wamid.1", **kw: Any) -> InboundMessage:
 
 
 @pytest.fixture
-def ingest(migrated: str) -> tuple[Ingest, FakeBuffer]:
-    engine = create_async_engine(migrated)
+def ingest(app_dsn: str) -> tuple[Ingest, FakeBuffer]:
+    """Connects as fittrack_app, the way production does.
+
+    An earlier version used the owner engine, which is a superuser and bypasses
+    RLS -- so the suite passed while every write would have been rejected in
+    production. The whole point of this fixture is that the policies are live.
+    """
+    engine = create_async_engine(app_dsn)
     buffer = FakeBuffer()
-    return Ingest(engine, ENCRYPTOR, FakeDedup(), buffer), buffer
+    return Ingest(engine, ENCRYPTOR, buffer), buffer
 
 
 async def test_first_contact_creates_the_tenant_before_the_message(
@@ -143,3 +139,47 @@ async def test_conversation_window_is_refreshed(
         )
     )
     assert row.scalar_one() is True
+
+
+async def test_writes_succeed_under_row_level_security(
+    ingest: tuple[Ingest, FakeBuffer], owner_conn: AsyncConnection
+) -> None:
+    """The regression this file exists for.
+
+    raw_message and conversation_window are RLS-forced, and fittrack_app is not
+    a superuser, so a transaction that does not SET LOCAL app.tenant_id has its
+    writes rejected and the delivery is lost.
+    """
+    service, buffer = ingest
+
+    await service.accept_message(_message("wamid.rls", bsuid="BSUID-rls"), {"e": 1})
+
+    row = await owner_conn.execute(
+        text(
+            "SELECT count(*) FROM raw_message r JOIN tenant t ON t.id = r.tenant_id "
+            "WHERE t.bsuid = 'BSUID-rls'"
+        )
+    )
+    assert row.scalar_one() == 1
+    assert len(buffer.pushed) == 1
+
+
+async def test_a_failed_store_does_not_consume_the_delivery(
+    ingest: tuple[Ingest, FakeBuffer], owner_conn: AsyncConnection
+) -> None:
+    """Deduplication is the unique constraint, claimed only once the row is
+    durable. Claiming it in a cache beforehand meant a transient Postgres
+    failure lost the workout permanently: Meta's retry found the id already
+    claimed and returned without persisting anything.
+    """
+    service, buffer = ingest
+    message = _message("wamid.retry", bsuid="BSUID-retry")
+
+    await service.accept_message(message, {"e": 1})
+    await service.accept_message(message, {"e": 1})
+
+    row = await owner_conn.execute(
+        text("SELECT count(*) FROM raw_message WHERE wa_message_id = 'wamid.retry'")
+    )
+    assert row.scalar_one() == 1
+    assert len(buffer.pushed) == 1, "the redelivery must not reach the buffer twice"

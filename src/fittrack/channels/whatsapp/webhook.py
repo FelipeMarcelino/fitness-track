@@ -15,7 +15,16 @@ from __future__ import annotations
 import logging
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Header, HTTPException, Query, Request, Response, status
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    status,
+)
 
 from fittrack.channels.whatsapp.payload import parse
 from fittrack.channels.whatsapp.signature import verify_signature
@@ -44,6 +53,7 @@ async def verify(
 @router.post("/whatsapp", status_code=status.HTTP_200_OK)
 async def receive(
     request: Request,
+    background: BackgroundTasks,
     x_hub_signature_256: Annotated[str | None, Header()] = None,
 ) -> dict[str, str]:
     """Accepts a delivery, enqueues it, and returns.
@@ -65,11 +75,21 @@ async def receive(
     envelope = await _json(request)
     messages, statuses = parse(envelope)
 
-    ingest = request.app.state.ingest
+    ingest = getattr(request.app.state, "ingest", None)
+    if ingest is None:
+        # Fail loudly here rather than raising AttributeError per delivery: a
+        # 500 on every message is how a webhook gets disabled.
+        log.error("webhook received a delivery but no ingest is configured")
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "ingest not configured")
+
+    # Background, not awaited: encryption plus several database round trips
+    # plus a Redis write would put a slow dependency directly in the 200 ms
+    # budget, and an envelope can carry many events. FastAPI runs these after
+    # the response is sent.
     for message in messages:
-        await ingest.accept_message(message, envelope)
+        background.add_task(ingest.accept_message, message, envelope)
     for update in statuses:
-        await ingest.accept_status(update)
+        background.add_task(ingest.accept_status, update)
 
     return {"status": "ok"}
 

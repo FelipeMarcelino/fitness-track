@@ -74,7 +74,7 @@ def _messages(value: dict[str, Any]) -> list[InboundMessage]:
                 message_id=str(message_id),
                 bsuid=str(sender),
                 msg_type=str(msg_type),
-                timestamp=int(message.get("timestamp") or 0),
+                timestamp=_int(message.get("timestamp")),
                 text=_dig(message, "text", "body"),
                 media_id=_dig(message, "audio", "id"),
                 button_id=_dig(message, "interactive", "button_reply", "id"),
@@ -101,6 +101,18 @@ def _statuses(value: dict[str, Any]) -> list[StatusUpdate]:
             )
         )
     return out
+
+
+def _int(value: object) -> int:
+    """A non-numeric timestamp is a malformed message, not an exception.
+
+    int() on a stray string raises, which escapes parse(), becomes a 500,
+    and contradicts the guarantee that odd payloads are acknowledged rather
+    than retried."""
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
 
 
 def _list(value: object) -> list[dict[str, Any]]:

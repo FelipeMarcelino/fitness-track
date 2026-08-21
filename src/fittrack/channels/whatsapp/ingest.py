@@ -1,12 +1,12 @@
 """What happens to a delivery once it is authenticated.
 
 Kept out of the request handler so the response path stays short: the handler
-validates and hands over, this decides what to persist and enqueue.
+validates and acknowledges, this runs afterwards and decides what to persist
+and enqueue.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any, Protocol
 
@@ -19,10 +19,6 @@ from fittrack.crypto.aesgcm import Encryptor
 log = logging.getLogger(__name__)
 
 
-class Deduplicator(Protocol):
-    async def seen(self, message_id: str) -> bool: ...
-
-
 class Buffer(Protocol):
     async def push(self, bsuid: str, message: dict[str, Any]) -> None: ...
 
@@ -30,38 +26,34 @@ class Buffer(Protocol):
 class Ingest:
     """Persists the raw delivery and pushes it onto the burst buffer.
 
-    Order matters and is not obvious: the tenant is upserted before
-    raw_message, because raw_message.tenant_id is NOT NULL ON DELETE CASCADE
-    (§5.2) so that an erasure request cannot leave orphaned message bodies
-    behind.
+    Deduplication is the database's job, not a cache's. `raw_message` has a
+    unique constraint on wa_message_id, so `ON CONFLICT DO NOTHING RETURNING id`
+    tells us whether this delivery is new -- atomically, and only once the row
+    is durable.
+
+    An earlier version claimed the id in Redis before writing. If the write or
+    the buffer push then failed, Meta's retry found the id already claimed and
+    returned without persisting anything: a transient Postgres blip would have
+    silently lost the user's workout.
     """
 
-    def __init__(
-        self,
-        engine: AsyncEngine,
-        encryptor: Encryptor,
-        dedup: Deduplicator,
-        buffer: Buffer,
-    ) -> None:
+    def __init__(self, engine: AsyncEngine, encryptor: Encryptor, buffer: Buffer) -> None:
         self._engine = engine
         self._encryptor = encryptor
-        self._dedup = dedup
         self._buffer = buffer
 
     async def accept_message(self, message: InboundMessage, envelope: dict[str, Any]) -> None:
-        if await self._dedup.seen(message.message_id):
-            # Meta redelivers anything it did not get a 200 for, and a redelivery
-            # of a set already recorded would double the workout volume.
+        stored = await self._store(message, envelope)
+        if stored is None:
             log.info("ignoring redelivery of %s", message.message_id)
             return
 
-        tenant_id = await self._store(message, envelope)
         if message.is_actionable:
             await self._buffer.push(
                 message.bsuid,
                 {
                     "message_id": message.message_id,
-                    "tenant_id": tenant_id,
+                    "tenant_id": stored,
                     "type": message.msg_type,
                     "text": message.text,
                     "media_id": message.media_id,
@@ -70,16 +62,25 @@ class Ingest:
             )
 
     async def accept_status(self, update: StatusUpdate) -> None:
+        if update.error_code is None:
+            return
         async with self._engine.begin() as conn:
             await conn.execute(
                 text(
                     "UPDATE outbound_queue SET error_code = :code "
-                    "WHERE payload->>'wa_message_id' = :id AND :code IS NOT NULL"
+                    "WHERE payload->>'wa_message_id' = :id"
                 ),
                 {"id": update.message_id, "code": update.error_code},
             )
 
-    async def _store(self, message: InboundMessage, envelope: dict[str, Any]) -> int:
+    async def _store(self, message: InboundMessage, envelope: dict[str, Any]) -> int | None:
+        """Returns the tenant id, or None when this delivery was already stored.
+
+        The tenant is upserted before raw_message because raw_message.tenant_id
+        is NOT NULL ON DELETE CASCADE (§5.2), so an erasure cannot leave orphaned
+        message bodies -- which means there is no such thing as a message
+        without a tenant.
+        """
         payload_blob, key_version = self._encryptor.encrypt_json(envelope)
 
         async with self._engine.begin() as conn:
@@ -93,12 +94,17 @@ class Ingest:
             )
             tenant_id = int(row.scalar_one())
 
-            await conn.execute(
+            # Everything below is RLS-protected and forced, and the application
+            # connects as fittrack_app, which is not a superuser. Without this
+            # the policies reject the write and the delivery is lost.
+            await conn.execute(text(f"SET LOCAL app.tenant_id = '{tenant_id}'"))
+
+            inserted = await conn.execute(
                 text(
                     "INSERT INTO raw_message "
                     "(tenant_id, wa_message_id, direction, msg_type, payload, key_version) "
                     "VALUES (:t, :m, 'inbound', :k, :p, :v) "
-                    "ON CONFLICT (wa_message_id) DO NOTHING"
+                    "ON CONFLICT (wa_message_id) DO NOTHING RETURNING id"
                 ),
                 {
                     "t": tenant_id,
@@ -108,6 +114,9 @@ class Ingest:
                     "v": key_version,
                 },
             )
+            if inserted.scalar_one_or_none() is None:
+                return None
+
             await conn.execute(
                 text(
                     "INSERT INTO conversation_window (tenant_id, last_inbound_at) "
@@ -117,7 +126,3 @@ class Ingest:
                 {"t": tenant_id},
             )
         return tenant_id
-
-
-def envelope_json(envelope: dict[str, Any]) -> str:
-    return json.dumps(envelope, sort_keys=True, ensure_ascii=False)
