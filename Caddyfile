@@ -1,0 +1,16 @@
+# Automatic TLS. Meta's webhook requires HTTPS with a valid certificate (§18.2).
+{$FITTRACK_DOMAIN:localhost} {
+	encode gzip
+
+	# Meta disables slow webhooks. No buffering on the path.
+	reverse_proxy ingress:8000 {
+		flush_interval -1
+		health_uri /health
+		health_interval 10s
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}
