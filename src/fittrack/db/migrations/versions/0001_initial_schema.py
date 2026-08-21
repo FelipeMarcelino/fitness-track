@@ -570,7 +570,9 @@ def _drop_statements() -> list[str]:
     alembic_version -- Alembic then cannot record the downgrade and the next
     command fails with "relation alembic_version does not exist".
     """
-    tables, types, views = [], [], []
+    tables: list[str] = []
+    types: list[str] = []
+    views: list[str] = []
     for kind, name in _CREATED.findall(SCHEMA):
         {"TABLE": tables, "TYPE": types, "VIEW": views}[kind].append(name)
 
