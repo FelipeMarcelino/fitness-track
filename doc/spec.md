@@ -75,7 +75,7 @@ atravessam a spec inteira:
 | AD-11 | STT | Whisper large-v3 via Groq | Baixa latência, bom em pt-BR, custo baixo. |
 | AD-12 | Fila | Redis + ARQ, lock FIFO por `bsuid` | Redis já necessário para debounce e cache. |
 | AD-13 | Confirmação | Reação de emoji quando confiante, texto na dúvida | Mínimo ruído no chat durante o treino. |
-| AD-14 | Roteamento | Supervisor LLM em toda mensagem, retornando um **plano** | Suporta pedidos compostos nativamente. |
+| AD-14 | Roteamento | Supervisor LLM em toda mensagem, retornando um **plano em estágios** | Suporta pedidos compostos nativamente; passos independentes rodam em paralelo, com escrita antes de leitura (§8.7). |
 | AD-15 | Estado | 1 thread LangGraph por usuário + `interrupt()` com TTL | Continuidade conversacional + esclarecimento nativo. |
 | AD-16 | Topologia | Grafo raiz + subgrafos por domínio | Estado tipado compartilhado, tracing unificado. |
 | AD-17 | LLM | Tiering por agente + fallback de provider | Primário xAI (Grok), fallback Anthropic. |
@@ -880,6 +880,7 @@ Consequências práticas para a implementação:
 ### 8.1 Estado compartilhado
 
 ```python
+import operator
 from typing import Annotated, Literal, TypedDict
 from langgraph.graph.message import add_messages
 
@@ -887,6 +888,10 @@ class RouteStep(TypedDict):
     target: Literal["ingestion","insight","coach","admin","smalltalk"]
     intent: str          # log_workout | query_history | analyze_progress | ...
     payload: dict        # argumentos extraídos pelo supervisor
+
+# Um ESTÁGIO é um conjunto de passos que rodam em PARALELO. Os estágios rodam
+# em ordem. O supervisor decide o agrupamento; a regra está na §8.7.
+PlanStage = list[RouteStep]
 
 class GraphState(TypedDict):
     # --- entrada ---
@@ -907,19 +912,23 @@ class GraphState(TypedDict):
     conversation_digest: str                  # resumo das interações antigas
 
     # --- roteamento ---
-    plan: list[RouteStep]
-    plan_cursor: int
+    plan: list[PlanStage]            # lista de estágios; cada estágio roda em paralelo
+    stage_cursor: int
 
     # --- resultados dos subgrafos ---
-    extracted_sets: list[dict]
-    persisted_set_ids: list[int]
-    analysis_result: dict | None
-    recommendation: dict | None
-    query_result: dict | None
-    health_flag: dict | None
+    # Campos escritos por ramos que podem rodar em paralelo PRECISAM de reducer.
+    # Sem ele o LangGraph levanta InvalidUpdateError quando dois ramos escrevem
+    # a mesma chave no mesmo super-step. Ver §8.7.
+    extracted_sets: Annotated[list[dict], operator.add]
+    persisted_set_ids: Annotated[list[int], operator.add]
+    analysis_result: dict | None     # escrito só por `insight` — sem concorrência
+    recommendation: dict | None      # escrito só por `coach`
+    query_result: dict | None        # escrito só por `admin`
+    health_flag: dict | None         # escrito só pelo guardrail, antes do fan-out
 
     # --- controle de saída ---
-    outbound: list[dict]             # blocos brutos a serem normalizados
+    outbound: Annotated[list[dict], operator.add]   # TODO ramo acrescenta blocos aqui
+    errors: Annotated[list[str], operator.add]
     ack_mode: Literal["reaction","text","silent"]
     confidence: float
     pending_clarification: dict | None
@@ -947,17 +956,19 @@ interações. Contexto de treino **não** vive no estado — vem sempre do Postg
                              │ (gera plano) │          │
                              └──────┬───────┘          │
                                     ▼                  │
-                          ┌── dispatch(plan_cursor) ───┤
-                          │                            │
-       ┌──────────┬───────┴─────┬──────────────┬───────┴──────┐
+                       ┌── dispatch(stage_cursor) ─────┤
+                       │   fan-out do estágio corrente │
+                       │                               │
+       ┌──────────┬────┴────────┬──────────────┬───────┴──────┐
        ▼          ▼             ▼              ▼              ▼
   ┌─────────┐ ┌────────┐  ┌──────────┐   ┌──────────┐   ┌──────────┐
   │ingestion│ │insight │  │  coach   │   │  admin   │   │smalltalk │
   │subgraph │ │subgraph│  │ subgraph │   │ subgraph │   │          │
   └────┬────┘ └───┬────┘  └────┬─────┘   └────┬─────┘   └────┬─────┘
        └──────────┴────────────┴──────────────┴──────────────┘
-                                    │
-                       plan_cursor += 1; resta passo? ──sim──► dispatch
+                                    │  join: espera TODOS do estágio
+                                    ▼
+                       stage_cursor += 1; resta estágio? ──sim──► dispatch
                                     │ não
                                     ▼
                              ┌──────────────┐
@@ -1044,6 +1055,103 @@ que carreguem região com `health_report` ativo, ou que exijam equipamento fora 
 
 ---
 
+### 8.7 Execução paralela
+
+Um pedido composto costuma conter passos independentes. Rodá-los em sequência soma latência sem
+motivo: duas chamadas de LLM de 3s viram 6s de espera quando poderiam ser 3s.
+
+O supervisor não devolve uma lista plana de rotas — devolve **estágios**. Passos dentro de um
+estágio rodam em paralelo; estágios rodam em ordem.
+
+#### A regra de agrupamento
+
+**Escrita antes de leitura, sempre.** `ingestion` grava no banco; todos os outros leem dele. Se
+rodassem juntos, o leitor poderia consultar antes do `COMMIT`.
+
+```
+1. Se o plano contém `ingestion`, ele fica sozinho no estágio 1.
+2. Todo o resto (`insight`, `coach`, `admin`, `smalltalk`) vai para o estágio 2, em paralelo.
+3. Sem `ingestion`, há um único estágio e tudo é paralelo.
+```
+
+#### O exemplo composto
+
+```
+"Fiz supino 80x8 e compara com semana passada"
+
+plan = [
+  [ {ingestion, log_workout} ],                    ← estágio 1, sozinho
+  [ {insight, analyze_progress, {exercise: supino_reto_barra}} ],  ← estágio 2
+]
+
+t=0.0s  ingestion: extrai → resolve → grava a série de 80kg × 8   (COMMIT)
+t=2.1s  insight:   load_progression(supino_reto_barra, weeks=2)
+                   ← já enxerga a série de hoje
+t=4.3s  voice:     "Supino reto 80kg × 8 anotado. Semana passada foi
+                    75kg × 8 — subiu 5kg mantendo as repetições."
+```
+
+Aqui o paralelismo **não** se aplica, e é intencional: sem a ordenação, a comparação sairia sem o
+treino de hoje. O ganho de latência não compensaria uma resposta errada.
+
+#### Onde o paralelismo de fato rende
+
+```
+"Como foi meu volume de pernas no mês e me monta uma ficha nova"
+
+plan = [
+  [ {insight, analyze_volume, {muscle: pernas}},
+    {coach,   build_plan} ],                       ← um estágio, dois ramos
+]
+
+sequencial:  insight 3.2s ──► coach 6.8s          = 10.0s
+paralelo:    insight 3.2s ┐
+             coach   6.8s ┴──────────────────────  =  6.8s
+```
+
+Ganho de 32% na latência percebida. Quanto mais caro o ramo, maior o ganho.
+
+#### Mecânica no LangGraph
+
+A aresta condicional do `dispatch` devolve uma **lista** de nós, e o LangGraph executa todos no
+mesmo super-step. O nó de join só dispara quando todos concluem.
+
+```python
+def dispatch(state: GraphState) -> list[str]:
+    stage = state["plan"][state["stage_cursor"]]
+    return [step["target"] for step in stage]      # lista ⇒ fan-out paralelo
+
+graph.add_conditional_edges("dispatch", dispatch,
+                            ["ingestion", "insight", "coach", "admin", "smalltalk"])
+```
+
+**Reducers não são opcionais.** Todo campo que mais de um ramo pode escrever precisa de reducer no
+`GraphState` (§8.1). Sem ele, dois ramos escrevendo `outbound` no mesmo super-step levantam
+`InvalidUpdateError` — não é degradação silenciosa, é falha dura na primeira execução paralela.
+Campos escritos por um único ramo (`analysis_result`, `recommendation`) dispensam.
+
+#### Falha parcial
+
+Um ramo falhar não derruba o estágio. Cada subgrafo captura sua própria exceção, acrescenta a
+`errors` e devolve `outbound` vazio. O `voice_agent` recebe o que deu certo e comunica o que não
+deu, em vez de o usuário perder tudo:
+
+> "Anotei o supino 80kg × 8. Não consegui puxar a comparação agora — pode pedir de novo em
+> instantes?"
+
+#### Custo
+
+Paralelismo transforma N chamadas sequenciais em N simultâneas, o que concentra a carga no rate
+limit do provider. Duas defesas: um semáforo por processo limita chamadas concorrentes de LLM, e o
+`LLMGateway` já trata 429 com backoff e fallback (§7.3). Um estágio nunca tem mais que 4 ramos,
+que é o número de subgrafos roteáveis.
+
+A quota por tenant (§19.3) é verificada **antes** do fan-out, sobre o custo estimado do estágio
+inteiro — senão dois ramos paralelos poderiam estourar o teto juntos, cada um passando na
+verificação isoladamente.
+
+---
+
 ## 9. Catálogo de agentes
 
 ### 9.1 Núcleo — obrigatório
@@ -1051,7 +1159,7 @@ que carreguem região com `health_report` ativo, ou que exijam equipamento fora 
 | Agente | Tier | Entrada | Saída | Descrição |
 | --- | --- | --- | --- | --- |
 | `guardrail_agent` | GUARDRAIL | texto da rajada | `{verdict, category, region, severity}` | Triagem de saúde/segurança e de conteúdo fora de escopo. Ver §12. |
-| `supervisor_agent` | ROUTER | texto + contexto | `list[RouteStep]` | Gera o **plano** ordenado de rotas. Suporta pedidos compostos. |
+| `supervisor_agent` | ROUTER | texto + contexto | `list[PlanStage]` | Gera o **plano em estágios**: passos de um estágio rodam em paralelo, estágios em ordem. Ver §8.7. |
 | `transcriber` | — (Groq) | media_id | texto pt-BR | Não é agente LLM; é serviço. Ver §11. |
 | `session_manager` | — (Python) | tenant + timestamp | session_id | Abre, reabre ou reutiliza sessão. Sem LLM. |
 | `extraction_agent` | EXTRACTOR | texto + catálogo candidato | `ExtractionResult` | Converte linguagem natural em séries estruturadas. Ver §9.4. |

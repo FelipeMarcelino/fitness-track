@@ -89,7 +89,12 @@ associada.
    Nada de `SUM`, `AVG`, `WHERE` ou índice sobre elas — carregue, decifre e agregue em Python.
    `body_metric_trend` é a tool afetada. Continua determinístico: muda a camada, não a natureza.
 
-9. **Conteúdo de usuário não vai para o Datadog.** Langfuse (self-hosted) guarda prompt e resposta;
+9. **Campo de estado escrito por ramo paralelo precisa de reducer.** O grafo roda estágios em
+   paralelo (§8.7). Adicionou campo ao `GraphState` que mais de um subgrafo escreve? Anote com
+   `Annotated[..., operator.add]`, senão o LangGraph levanta `InvalidUpdateError`. E `ingestion`
+   nunca compartilha estágio com quem lê o banco — escrita antes de leitura.
+
+10. **Conteúdo de usuário não vai para o Datadog.** Langfuse (self-hosted) guarda prompt e resposta;
    Datadog recebe só metadado de infraestrutura. A lista de redação da §20.2 é verificada por
    teste — se adicionar um atributo de span com texto, o teste quebra.
 
