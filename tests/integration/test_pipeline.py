@@ -206,3 +206,85 @@ async def test_two_users_are_processed_concurrently(
     await asyncio.gather(pipeline.flush("pipe-a"), pipeline.flush("pipe-b"))
 
     assert peak == 2, "different users were serialised"
+
+
+async def test_the_messages_survive_a_crash_before_the_batch_is_written(
+    client: aioredis.Redis, app_dsn: str, owner_conn: AsyncConnection
+) -> None:
+    """The drain key must outlive the database insert.
+
+    If Redis drops the burst first and the worker dies before the batch
+    commits, the messages exist nowhere: not in the buffer, not in
+    processing_batch, and the reclaimer has nothing to find. That is silent
+    loss of a workout the user reported.
+    """
+    tenant_id = await _tenant(owner_conn, "pipe-crash")
+
+    class DyingStore(BatchStore):
+        async def create(self, _tid: int, _messages: list[dict[str, object]]) -> Batch | None:
+            raise RuntimeError("postgres went away mid-insert")
+
+    buffer = BurstBuffer(client, window_seconds=WINDOW)
+    store = DyingStore(create_async_engine(app_dsn))
+
+    async def handler(batch: Batch) -> None:  # pragma: no cover - never reached
+        raise AssertionError("the batch was never created")
+
+    pipeline = Pipeline(client, buffer, store, handler)
+    await buffer.push(
+        "pipe-crash",
+        {"message_id": "m0", "tenant_id": tenant_id, "text": "supino 80kg 8"},
+        now=0,
+    )
+
+    with pytest.raises(RuntimeError):
+        await pipeline.flush("pipe-crash")
+
+    # Still recoverable: the burst is sitting in its drain key, which is
+    # exactly what reclaim_orphans scans for.
+    stranded = [k async for k in client.scan_iter(match="drain:pipe-crash:*")]
+    assert stranded, "the drain was cleared before the batch was durable"
+
+    # And the reclaimer does put it back, once the lease is gone.
+    for key in stranded:
+        _, _, batch_id = key[len("drain:") :].rpartition(":")
+        await client.delete(f"drainlease:pipe-crash:{batch_id}")
+    assert await buffer.reclaim_orphans() == 1
+    assert await client.llen(buffer.buffer_key("pipe-crash")) == 1
+
+
+async def test_a_failed_batch_is_retried_from_the_database(
+    client: aioredis.Redis, app_dsn: str, owner_conn: AsyncConnection
+) -> None:
+    """The retry job carries only the user id, and by then Redis is empty.
+
+    Draining again finds nothing, so unless the pending batch is loaded back
+    out of processing_batch the failure is permanent -- the retry budget in
+    §17 would count attempts against a batch nobody ever runs again.
+    """
+    tenant_id = await _tenant(owner_conn, "pipe-retry")
+    attempts: list[str] = []
+
+    async def flaky(batch: Batch) -> None:
+        attempts.append(batch.combined_text)
+        if len(attempts) == 1:
+            raise RuntimeError("the model timed out")
+
+    pipeline, buffer = _pipeline(client, app_dsn, flaky)
+    await buffer.push(
+        "pipe-retry",
+        {"message_id": "r0", "tenant_id": tenant_id, "text": "agachamento 100kg 5"},
+        now=0,
+    )
+
+    with pytest.raises(RuntimeError):
+        await pipeline.flush("pipe-retry")
+
+    assert await client.llen(buffer.buffer_key("pipe-retry")) == 0, "the buffer should be empty"
+
+    # Same call the requeued job makes: nothing buffered, everything pending.
+    batch = await pipeline.flush("pipe-retry")
+
+    assert batch is not None
+    assert attempts == ["agachamento 100kg 5", "agachamento 100kg 5"]
+    assert batch.attempts == 2

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from typing import Final
 from uuid import uuid4
 
@@ -57,33 +58,71 @@ class Pipeline:
                 return None
 
             batch_id = uuid4().hex
-            messages = await self._buffer.drain(bsuid, batch_id=batch_id)
+            if not await self._buffer.claim(bsuid, batch_id=batch_id):
+                # Nothing buffered, or the window has not closed. A previous
+                # attempt may still owe work, though: the drain took its
+                # messages, so only the database knows about it.
+                return await self._resume(bsuid)
+
+            # Read without dropping. Deleting here and persisting afterwards
+            # leaves a window where a dying worker loses the burst from both
+            # Redis and Postgres, with nothing for the reclaimer to find.
+            messages = await self._buffer.peek(bsuid, batch_id)
             if not messages:
+                await self._buffer.discard(bsuid, batch_id)
                 return None
 
             tenant_id = int(messages[0]["tenant_id"])
             batch = await self._batches.create(tenant_id, messages)
             if batch is None:
+                await self._buffer.discard(bsuid, batch_id)
                 return None
 
-            await self._run(batch)
-            return batch
+            # Durable now; Redis can let go.
+            await self._buffer.discard(bsuid, batch_id)
 
-    async def _run(self, batch: Batch) -> None:
+            return await self._run(batch)
+
+    async def _resume(self, bsuid: str) -> Batch | None:
+        """Picks up a batch a previous attempt left pending.
+
+        The retry job carries only the user id, and Redis no longer holds the
+        messages. Without this the failed batch is never touched again."""
+        tenant_id = await self._tenant_of(bsuid)
+        if tenant_id is None:
+            return None
+
+        batch = await self._batches.pending_for(tenant_id)
+        if batch is None:
+            return None
+
+        log.info("resuming batch %s after a previous failure", batch.id)
+        return await self._run(batch)
+
+    async def _tenant_of(self, bsuid: str) -> int | None:
+        return await self._batches.tenant_id_for(bsuid)
+
+    async def _run(self, batch: Batch) -> Batch:
         """Runs the handler, counting the attempt before rather than after.
 
         Counting afterwards means a handler that crashes the process never
         records its attempt, and the batch retries forever.
         """
         attempts = await self._batches.mark_attempt(batch)
+        # Batch is frozen, so the counter is carried forward in a new object
+        # rather than mutated. `exhausted` reads this field, and returning the
+        # pre-increment value would understate how close the batch is to being
+        # given up on.
+        batch = replace(batch, attempts=attempts)
         try:
             await self._handler(batch)
         except Exception as exc:
             if attempts >= MAX_ATTEMPTS:
                 log.exception("batch %s exhausted its retries", batch.id)
                 await self._batches.mark_failed(batch, str(exc))
-                return
+                return batch
             log.warning("batch %s failed on attempt %d: %s", batch.id, attempts, exc)
             raise
         else:
             await self._batches.mark_done(batch)
+            return batch

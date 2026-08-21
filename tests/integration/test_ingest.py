@@ -16,6 +16,7 @@ from fittrack.crypto.aesgcm import Encryptor, KeyRing
 pytestmark = pytest.mark.integration
 
 ENCRYPTOR = Encryptor(KeyRing({1: os.urandom(32)}, current_version=1))
+WINDOW = 10
 
 
 class FakeBuffer:
@@ -24,6 +25,18 @@ class FakeBuffer:
 
     async def push(self, bsuid: str, message: dict[str, Any]) -> None:
         self.pushed.append((bsuid, message))
+
+
+class FakeScheduler:
+    def __init__(self, fails: bool = False) -> None:
+        self.jobs: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
+        self._fails = fails
+
+    async def enqueue_job(self, function: str, *args: Any, **kwargs: Any) -> Any:
+        if self._fails:
+            raise ConnectionError("queue is down")
+        self.jobs.append((function, args, kwargs))
+        return None
 
 
 def _message(message_id: str = "wamid.1", **kw: Any) -> InboundMessage:
@@ -38,7 +51,7 @@ def _message(message_id: str = "wamid.1", **kw: Any) -> InboundMessage:
 
 
 @pytest.fixture
-def ingest(app_dsn: str) -> tuple[Ingest, FakeBuffer]:
+def ingest(app_dsn: str) -> tuple[Ingest, FakeBuffer, FakeScheduler]:
     """Connects as fittrack_app, the way production does.
 
     An earlier version used the owner engine, which is a superuser and bypasses
@@ -47,16 +60,17 @@ def ingest(app_dsn: str) -> tuple[Ingest, FakeBuffer]:
     """
     engine = create_async_engine(app_dsn)
     buffer = FakeBuffer()
-    return Ingest(engine, ENCRYPTOR, buffer), buffer
+    scheduler = FakeScheduler()
+    return Ingest(engine, ENCRYPTOR, buffer, scheduler, WINDOW), buffer, scheduler
 
 
 async def test_first_contact_creates_the_tenant_before_the_message(
-    ingest: tuple[Ingest, FakeBuffer], owner_conn: AsyncConnection
+    ingest: tuple[Ingest, FakeBuffer, FakeScheduler], owner_conn: AsyncConnection
 ) -> None:
     """raw_message.tenant_id is NOT NULL ON DELETE CASCADE so an erasure cannot
     leave orphaned message bodies (§5.2). That makes the upsert order a
     correctness requirement, not a preference."""
-    service, _ = ingest
+    service, _, _scheduler = ingest
 
     await service.accept_message(_message(), {"entry": []})
 
@@ -72,9 +86,9 @@ async def test_first_contact_creates_the_tenant_before_the_message(
 
 
 async def test_payload_is_stored_encrypted(
-    ingest: tuple[Ingest, FakeBuffer], owner_conn: AsyncConnection
+    ingest: tuple[Ingest, FakeBuffer, FakeScheduler], owner_conn: AsyncConnection
 ) -> None:
-    service, _ = ingest
+    service, _, _scheduler = ingest
     envelope = {"entry": [{"secret": "conteudo do usuario"}]}
 
     await service.accept_message(_message("wamid.enc"), envelope)
@@ -88,11 +102,11 @@ async def test_payload_is_stored_encrypted(
 
 
 async def test_redelivery_does_not_duplicate(
-    ingest: tuple[Ingest, FakeBuffer], owner_conn: AsyncConnection
+    ingest: tuple[Ingest, FakeBuffer, FakeScheduler], owner_conn: AsyncConnection
 ) -> None:
     """Meta redelivers whatever it did not get a 200 for. A redelivery reaching
     the buffer twice would double the workout volume."""
-    service, buffer = ingest
+    service, buffer, _scheduler = ingest
     message = _message("wamid.dup")
 
     await service.accept_message(message, {"entry": []})
@@ -106,10 +120,10 @@ async def test_redelivery_does_not_duplicate(
 
 
 async def test_non_actionable_message_is_stored_but_not_queued(
-    ingest: tuple[Ingest, FakeBuffer], owner_conn: AsyncConnection
+    ingest: tuple[Ingest, FakeBuffer, FakeScheduler], owner_conn: AsyncConnection
 ) -> None:
     """A reaction is kept for audit and costs nothing downstream (§18.3)."""
-    service, buffer = ingest
+    service, buffer, _scheduler = ingest
 
     await service.accept_message(
         _message("wamid.react", msg_type="reaction", text=None), {"entry": []}
@@ -123,11 +137,11 @@ async def test_non_actionable_message_is_stored_but_not_queued(
 
 
 async def test_conversation_window_is_refreshed(
-    ingest: tuple[Ingest, FakeBuffer], owner_conn: AsyncConnection
+    ingest: tuple[Ingest, FakeBuffer, FakeScheduler], owner_conn: AsyncConnection
 ) -> None:
     """The 24h window decides whether the coach may send free text or must use
     a template (§14). It is anchored on the last inbound message."""
-    service, _ = ingest
+    service, _, _scheduler = ingest
 
     await service.accept_message(_message("wamid.win", bsuid="BSUID-window"), {})
 
@@ -142,7 +156,7 @@ async def test_conversation_window_is_refreshed(
 
 
 async def test_writes_succeed_under_row_level_security(
-    ingest: tuple[Ingest, FakeBuffer], owner_conn: AsyncConnection
+    ingest: tuple[Ingest, FakeBuffer, FakeScheduler], owner_conn: AsyncConnection
 ) -> None:
     """The regression this file exists for.
 
@@ -150,7 +164,7 @@ async def test_writes_succeed_under_row_level_security(
     a superuser, so a transaction that does not SET LOCAL app.tenant_id has its
     writes rejected and the delivery is lost.
     """
-    service, buffer = ingest
+    service, buffer, _scheduler = ingest
 
     await service.accept_message(_message("wamid.rls", bsuid="BSUID-rls"), {"e": 1})
 
@@ -165,14 +179,14 @@ async def test_writes_succeed_under_row_level_security(
 
 
 async def test_a_failed_store_does_not_consume_the_delivery(
-    ingest: tuple[Ingest, FakeBuffer], owner_conn: AsyncConnection
+    ingest: tuple[Ingest, FakeBuffer, FakeScheduler], owner_conn: AsyncConnection
 ) -> None:
     """Deduplication is the unique constraint, claimed only once the row is
     durable. Claiming it in a cache beforehand meant a transient Postgres
     failure lost the workout permanently: Meta's retry found the id already
     claimed and returned without persisting anything.
     """
-    service, buffer = ingest
+    service, buffer, _scheduler = ingest
     message = _message("wamid.retry", bsuid="BSUID-retry")
 
     await service.accept_message(message, {"e": 1})
@@ -183,3 +197,68 @@ async def test_a_failed_store_does_not_consume_the_delivery(
     )
     assert row.scalar_one() == 1
     assert len(buffer.pushed) == 1, "the redelivery must not reach the buffer twice"
+
+
+async def test_a_buffered_message_schedules_its_own_flush(
+    ingest: tuple[Ingest, FakeBuffer, FakeScheduler],
+) -> None:
+    """Buffering without scheduling is where a burst dies.
+
+    Nothing else in the system enqueues `flush_user`: the worker only
+    reschedules a job that already exists. Without this the messages sit in
+    Redis until their TTL and the user never gets an answer.
+    """
+    service, buffer, scheduler = ingest
+    await service.accept_message(_message("wamid.sched"), {"raw": True})
+
+    assert buffer.pushed, "the message never reached the buffer"
+    assert [job[0] for job in scheduler.jobs] == ["flush_user"]
+    _, args, kwargs = scheduler.jobs[0]
+    assert args == ("BSUID-ingest",)
+    # After the window, not before: an earlier job finds the buffer not ready
+    # and costs a whole round trip through the queue.
+    assert kwargs["_defer_by"] > WINDOW
+
+
+async def test_each_message_of_a_burst_schedules_a_flush(
+    ingest: tuple[Ingest, FakeBuffer, FakeScheduler],
+) -> None:
+    """The window renews on every message, so the flush has to follow it.
+
+    Scheduling once from the first message would pin the flush to a deadline
+    that no longer exists and cut the burst in half.
+    """
+    service, _, scheduler = ingest
+    for i in range(3):
+        await service.accept_message(_message(f"wamid.burst{i}"), {"raw": True})
+
+    assert len(scheduler.jobs) == 3
+
+
+async def test_a_redelivery_does_not_schedule_a_second_flush(
+    ingest: tuple[Ingest, FakeBuffer, FakeScheduler],
+) -> None:
+    """Meta retries deliveries it thinks failed. Those must not re-enter the
+    buffer or the queue."""
+    service, buffer, scheduler = ingest
+    await service.accept_message(_message("wamid.dupe"), {"raw": True})
+    await service.accept_message(_message("wamid.dupe"), {"raw": True})
+
+    assert len(buffer.pushed) == 1
+    assert len(scheduler.jobs) == 1
+
+
+async def test_a_dead_queue_does_not_lose_the_delivery(app_dsn: str) -> None:
+    """The message is already persisted and buffered by then.
+
+    Raising here would make the webhook return 500 and Meta redeliver a
+    message we already stored -- trading a recoverable delay for a duplicate.
+    """
+    buffer = FakeBuffer()
+    service = Ingest(
+        create_async_engine(app_dsn), ENCRYPTOR, buffer, FakeScheduler(fails=True), WINDOW
+    )
+
+    await service.accept_message(_message("wamid.noqueue"), {"raw": True})
+
+    assert len(buffer.pushed) == 1

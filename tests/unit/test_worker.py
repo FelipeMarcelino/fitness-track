@@ -35,3 +35,51 @@ def test_importing_the_module_does_not_require_an_environment() -> None:
 
     module = importlib.import_module("fittrack.worker")
     assert module.WorkerSettings.functions, "the worker must register its jobs"
+
+
+def test_the_orphan_reclaimer_is_scheduled() -> None:
+    """Defining reclaim_orphans is not running it.
+
+    Unregistered, a worker killed between the RENAME and the batch insert
+    leaves that burst in its drain key forever once the lease expires: out of
+    the buffer, absent from processing_batch, and swept by nothing.
+    """
+    from fittrack.worker import reclaim_orphans
+
+    assert reclaim_orphans in WorkerSettings.functions
+    scheduled = [job for job in WorkerSettings.cron_jobs if job.coroutine is reclaim_orphans]
+    assert scheduled, "reclaim_orphans is defined but never scheduled"
+
+
+def test_the_queue_client_is_the_one_that_can_enqueue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only ARQ's own pool has enqueue_job.
+
+    A plain redis.asyncio.Redis passes every type check here and then raises
+    AttributeError at the one moment it is needed -- when a user is already
+    locked and the flush has to be rescheduled.
+    """
+    import asyncio
+
+    from fittrack.worker import startup
+
+    for key, value in REQUIRED.items():
+        monkeypatch.setenv(key, value)
+
+    from fittrack.settings import get_settings
+
+    get_settings.cache_clear()
+
+    class FakePool:
+        """Stands in for ArqRedis: the only thing that matters is enqueue_job."""
+
+        async def enqueue_job(self, _function: str, *_args: object, **_kwargs: object) -> None:
+            return None
+
+    ctx: dict[str, object] = {"redis": FakePool()}
+    asyncio.run(startup(ctx))
+    get_settings.cache_clear()
+
+    assert hasattr(ctx["redis_queue"], "enqueue_job")
+    assert ctx["redis_queue"] is ctx["redis"]

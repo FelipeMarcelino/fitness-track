@@ -7,9 +7,10 @@ from __future__ import annotations
 
 import base64
 import logging
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Final
 
 import redis.asyncio as aioredis
+from arq import cron
 from arq.connections import RedisSettings
 from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -20,6 +21,9 @@ from fittrack.services.pipeline import BUSY_RETRY_SECONDS, Pipeline
 from fittrack.settings import get_settings
 
 log = logging.getLogger(__name__)
+
+# Orphans are rare and not urgent, but they are invisible until swept.
+RECLAIM_EVERY_MINUTES: Final = 5
 
 
 class _LazyRedisSettings:
@@ -67,6 +71,12 @@ async def startup(ctx: dict[str, Any]) -> None:
     settings = get_settings()
     key = base64.b64decode(settings.fittrack_encryption_key.get_secret_value())
 
+    # ARQ puts its own pool in ctx["redis"] before calling this, and that is
+    # the only client with enqueue_job. It decodes nothing, though, so the
+    # buffer and the lock get their own text-mode client: reclaim_orphans
+    # partitions scanned keys with a str separator and would fail on bytes.
+    ctx["redis_queue"] = ctx["redis"]
+
     redis: aioredis.Redis = aioredis.from_url(  # type: ignore[no-untyped-call]
         settings.redis_url.get_secret_value(),
         decode_responses=True,
@@ -75,15 +85,15 @@ async def startup(ctx: dict[str, Any]) -> None:
     batches = BatchStore(create_async_engine(settings.database_url.get_secret_value()))
 
     ctx["settings"] = settings
-    ctx["redis"] = redis
+    ctx["redis_text"] = redis
     ctx["buffer"] = buffer
     ctx["encryptor"] = Encryptor(KeyRing({1: key}, current_version=1))
     ctx["pipeline"] = Pipeline(redis, buffer, batches, _handle)
-    ctx["redis_queue"] = ctx.get("redis")
 
 
 async def shutdown(ctx: dict[str, Any]) -> None:
-    redis = ctx.get("redis")
+    # Only ours; ARQ closes its own pool.
+    redis = ctx.get("redis_text")
     if redis is not None:
         await redis.aclose()
 
@@ -97,8 +107,13 @@ class WorkerSettings:
     fine.
     """
 
-    functions: ClassVar[list[Any]] = [flush_user]
-    cron_jobs: ClassVar[list[Any]] = []
+    functions: ClassVar[list[Any]] = [flush_user, reclaim_orphans]
+    # Unregistered, reclaim_orphans never runs, and a worker killed between the
+    # RENAME and the batch insert strands that burst in its drain key forever
+    # once the lease expires -- messages the user sent and the bot never sees.
+    cron_jobs: ClassVar[list[Any]] = [
+        cron(reclaim_orphans, minute=set(range(0, 60, RECLAIM_EVERY_MINUTES)), run_at_startup=True)
+    ]
     redis_settings = _LazyRedisSettings()
     on_startup = startup
     on_shutdown = shutdown

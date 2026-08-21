@@ -71,6 +71,47 @@ class BatchStore:
             attempts=int(attempts),
         )
 
+    async def tenant_id_for(self, bsuid: str) -> int | None:
+        """Resolves the identity a retry job carries back to a tenant."""
+        async with self._engine.begin() as conn:
+            row = await conn.execute(
+                text("SELECT id FROM tenant WHERE bsuid = :b AND deleted_at IS NULL"),
+                {"b": bsuid},
+            )
+            found = row.scalar_one_or_none()
+        return int(found) if found is not None else None
+
+    async def pending_for(self, tenant_id: int) -> Batch | None:
+        """The oldest batch this user still owes.
+
+        A retry only carries the user id, and by then Redis has nothing: the
+        drain took the messages. Without this lookup a failed batch is never
+        picked up again -- the retry drains an empty buffer and returns.
+        """
+        async with self._engine.begin() as conn:
+            await conn.execute(text(f"SET LOCAL app.tenant_id = '{tenant_id}'"))
+            row = await conn.execute(
+                text(
+                    "SELECT id, combined_text, message_ids, attempts "
+                    "FROM processing_batch "
+                    "WHERE tenant_id = :t AND status = 'pending' AND attempts < :max "
+                    "ORDER BY id LIMIT 1"
+                ),
+                {"t": tenant_id, "max": MAX_ATTEMPTS},
+            )
+            found = row.one_or_none()
+
+        if found is None:
+            return None
+        batch_id, combined, message_ids, attempts = found
+        return Batch(
+            id=int(batch_id),
+            tenant_id=tenant_id,
+            combined_text=str(combined),
+            message_ids=list(message_ids),
+            attempts=int(attempts),
+        )
+
     async def mark_attempt(self, batch: Batch) -> int:
         async with self._engine.begin() as conn:
             await conn.execute(text(f"SET LOCAL app.tenant_id = '{batch.tenant_id}'"))
