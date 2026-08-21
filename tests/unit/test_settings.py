@@ -119,14 +119,14 @@ def test_encryption_key_must_be_32_bytes(monkeypatch: pytest.MonkeyPatch) -> Non
     not at the first write to an encrypted column."""
     _env(monkeypatch, FITTRACK_ENCRYPTION_KEY="dG9vLXNob3J0")  # b"too-short"
 
-    with pytest.raises(ValidationError, match="32 bytes"):
+    with pytest.raises(ValidationError, match=r"32 bytes"):
         _build()
 
 
 def test_encryption_key_must_be_valid_base64(monkeypatch: pytest.MonkeyPatch) -> None:
     _env(monkeypatch, FITTRACK_ENCRYPTION_KEY="not base64 at all !!")
 
-    with pytest.raises(ValidationError, match="base64"):
+    with pytest.raises(ValidationError, match=r"base64"):
         _build()
 
 
@@ -134,7 +134,7 @@ def test_database_url_must_be_async_driver(monkeypatch: pytest.MonkeyPatch) -> N
     """A sync driver silently blocks the event loop under load."""
     _env(monkeypatch, DATABASE_URL="postgresql://u:p@localhost:5432/db")
 
-    with pytest.raises(ValidationError, match="asyncpg"):
+    with pytest.raises(ValidationError, match=r"asyncpg"):
         _build()
 
 
@@ -143,7 +143,7 @@ def test_blank_credential_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     the app and defer the failure to the first API call."""
     _env(monkeypatch, WABA_TOKEN="")
 
-    with pytest.raises(ValidationError, match="must not be empty"):
+    with pytest.raises(ValidationError, match=r"must not be empty"):
         _build()
 
 
@@ -152,7 +152,7 @@ def test_whitespace_only_credential_is_rejected(
 ) -> None:
     _env(monkeypatch, ANTHROPIC_API_KEY="   ")
 
-    with pytest.raises(ValidationError, match="must not be empty"):
+    with pytest.raises(ValidationError, match=r"must not be empty"):
         _build()
 
 
@@ -180,5 +180,5 @@ def test_rejects_urls_that_only_look_async(monkeypatch: pytest.MonkeyPatch, url:
     """A substring check would accept the first two."""
     _env(monkeypatch, DATABASE_URL=url)
 
-    with pytest.raises(ValidationError, match="postgresql\\+asyncpg"):
+    with pytest.raises(ValidationError, match=r"postgresql\+asyncpg"):
         _build()

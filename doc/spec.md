@@ -412,6 +412,8 @@ CREATE TABLE workout_session (
     plan_item_id    BIGINT,            -- se seguiu uma ficha
     CONSTRAINT ck_session_dates CHECK (ended_at IS NULL OR ended_at >= started_at)
 );
+ALTER TABLE workout_session ADD CONSTRAINT uq_session_tenant UNIQUE (id, tenant_id);
+
 -- No máximo uma sessão aberta por tenant
 CREATE UNIQUE INDEX ux_session_one_open
     ON workout_session(tenant_id) WHERE status = 'open';
@@ -425,7 +427,11 @@ CREATE TYPE set_status AS ENUM ('complete', 'incomplete');
 CREATE TABLE exercise_set (
     id              BIGSERIAL PRIMARY KEY,
     tenant_id       BIGINT NOT NULL REFERENCES tenant(id) ON DELETE CASCADE,
-    session_id      BIGINT NOT NULL REFERENCES workout_session(id) ON DELETE CASCADE,
+    -- FK tenant-qualificada: sem ela, uma série do tenant A pode apontar
+    -- para a sessão do tenant B, e apagar a sessão de B apagaria a série
+    -- de A por CASCADE. RLS não cobre isso: ela valida a linha nova, não
+    -- a integridade referencial com o pai.
+    session_id      BIGINT NOT NULL,
     exercise_id     BIGINT NOT NULL REFERENCES exercise(id),
     set_type        set_type NOT NULL DEFAULT 'strength',
     set_index       SMALLINT NOT NULL,          -- 1..N dentro do exercício na sessão
@@ -480,7 +486,9 @@ CREATE TABLE exercise_set (
      OR (set_type = 'isometric' AND hold_s IS NOT NULL)
      OR (set_type = 'interval'  AND rounds IS NOT NULL)
     ),
-    CONSTRAINT ck_rpe_range CHECK (rpe IS NULL OR (rpe >= 0 AND rpe <= 10))
+    CONSTRAINT ck_rpe_range CHECK (rpe IS NULL OR (rpe >= 0 AND rpe <= 10)),
+    FOREIGN KEY (session_id, tenant_id)
+        REFERENCES workout_session(id, tenant_id) ON DELETE CASCADE
 );
 CREATE INDEX ix_set_tenant_created ON exercise_set(tenant_id, created_at DESC)
     WHERE deleted_at IS NULL;
@@ -655,12 +663,13 @@ CREATE TABLE workout_plan (
     UNIQUE (id, tenant_id)            -- alvo da FK composta em plan_item
 );
 
--- tenant_id obrigatório pelo mesmo motivo de program_phase: RLS é por tabela
--- e não se propaga por FK. Sem ele, uma query direta em plan_item leria os
--- itens de ficha de todos os tenants.
+-- tenant_id existe pelo mesmo motivo de program_phase: RLS é por tabela e
+-- não se propaga por FK. É NULL nos itens de ficha global, espelhando
+-- workout_plan.tenant_id — com MATCH SIMPLE, a FK composta não é checada
+-- quando qualquer coluna é NULL, que é o que permite item global existir.
 CREATE TABLE plan_item (
     id           BIGSERIAL PRIMARY KEY,
-    tenant_id    BIGINT NOT NULL REFERENCES tenant(id) ON DELETE CASCADE,
+    tenant_id    BIGINT REFERENCES tenant(id) ON DELETE CASCADE,
     plan_id      BIGINT NOT NULL,
     day_label    TEXT NOT NULL,   -- "A" | "Push" | "Segunda"
     day_order    SMALLINT NOT NULL,
@@ -2262,6 +2271,25 @@ lista é um vazamento silencioso: basta um repositório esquecer o predicado de 
 Postgres devolver linhas de outro usuário.
 
 ```sql
+-- O PAPEL DA APLICAÇÃO NÃO PODE SER SUPERUSUÁRIO.
+-- Superusuário (e qualquer role com BYPASSRLS) ignora RLS mesmo com FORCE.
+-- Conectar como o dono criado pela imagem do Postgres torna toda esta seção
+-- decorativa: as policies existem e nunca são avaliadas.
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'fittrack_app') THEN
+    CREATE ROLE fittrack_app NOLOGIN NOSUPERUSER NOBYPASSRLS;
+  END IF;
+END $$;
+
+GRANT USAGE ON SCHEMA public TO fittrack_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO fittrack_app;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO fittrack_app;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO fittrack_app;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT USAGE, SELECT ON SEQUENCES TO fittrack_app;
+
 -- Aplicar a cada tabela tenant-scoped, sem exceção:
 --   athlete_profile, consent, subscription, exercise (privados),
 --   exercise_alias, workout_session, exercise_set, session_summary,
@@ -2284,6 +2312,23 @@ BEGIN
       CREATE POLICY tenant_isolation ON %I
         USING (tenant_id IS NOT DISTINCT FROM
                NULLIF(current_setting('app.tenant_id', true), '')::bigint)
+        WITH CHECK (tenant_id IS NOT DISTINCT FROM
+               NULLIF(current_setting('app.tenant_id', true), '')::bigint)
+    $f$, t);
+  END LOOP;
+END $$;
+
+-- Linhas GLOBAIS (tenant_id IS NULL) precisam ser LEGÍVEIS por qualquer tenant:
+-- o resolver (§10) consulta `tenant_id IS NULL OR tenant_id = :t`, e sem esta
+-- policy o catálogo global fica invisível assim que app.tenant_id é definido.
+-- Somente leitura: escrever no catálogo global é operação administrativa.
+DO $$
+DECLARE t text;
+BEGIN
+  FOREACH t IN ARRAY ARRAY['exercise','exercise_alias','workout_plan','plan_item'] LOOP
+    EXECUTE format($f$
+      CREATE POLICY global_rows_readable ON %I
+        FOR SELECT USING (tenant_id IS NULL)
     $f$, t);
   END LOOP;
 END $$;
@@ -2293,6 +2338,10 @@ Notas:
 
 - **`FORCE ROW LEVEL SECURITY`** é necessário porque o dono da tabela ignora RLS por padrão — sem
   ele a barreira não existe para o usuário das migrações.
+- **`FORCE` não basta.** Superusuário e qualquer role com `BYPASSRLS` ignoram RLS de qualquer
+  forma. A aplicação conecta como `fittrack_app` (`NOSUPERUSER NOBYPASSRLS`); as migrações
+  rodam como o dono. Se `DATABASE_URL` apontar para o superusuário, as policies existem e
+  nunca são avaliadas — é falha silenciosa, não erro.
 - **`exercise` e `exercise_alias`** têm `tenant_id` nulo nas linhas globais; `IS NOT DISTINCT FROM`
   as mantém visíveis apenas quando `app.tenant_id` também está ausente. Para leitura do catálogo
   global use uma role dedicada de leitura, ou uma policy adicional `USING (tenant_id IS NULL)`.
