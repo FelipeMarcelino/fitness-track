@@ -109,10 +109,14 @@ def _int(value: object) -> int:
     int() on a stray string raises, which escapes parse(), becomes a 500,
     and contradicts the guarantee that odd payloads are acknowledged rather
     than retried."""
-    try:
-        return int(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return 0
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return 0
+    return 0
 
 
 def _list(value: object) -> list[dict[str, Any]]:
