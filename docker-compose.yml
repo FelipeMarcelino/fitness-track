@@ -1,0 +1,85 @@
+# Infra do sprint 01 (§3.1). Apenas o caddy publica portas; o resto fica na
+# rede interna — Postgres, Redis e Qdrant nunca ficam expostos (§22).
+name: fittrack
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    environment:
+      FITTRACK_DOMAIN: ${FITTRACK_DOMAIN:-localhost}
+    depends_on:
+      ingress: { condition: service_healthy }
+
+  ingress:
+    build: .
+    restart: unless-stopped
+    env_file: [.env]
+    expose: ["8000"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health',timeout=3).status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  worker:
+    build: .
+    restart: unless-stopped
+    env_file: [.env]
+    command: ["arq", "fittrack.worker.WorkerSettings"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-fittrack}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fittrack}
+      POSTGRES_DB: ${POSTGRES_DB:-fittrack}
+    volumes: [pg_data:/var/lib/postgresql/data]
+    expose: ["5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-fittrack}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # appendonly: o buffer de rajada (§17.1) não pode evaporar num restart
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes: [redis_data:/data]
+    expose: ["6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  qdrant:
+    # Sobe já no sprint 01 sem uso: infra é barata agora e cara no meio de
+    # outro sprint. As coleções chegam no sprint 04.
+    image: qdrant/qdrant:v1.19.0
+    restart: unless-stopped
+    volumes: [qdrant_data:/qdrant/storage]
+    expose: ["6333"]
+
+volumes:
+  pg_data:
+  redis_data:
+  qdrant_data:
+  caddy_data:
+  caddy_config:
