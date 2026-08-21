@@ -25,7 +25,11 @@ log = logging.getLogger(__name__)
 # Short: the holder is usually mid-LLM-call and will be done shortly.
 BUSY_RETRY_SECONDS: Final = 5
 
-Handler = Callable[[Batch], Awaitable[None]]
+# The bsuid travels with the batch because the handler needs it and the batch
+# row does not carry it: processing_batch is keyed on tenant_id, and looking
+# the bsuid back up would be a query per batch for something the caller
+# already has in hand.
+Handler = Callable[[Batch, str], Awaitable[None]]
 
 
 class Pipeline:
@@ -81,7 +85,7 @@ class Pipeline:
             # Durable now; Redis can let go.
             await self._buffer.discard(bsuid, batch_id)
 
-            return await self._run(batch, lock)
+            return await self._run(batch, bsuid, lock)
 
     async def _resume(self, bsuid: str, lock: UserLock) -> Batch | None:
         """Picks up a batch a previous attempt left pending.
@@ -97,12 +101,12 @@ class Pipeline:
             return None
 
         log.info("resuming batch %s after a previous failure", batch.id)
-        return await self._run(batch, lock)
+        return await self._run(batch, bsuid, lock)
 
     async def _tenant_of(self, bsuid: str) -> int | None:
         return await self._batches.tenant_id_for(bsuid)
 
-    async def _run(self, batch: Batch, lock: UserLock) -> Batch:
+    async def _run(self, batch: Batch, bsuid: str, lock: UserLock) -> Batch:
         """Runs the handler, counting the attempt before rather than after.
 
         Counting afterwards means a handler that crashes the process never
@@ -118,7 +122,7 @@ class Pipeline:
             # Under the lock's guard: if the lease is lost mid-handler another
             # worker is already on this user, and continuing would write the
             # same sets twice.
-            await lock.guard(self._handler(batch))
+            await lock.guard(self._handler(batch, bsuid))
         except LockLostError:
             # Not the batch's fault, so it is left pending rather than being
             # marked failed. The row keeps its incremented attempt, which is

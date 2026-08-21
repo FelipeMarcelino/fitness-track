@@ -1015,8 +1015,13 @@ class GraphState(TypedDict):
     ack_mode: Literal["reaction","text","silent"]
     confidence: float
     pending_clarification: dict | None
-    errors: list[str]
 ```
+
+> `errors` aparece **uma vez só**, com reducer. Uma versão anterior desta seção
+> declarava o campo duas vezes — a segunda sem `Annotated` — e em Python a
+> segunda vence, o que apagava o reducer. Dois ramos falhando no mesmo
+> super-step levantariam `InvalidUpdateError`, transformando duas falhas numa
+> terceira não relacionada. É exatamente a armadilha que a §8.7 descreve.
 
 **Poda do estado.** Após cada execução, um reducer mantém no máximo as 12 últimas mensagens em
 `messages`; o excedente é comprimido em `conversation_digest` pelo `SUMMARY` tier a cada 20

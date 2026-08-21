@@ -16,6 +16,12 @@ dependencies = [
     "httpx>=0.28",
     "cryptography>=44.0",
     "python-dateutil>=2.9",
+    "langgraph>=1.2",
+    # The Postgres checkpointer is a separate distribution, and it brings
+    # psycopg (v3) with it: the graph's own connection is sync-capable and
+    # separate from SQLAlchemy's asyncpg engine.
+    "langgraph-checkpoint-postgres>=3.1",
+    "psycopg[binary,pool]>=3.2",
 ]
 
 [project.optional-dependencies]
@@ -48,7 +54,14 @@ select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "PT", "SIM", "ARG", "RU
 ignore = ["E501"]  # line length is enforced by the formatter
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["ARG001"]  # fixtures are injected, not called
+# Fixtures are injected, not called; and a fake standing in for a real
+# collaborator has to keep its parameter names, because the caller passes them
+# by keyword. Renaming one to satisfy the linter breaks the call at runtime.
+"tests/**" = ["ARG001", "ARG002"]
+# LangGraph matches nodes against a Protocol whose parameter is named `state`,
+# so renaming it to `_state` to satisfy ARG001 makes mypy reject the node.
+# A node that does not read the state yet is a placeholder, not a mistake.
+"src/fittrack/graph/**" = ["ARG001"]
 
 [tool.mypy]
 python_version = "3.12"

@@ -60,7 +60,7 @@ async def test_a_burst_becomes_one_processed_batch(
     tenant_id = await _tenant(owner_conn, "pipe-1")
     seen: list[Batch] = []
 
-    async def handler(batch: Batch) -> None:
+    async def handler(batch: Batch, _bsuid: str) -> None:
         seen.append(batch)
 
     pipeline, buffer = _pipeline(client, app_dsn, handler)
@@ -86,7 +86,7 @@ async def test_a_second_worker_backs_off_instead_of_waiting(
     call; under load every worker ends up blocked on a handful of users."""
     tenant_id = await _tenant(owner_conn, "pipe-2")
 
-    async def handler(batch: Batch) -> None:
+    async def handler(batch: Batch, _bsuid: str) -> None:
         return None
 
     pipeline, buffer = _pipeline(client, app_dsn, handler)
@@ -109,7 +109,7 @@ async def test_a_failing_handler_leaves_the_batch_retryable(
     batch retries forever."""
     tenant_id = await _tenant(owner_conn, "pipe-3")
 
-    async def handler(batch: Batch) -> None:
+    async def handler(batch: Batch, _bsuid: str) -> None:
         raise RuntimeError("provider down")
 
     pipeline, buffer = _pipeline(client, app_dsn, handler)
@@ -138,7 +138,7 @@ async def test_an_exhausted_batch_is_marked_failed_not_retried(
     silence, and the raw text is still in raw_message either way."""
     tenant_id = await _tenant(owner_conn, "pipe-4")
 
-    async def handler(batch: Batch) -> None:
+    async def handler(batch: Batch, _bsuid: str) -> None:
         raise RuntimeError("still down")
 
     _, buffer = _pipeline(client, app_dsn, handler)
@@ -191,7 +191,7 @@ async def test_two_users_are_processed_concurrently(
     running = 0
     peak = 0
 
-    async def handler(batch: Batch) -> None:
+    async def handler(batch: Batch, _bsuid: str) -> None:
         nonlocal running, peak
         running += 1
         peak = max(peak, running)
@@ -227,7 +227,7 @@ async def test_the_messages_survive_a_crash_before_the_batch_is_written(
     buffer = BurstBuffer(client, window_seconds=WINDOW)
     store = DyingStore(create_async_engine(app_dsn))
 
-    async def handler(batch: Batch) -> None:  # pragma: no cover - never reached
+    async def handler(batch: Batch, _bsuid: str) -> None:  # pragma: no cover - never reached
         raise AssertionError("the batch was never created")
 
     pipeline = Pipeline(client, buffer, store, handler)
@@ -265,7 +265,7 @@ async def test_a_failed_batch_is_retried_from_the_database(
     tenant_id = await _tenant(owner_conn, "pipe-retry")
     attempts: list[str] = []
 
-    async def flaky(batch: Batch) -> None:
+    async def flaky(batch: Batch, _bsuid: str) -> None:
         attempts.append(batch.combined_text)
         if len(attempts) == 1:
             raise RuntimeError("the model timed out")
