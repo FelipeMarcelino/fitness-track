@@ -13,6 +13,8 @@ from contextlib import asynccontextmanager
 from typing import Literal
 
 import redis.asyncio as aioredis
+from arq import create_pool
+from arq.connections import ArqRedis, RedisSettings
 from fastapi import FastAPI
 from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -25,7 +27,7 @@ from fittrack.settings import Settings, get_settings
 log = logging.getLogger(__name__)
 
 
-def build_ingest(settings: Settings) -> tuple[Ingest, aioredis.Redis]:
+async def build_ingest(settings: Settings) -> tuple[Ingest, aioredis.Redis, ArqRedis]:
     key = base64.b64decode(settings.fittrack_encryption_key.get_secret_value())
     encryptor = Encryptor(KeyRing({1: key}, current_version=1))
     engine = create_async_engine(settings.database_url.get_secret_value())
@@ -35,7 +37,11 @@ def build_ingest(settings: Settings) -> tuple[Ingest, aioredis.Redis]:
         decode_responses=True,
     )
     buffer = BurstBuffer(redis, window_seconds=settings.debounce_window_s)
-    return Ingest(engine, encryptor, buffer), redis
+    # A separate ARQ pool: enqueue_job lives on ArqRedis, and ARQ serialises
+    # jobs itself, so the text-mode client above cannot stand in for it.
+    queue = await create_pool(RedisSettings.from_dsn(settings.redis_url.get_secret_value()))
+    ingest = Ingest(engine, encryptor, buffer, queue, settings.debounce_window_s)
+    return ingest, redis, queue
 
 
 @asynccontextmanager
@@ -48,11 +54,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
     settings = get_settings()
     app.state.settings = settings
-    app.state.ingest, redis = build_ingest(settings)
+    app.state.ingest, redis, queue = await build_ingest(settings)
     try:
         yield
     finally:
         await redis.aclose()
+        await queue.aclose()
 
 
 app = FastAPI(title="FitTrack", docs_url=None, redoc_url=None, lifespan=lifespan)

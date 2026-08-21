@@ -8,7 +8,7 @@ and enqueue.
 from __future__ import annotations
 
 import logging
-from typing import Any, Protocol
+from typing import Any, Final, Protocol
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -21,6 +21,18 @@ log = logging.getLogger(__name__)
 
 class Buffer(Protocol):
     async def push(self, bsuid: str, message: dict[str, Any]) -> None: ...
+
+
+class Scheduler(Protocol):
+    """The ARQ pool, narrowed to what ingress needs."""
+
+    async def enqueue_job(self, function: str, *args: Any, **kwargs: Any) -> Any: ...
+
+
+# Margin on top of the debounce window. The job must fire after the deadline
+# it was scheduled against, and ARQ's poll interval plus clock skew can land it
+# a hair early -- which costs a whole extra round trip through the queue.
+SCHEDULE_MARGIN_SECONDS: Final = 2
 
 
 class Ingest:
@@ -37,10 +49,19 @@ class Ingest:
     silently lost the user's workout.
     """
 
-    def __init__(self, engine: AsyncEngine, encryptor: Encryptor, buffer: Buffer) -> None:
+    def __init__(
+        self,
+        engine: AsyncEngine,
+        encryptor: Encryptor,
+        buffer: Buffer,
+        scheduler: Scheduler,
+        window_seconds: int,
+    ) -> None:
         self._engine = engine
         self._encryptor = encryptor
         self._buffer = buffer
+        self._scheduler = scheduler
+        self._window = window_seconds
 
     async def accept_message(self, message: InboundMessage, envelope: dict[str, Any]) -> None:
         stored = await self._store(message, envelope)
@@ -60,6 +81,31 @@ class Ingest:
                     "button_id": message.button_id,
                 },
             )
+            await self._schedule_flush(message.bsuid)
+
+    async def _schedule_flush(self, bsuid: str) -> None:
+        """Asks a worker to look at this user once the window has closed.
+
+        Buffering without scheduling is where the burst dies: nothing else in
+        the system enqueues `flush_user`, so the messages would sit in Redis
+        until their TTL and the user would never get an answer.
+
+        One job per message rather than one per burst. The window renews on
+        every message, so an early job finds the buffer not ready and returns;
+        the job belonging to the last message is the one that fires after the
+        real deadline. Deduplicating on the user would mean pinning the flush
+        to the *first* message's deadline and cutting the burst short.
+        """
+        try:
+            await self._scheduler.enqueue_job(
+                "flush_user", bsuid, _defer_by=self._window + SCHEDULE_MARGIN_SECONDS
+            )
+        except Exception:
+            # The delivery is already persisted and buffered, so this is
+            # recoverable: the next message from this user schedules a flush
+            # that picks up everything. Failing the request would make Meta
+            # redeliver a message we already stored.
+            log.exception("could not schedule the flush for %s", bsuid)
 
     async def accept_status(self, update: StatusUpdate) -> None:
         if update.error_code is None:

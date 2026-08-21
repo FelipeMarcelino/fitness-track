@@ -155,15 +155,31 @@ class BurstBuffer:
         Separate from `drain` so a worker that crashed after the RENAME can be
         recovered: the batch is still sitting in its drain key.
         """
-        key = self.drain_key(bsuid, batch_id)
+        messages = await self.peek(bsuid, batch_id)
+        await self.discard(bsuid, batch_id)
+        return messages
+
+    async def peek(self, bsuid: str, batch_id: str) -> list[dict[str, Any]]:
+        """Reads a claimed batch without dropping it.
+
+        Kept separate from `discard` so the messages survive until they are
+        durable somewhere else. Deleting here and persisting afterwards leaves
+        a window where a dying worker loses the burst from both Redis and
+        Postgres, with nothing for the reclaimer to find.
+        """
         # redis-py types lrange as sync-or-async on the shared stub; the
         # async client always returns an awaitable.
-        raw: list[str] = await self._redis.lrange(key, 0, -1)  # type: ignore[misc]
+        raw: list[str] = await self._redis.lrange(  # type: ignore[misc]
+            self.drain_key(bsuid, batch_id), 0, -1
+        )
+        return [json.loads(item) for item in raw]
+
+    async def discard(self, bsuid: str, batch_id: str) -> None:
+        """Drops a batch that is now safe elsewhere, and its lease."""
         async with self._redis.pipeline(transaction=True) as pipe:
-            pipe.delete(key)
+            pipe.delete(self.drain_key(bsuid, batch_id))
             pipe.delete(self._lease_key(bsuid, batch_id))
             await pipe.execute()
-        return [json.loads(item) for item in raw]
 
     async def reclaim_orphans(self) -> int:
         """Returns stranded batches to their buffers.
