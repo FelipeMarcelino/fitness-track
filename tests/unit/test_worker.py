@@ -83,3 +83,17 @@ def test_the_queue_client_is_the_one_that_can_enqueue(
 
     assert hasattr(ctx["redis_queue"], "enqueue_job")
     assert ctx["redis_queue"] is ctx["redis"]
+
+
+def test_the_delivery_job_is_registered() -> None:
+    """The dispatcher reschedules itself by name after a backoff.
+
+    Unregistered, that enqueue lands a job ARQ cannot run, and every retryable
+    send failure becomes a permanent one.
+    """
+    from fittrack.worker import deliver_outbound
+
+    assert deliver_outbound in WorkerSettings.functions
+    assert deliver_outbound.__name__ == "deliver_outbound", (
+        "the dispatcher enqueues this name literally"
+    )
