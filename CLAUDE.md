@@ -29,7 +29,7 @@ Antes de propor qualquer decisão de arquitetura, leia a seção relevante da sp
 navegável:
 
 | Precisa de | Seção |
-|---|---|
+| --- | --- |
 | Por que uma decisão foi tomada | §2 (tabela AD-01 a AD-27) |
 | Schema do banco | §5.2 |
 | Ciclo de vida da sessão de treino | §6 |
@@ -136,7 +136,7 @@ Toda implementação tem teste. Sem exceção.
 Nunca commitar direto na `main`. Todo trabalho sai em branch, **com nome em inglês**:
 
 | Tipo | Prefixo | Exemplo |
-|---|---|---|
+| --- | --- | --- |
 | Feature | `feat/` | `feat/whatsapp-webhook` |
 | Correção de bug | `hotfix/` | `hotfix/session-timeout-race` |
 | Documentação | `doc/` | `doc/adr-vector-store` |

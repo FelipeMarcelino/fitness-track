@@ -3,7 +3,7 @@
 **Sistema multi-agente de registro, análise e recomendação de treinos via WhatsApp**
 
 | | |
-|---|---|
+| --- | --- |
 | Versão | 1.0 |
 | Data | 2026-08-21 |
 | Status | Spec aprovada para implementação |
@@ -61,7 +61,7 @@ atravessam a spec inteira:
 ## 2. Decisões arquiteturais
 
 | # | Decisão | Escolha | Justificativa |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | AD-01 | Canal WhatsApp | WhatsApp Cloud API (Meta) | Oficial, sem risco de ban, webhook HTTP estável. Custo: janela de 24h e templates aprovados para proativo. |
 | AD-02 | Escala e identidade | Multi-tenant, centenas/milhares; tenant = `bsuid` | BSUID (business-scoped user ID) é opaco e pseudonimizado: dispensa armazenar telefone, sobrevive à troca de número e reduz a exposição LGPD. Exige isolamento, quota e RLS. |
 | AD-03 | Persistência relacional | PostgreSQL 16 | Domínio fortemente relacional; também hospeda checkpoints LangGraph. |
@@ -155,7 +155,7 @@ atravessam a spec inteira:
 ### 3.1 Serviços do `docker-compose.yml`
 
 | Serviço | Imagem/Base | Réplicas | Papel |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `ingress` | app (FastAPI + uvicorn) | 2 | Webhook WhatsApp, webhook Mercado Pago, healthcheck |
 | `worker` | app (ARQ) | 4 (ajustável) | Executa o grafo LangGraph |
 | `scheduler` | app (APScheduler) | 1 | Jobs periódicos |
@@ -684,7 +684,7 @@ da última thread de cada tenant.
 ### 6.2 Regras de guarda
 
 | Regra | Valor | Comportamento |
-|---|---|---|
+| --- | --- | --- |
 | `SESSION_IDLE_TIMEOUT` | 90 min | Fecha automaticamente por inatividade. |
 | `SESSION_MAX_DURATION` | 4 h | Fecha mesmo com atividade recente (protege contra sessão zumbi). |
 | `SESSION_DAY_BOUNDARY` | 04:00 local | Sessão nunca cruza esse horário; fecha e a próxima série abre nova. |
@@ -743,7 +743,7 @@ Responsabilidades:
 ### 7.2 Tiering por papel
 
 | Role | Uso | Volume | Tier | Primário (xAI) | Fallback (Anthropic) |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | `ROUTER` | supervisor, classificação de intenção | Altíssimo | rápido | `grok-4-fast` | `claude-haiku-4-5` |
 | `EXTRACTOR` | extração estruturada de séries | Altíssimo | rápido | `grok-4-fast` | `claude-haiku-4-5` |
 | `RESOLVER` | desempate de exercício ambíguo | Médio | rápido | `grok-4-fast` | `claude-haiku-4-5` |
@@ -794,7 +794,7 @@ perdido — fica em `raw_message`.
 ### 7.4 Diferenças entre providers que o gateway precisa absorver
 
 | Aspecto | xAI (Grok) | Anthropic |
-|---|---|---|
+| --- | --- | --- |
 | SDK LangChain | `langchain_xai.ChatXAI` | `langchain_anthropic.ChatAnthropic` |
 | Structured output | `response_format` JSON Schema (estilo OpenAI) | `output_config.format` com `json_schema`, ou tool com `strict: true` |
 | Amostragem | `temperature`, `top_p` aceitos | **Rejeitados** em `claude-opus-5` / `claude-haiku-4-5` de nova geração → o gateway **remove** esses parâmetros no caminho Anthropic |
@@ -989,7 +989,7 @@ que carreguem região com `health_report` ativo, ou que exijam equipamento fora 
 ### 9.1 Núcleo — obrigatório
 
 | Agente | Tier | Entrada | Saída | Descrição |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | `guardrail_agent` | GUARDRAIL | texto da rajada | `{verdict, category, region, severity}` | Triagem de saúde/segurança e de conteúdo fora de escopo. Ver §12. |
 | `supervisor_agent` | ROUTER | texto + contexto | `list[RouteStep]` | Gera o **plano** ordenado de rotas. Suporta pedidos compostos. |
 | `transcriber` | — (Groq) | media_id | texto pt-BR | Não é agente LLM; é serviço. Ver §11. |
@@ -1003,7 +1003,7 @@ que carreguem região com `health_report` ativo, ou que exijam equipamento fora 
 ### 9.2 Capacidades de valor — v1
 
 | Agente | Tier | Fase | Descrição |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `analytics_planner` + `narrator` | ANALYST | 1.1 | Análise de evolução e consulta ao histórico via tools SQL. |
 | `recommendation_agent` | COACH | 1.2 | Monta/ajusta ficha combinando texto + histórico + RAG. |
 | `progression_agent` | COACH | 1.2 | Sugere próxima carga por e1RM (Epley/Brzycki) e RPE reportado. |
@@ -1013,7 +1013,7 @@ que carreguem região com `health_report` ativo, ou que exijam equipamento fora 
 ### 9.3 Agentes adicionais aprovados
 
 | Agente | Tier | Fase | Descrição |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `onboarding_agent` | ROUTER | 1.0 | Conversa inicial: objetivo, nível, frequência, equipamento, lesões + coleta de consentimentos LGPD. Máquina de estados guiada, não free-form. |
 | `volume_auditor` | ANALYST | 1.2 | Volume semanal por grupo muscular vs. faixas da literatura; detecta desequilíbrio empurrar/puxar e grupos negligenciados. |
 | `gamification_agent` | — (Python + VOICE) | 1.1 | PRs, streaks, marcos de volume. SQL puro + geração de mensagem. Roda no fechamento de sessão. |
@@ -1074,7 +1074,7 @@ class ExtractionResult(BaseModel):
 ### 9.5 Mapa de RPE a partir de linguagem natural
 
 | Expressão | RPE | RIR aprox. |
-|---|---|---|
+| --- | --- | --- |
 | "muito fácil", "moleza", "aquecimento" | 3 | 7+ |
 | "fácil", "tranquilo", "de boa", "leve" | 4–5 | 5–6 |
 | "normal", "ok", "deu pra fazer" | 6 | 4 |
@@ -1175,7 +1175,7 @@ repetições, séries, carga, quilos, drop-set, falha, aquecimento.
 ### 11.3 Regras
 
 | Regra | Valor |
-|---|---|
+| --- | --- |
 | Duração máxima | 5 min (acima disso, pede para dividir) |
 | Retenção do áudio | Descarte imediato após transcrição bem-sucedida |
 | Buffer de falha | Em erro de STT, mantém em `/tmp` por até 6h para retry; depois apaga |
@@ -1196,7 +1196,7 @@ política de privacidade. Um `AudioTranscriber` com interface abstrata permite m
 ### 12.1 Categorias
 
 | Categoria | Gatilho | Ação |
-|---|---|---|
+| --- | --- | --- |
 | `PASS` | Conteúdo normal | Segue para o supervisor. |
 | `HEALTH_REPORT` | Dor, lesão, desconforto, tontura, mal-estar | Grava `health_report`. Responde com acolhimento + orientação para profissional. **Registra a série se houver.** Passa a evitar a região nas recomendações. |
 | `MEDICAL_ADVICE` | Pedido de diagnóstico, tratamento, medicação | Recusa educadamente, orienta procurar profissional, não prescreve. |
@@ -1292,7 +1292,7 @@ else:
 O `voice_agent` recebe três eixos e ajusta:
 
 | Eixo | Valores | Efeito |
-|---|---|---|
+| --- | --- | --- |
 | `persona_style` (perfil) | `parceiro` (padrão), `tecnico`, `motivacional` | Vocabulário e grau de formalidade. |
 | `context` | `in_session`, `out_of_session` | Em sessão: máx. 1 frase, sem markdown, sem emoji além do ack. Fora: até 5 frases, listas curtas permitidas. |
 | `experience_level` | iniciante / intermediário / avançado | Iniciante: explica termos ("RPE, que é o quanto foi difícil de 0 a 10"). Avançado: usa jargão direto. |
@@ -1324,7 +1324,7 @@ usuário responder (o que reabre a janela).
 ### 14.2 Templates a submeter
 
 | Nome | Categoria | Corpo | Uso |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `retomada_treino` | UTILITY | "Oi {{1}}! Faz {{2}} dias desde seu último treino. Quer retomar?" | Ausência ≥ 7 dias |
 | `insight_disponivel` | UTILITY | "Oi {{1}}, preparei uma análise do seu último ciclo de treino. Quer ver?" | Platô, deload, auditoria de volume |
 | `resumo_semanal` | UTILITY | "Seu resumo da semana está pronto: {{1}} treinos, {{2}} kg de volume. Quer os detalhes?" | Domingo à noite (opt-in) |
@@ -1348,7 +1348,7 @@ scheduler (3 janelas: 09:00, 13:00, 19:00 no fuso do tenant)
 ### 14.4 Detectores (SQL, sem LLM)
 
 | Detector | Regra |
-|---|---|
+| --- | --- |
 | Ausência | Nenhuma sessão há ≥ 7 dias e histórico de ≥ 4 sessões nas 4 semanas anteriores. |
 | Platô | e1RM do exercício estagnado (variação < 2%) por ≥ 4 semanas com ≥ 6 sessões. |
 | Fadiga / deload | RPE médio subindo ≥ 1,5 ponto em 3 semanas com volume estável ou em queda. |
@@ -1371,7 +1371,7 @@ conhecimento) e poluiria o contexto do extrator.
 ### 15.2 Coleções no Qdrant
 
 | Coleção | Conteúdo | Chunking | Filtros de payload |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `exercise_catalog` | Nome, apelidos, músculos, equipamento, execução, substitutos | 1 doc = 1 exercício (sem split) | `tenant_id` (null = global), `modality`, `equipment`, `pattern` |
 | `workout_templates` | Fichas: PPL, upper/lower, full body, 5x5, periodizações | 1 doc = 1 dia da ficha | `goal`, `level`, `days_week`, `split_type` |
 | `training_literature` | Sobrecarga progressiva, faixas de reps, volume semanal por grupo, deload, RIR/RPE | 500–800 tokens, split semântico por seção, overlap 80 | `topic`, `source`, `evidence_level` |
@@ -1436,7 +1436,7 @@ async def search_knowledge(
 Conjunto **fixo** de tools tipadas. O `tenant_id` é sempre injetado pelo código, nunca pelo LLM.
 
 | Tool | Assinatura | Retorno |
-|---|---|---|
+| --- | --- | --- |
 | `load_progression` | `(exercise_slug, weeks=12, metric="e1rm"\|"top_set"\|"volume")` | Série temporal semanal + variação % + tendência |
 | `weekly_volume` | `(weeks=8, group_by="muscle"\|"pattern"\|"exercise")` | Volume (kg) e nº de séries por semana e grupo |
 | `training_frequency` | `(weeks=8)` | Sessões/semana, dias entre treinos, aderência vs. meta do perfil |
@@ -1492,7 +1492,7 @@ backlog (fase 2), com whitelist de tabelas, `LIMIT` forçado, timeout e `tenant_
 ### 17.1 Chaves Redis
 
 | Chave | Tipo | TTL | Uso |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `seen:{message_id}` | string | 24h | Dedup de webhook (Meta reentrega) |
 | `buffer:{bsuid}` | list | 1h | Mensagens da rajada aguardando flush |
 | `debounce:{bsuid}` | string | 10s | Timer de silêncio; renovado a cada mensagem |
@@ -1505,7 +1505,7 @@ backlog (fase 2), com whitelist de tabelas, `LIMIT` forçado, timeout e `tenant_
 ### 17.2 Filas ARQ
 
 | Fila | Concorrência/worker | Timeout | Conteúdo |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `default` | 10 | 90s | Processamento de rajadas (ingestão, consultas) |
 | `analysis` | 3 | 300s | Análises pesadas, geração de ficha |
 | `proactive` | 5 | 60s | Mensagens proativas do coach |
@@ -1574,7 +1574,7 @@ teórico. **O gargalo real é o rate limit do provider de LLM e o custo de token
 ### 18.1 Endpoints do `ingress`
 
 | Método | Rota | Uso |
-|---|---|---|
+| --- | --- | --- |
 | `GET` | `/webhook/whatsapp` | Verificação inicial (`hub.challenge`) |
 | `POST` | `/webhook/whatsapp` | Recebimento de mensagens e status |
 | `POST` | `/webhook/mercadopago` | Notificações de assinatura |
@@ -1592,7 +1592,7 @@ teórico. **O gargalo real é o rate limit do provider de LLM e o custo de token
 ### 18.3 Tipos de mensagem tratados
 
 | Tipo | Tratamento |
-|---|---|
+| --- | --- |
 | `text` | Vai direto para o buffer. |
 | `audio` | Baixa, transcreve, entra no buffer como texto com `has_audio=true`. |
 | `interactive` (button_reply) | Resposta a esclarecimento → `Command(resume=...)`. |
@@ -1687,7 +1687,7 @@ Notas:
 ### 19.2 Planos (AD-21)
 
 | Capacidade | Free | Pro |
-|---|---|---|
+| --- | --- | --- |
 | Registro de treino (texto e áudio) | ✅ ilimitado | ✅ ilimitado |
 | Correção e edição | ✅ | ✅ |
 | Resumo de sessão | ✅ | ✅ |
@@ -1741,7 +1741,7 @@ no domínio.
 ### 19.5 LGPD
 
 | Requisito | Implementação |
-|---|---|
+| --- | --- |
 | Base legal | Consentimento explícito, granular, coletado no onboarding e registrado em `consent` com hash do texto e versão da política. |
 | Identidade pseudonimizada | O tenant é identificado pelo `bsuid`, opaco e escopado à empresa — **o telefone não é armazenado**. Reduz a exposição: um vazamento do banco não expõe números de telefone, e o `bsuid` não correlaciona o usuário com nenhum outro serviço. Segue sendo dado pessoal (identifica a pessoa dentro do produto), mas não é dado que a identifique fora dele. |
 | Dado sensível (art. 11) | `body_metric` e `health_report` exigem consentimento `health_data` **separado**. Sem ele, o `guardrail` grava apenas o `health_report` mínimo e as métricas corporais são recusadas. |
@@ -1777,7 +1777,7 @@ o mesmo backend. Atributos padronizados: `fittrack.tenant_id`, `fittrack.agent`,
 ### 20.3 Métricas (Prometheus)
 
 | Métrica | Tipo | Alerta |
-|---|---|---|
+| --- | --- | --- |
 | `webhook_latency_seconds` | histogram | p99 > 0.5s |
 | `batch_processing_seconds` | histogram | p95 > 30s |
 | `queue_depth{queue}` | gauge | `default` > 200 por 5 min |
@@ -1804,7 +1804,7 @@ de nível INFO (apenas em traces Langfuse, que têm retenção e controle de ace
 **200 a 300 exemplos reais** de pt-BR, cobrindo:
 
 | Bucket | Exemplos | Peso |
-|---|---|---|
+| --- | --- | --- |
 | Registro simples completo | 60 | alto |
 | Rajada fragmentada | 40 | alto |
 | Notação `NxM` e séries variáveis | 30 | alto |
@@ -1829,7 +1829,7 @@ de nível INFO (apenas em traces Langfuse, que têm retenção e controle de ace
 **Métricas por campo:**
 
 | Campo | Métrica | Limiar mínimo |
-|---|---|---|
+| --- | --- | --- |
 | `is_workout_log` | acurácia | 0.98 |
 | `exercise_slug` | acurácia exata | 0.92 |
 | `load_kg` | acurácia exata | 0.97 |
@@ -1845,7 +1845,7 @@ Para análise, recomendação e persona — que não têm gabarito — um juiz (
 de 1 a 5 em rubricas explícitas:
 
 | Rubrica | Critério |
-|---|---|
+| --- | --- |
 | Fidelidade numérica | Todo número citado aparece no resultado da tool? (falha = nota 1 automática) |
 | Aderência ao perfil | Respeita objetivo, nível, equipamento e lesões ativas? |
 | Fundamento | A recomendação cita princípio recuperado do RAG, ou é improviso? |
@@ -1879,7 +1879,7 @@ casos viram novas entradas do golden set. É assim que o dataset cresce a partir
 ## 22. Segurança
 
 | Vetor | Mitigação |
-|---|---|
+| --- | --- |
 | Webhook forjado | HMAC-SHA256 obrigatório, comparação em tempo constante |
 | Prompt injection | Delimitação em tags, `tenant_id` nunca vem do LLM, tools com contexto injetado |
 | Vazamento entre tenants | `tenant_id` em toda query + RLS no Postgres + filtro obrigatório no Qdrant + teste de integração dedicado |
@@ -2079,7 +2079,7 @@ extração ≥ 0.90 no golden set e nenhum vazamento entre tenants.
 ## 25. Riscos e questões em aberto
 
 | # | Risco | Impacto | Mitigação |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | R1 | Ack por emoji esconde erro de extração | Alto — dado sujo permanente | Limiar calibrado, resumo no fechamento, comando de revisão, `low_confidence` força texto |
 | R2 | Aprovação de templates pela Meta demora ou é negada | Médio — atrasa a fase 1.3 | Submeter cedo (durante a fase 1.0), ter variantes de redação prontas |
 | R3 | Rate limit da xAI em pico | Alto — indisponibilidade | Fallback Anthropic já previsto; monitorar `llm_fallback_total` |
@@ -2143,7 +2143,7 @@ ACK_CONFIDENCE_THRESHOLD=0.85
 ## Apêndice B — Glossário
 
 | Termo | Definição |
-|---|---|
+| --- | --- |
 | **Rajada (burst)** | Sequência de mensagens do mesmo usuário separadas por menos que a janela de debounce, processadas como uma unidade. |
 | **Série (set)** | Uma execução de um exercício: carga × repetições × RPE. Unidade atômica do sistema. |
 | **RPE** | Rate of Perceived Exertion, 0 a 10. Quão difícil foi a série. |
