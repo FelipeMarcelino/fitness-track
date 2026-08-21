@@ -27,8 +27,21 @@ Sistema:  exercise=supino_reto_barra  load=10.0kg  reps=8  rpe=4  session=#182  
 Bot:      ✅ (reação de emoji)
 ```
 
-O sistema é **multi-tenant** (centenas a milhares de usuários), com o telefone WhatsApp (`bsuid`)
-como identidade primária do tenant, e opera sobre um **único número WABA** compartilhado.
+O sistema é **multi-tenant** (centenas a milhares de usuários), com o **BSUID** (business-scoped
+user ID — o identificador do usuário no escopo da empresa) como identidade primária do tenant, e
+opera sobre um **único número WABA** compartilhado.
+
+O BSUID é **opaco**: não é o telefone, não é interpretável e não deve ser parseado. A Meta o
+entrega no webhook e ele é o valor devolvido no campo `to` ao enviar. Três consequências que
+atravessam a spec inteira:
+
+- **O sistema não precisa armazenar o telefone do usuário.** Isso reduz materialmente a exposição
+  sob a LGPD: a identidade passa a ser pseudonimizada por padrão, não um dado que identifica a
+  pessoa fora do contexto do produto (§19.5).
+- **O identificador sobrevive à troca de número.** Diferente de uma identidade baseada em telefone,
+  o histórico de treino não se perde quando o usuário muda de chip.
+- **É escopado à empresa.** O mesmo ser humano tem BSUIDs diferentes em negócios diferentes; não há
+  correlação entre eles, e o BSUID de outro produto nunca serve aqui.
 
 ### 1.1 Princípios de design
 
@@ -50,7 +63,7 @@ como identidade primária do tenant, e opera sobre um **único número WABA** co
 | # | Decisão | Escolha | Justificativa |
 |---|---|---|---|
 | AD-01 | Canal WhatsApp | WhatsApp Cloud API (Meta) | Oficial, sem risco de ban, webhook HTTP estável. Custo: janela de 24h e templates aprovados para proativo. |
-| AD-02 | Escala | Multi-tenant, centenas/milhares | Tenant = `bsuid`. Exige isolamento, quota, LGPD. |
+| AD-02 | Escala e identidade | Multi-tenant, centenas/milhares; tenant = `bsuid` | BSUID (business-scoped user ID) é opaco e pseudonimizado: dispensa armazenar telefone, sobrevive à troca de número e reduz a exposição LGPD. Exige isolamento, quota e RLS. |
 | AD-03 | Persistência relacional | PostgreSQL 16 | Domínio fortemente relacional; também hospeda checkpoints LangGraph. |
 | AD-04 | Vector store | Qdrant (dedicado) | Busca híbrida (densa + esparsa), filtros por tenant, payload rico. |
 | AD-05 | Deploy | VPS + Docker Compose | Custo previsível, controle total. Workers I/O-bound. |
@@ -258,7 +271,10 @@ CREATE TYPE tenant_state AS ENUM ('onboarding', 'active', 'suspended', 'deleted'
 
 CREATE TABLE tenant (
     id              BIGSERIAL PRIMARY KEY,
-    bsuid           TEXT NOT NULL,                 -- telefone E.164, ex: 5511999998888
+    -- BSUID: identificador opaco do usuário no escopo da empresa, entregue
+    -- pela Meta no webhook. NÃO é telefone, não é parseável, e não deve ser
+    -- exibido ao usuário. É o valor devolvido no campo `to` do envio (§18.4).
+    bsuid           TEXT NOT NULL,
     display_name    TEXT,
     locale          TEXT NOT NULL DEFAULT 'pt-BR',
     timezone        TEXT NOT NULL DEFAULT 'America/Sao_Paulo',
@@ -1727,6 +1743,7 @@ no domínio.
 | Requisito | Implementação |
 |---|---|
 | Base legal | Consentimento explícito, granular, coletado no onboarding e registrado em `consent` com hash do texto e versão da política. |
+| Identidade pseudonimizada | O tenant é identificado pelo `bsuid`, opaco e escopado à empresa — **o telefone não é armazenado**. Reduz a exposição: um vazamento do banco não expõe números de telefone, e o `bsuid` não correlaciona o usuário com nenhum outro serviço. Segue sendo dado pessoal (identifica a pessoa dentro do produto), mas não é dado que a identifique fora dele. |
 | Dado sensível (art. 11) | `body_metric` e `health_report` exigem consentimento `health_data` **separado**. Sem ele, o `guardrail` grava apenas o `health_report` mínimo e as métricas corporais são recusadas. |
 | Direito de acesso | Comando "meus dados" → gera export JSON + CSV, envia como documento no WhatsApp. |
 | Direito de exclusão | Comando "apagar meus dados" → confirmação em duas etapas → job que apaga Postgres (cascade), pontos do Qdrant, checkpoints LangGraph e traces do Langfuse. Log de auditoria retém apenas `tenant_id` e timestamp. |
@@ -2134,6 +2151,7 @@ ACK_CONFIDENCE_THRESHOLD=0.85
 | **e1RM** | Estimated 1 Rep Max. Carga máxima estimada para uma repetição. |
 | **Volume** | Σ (carga × repetições). Principal driver de hipertrofia. |
 | **Deload** | Semana de volume/intensidade reduzidos para recuperação. |
+| **BSUID** | *Business-scoped user ID.* Identificador opaco do usuário no escopo da empresa, entregue pela Meta. Não é telefone, é escopado ao negócio e sobrevive à troca de número. Identidade primária do tenant. |
 | **Tenant** | Um usuário do sistema, identificado pelo `bsuid`. |
 | **Janela de 24h** | Período após a última mensagem do usuário em que a Cloud API permite mensagens livres. |
 | **Tier** | Classe de modelo (rápido/raciocínio) associada a um papel de agente. |
