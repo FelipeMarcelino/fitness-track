@@ -2088,8 +2088,9 @@ Atributos padronizados nos spans: `fittrack.tenant_id`, `fittrack.agent`, `fittr
 `fittrack.batch_id`, `fittrack.llm_role`, `fittrack.provider`.
 
 > **Consequência para a política de privacidade.** O Datadog é transferência internacional de dado
-> pessoal (o `tenant_id` correlaciona a um usuário). Precisa constar na lista da §19.5 junto com
-> xAI, Anthropic, Groq, OpenAI e Meta — mesmo sem conteúdo, o metadado é dado pessoal.
+> pessoal: mesmo sem conteúdo, o `tenant_id` correlaciona a um usuário, e metadado correlacionável
+> é dado pessoal. Já consta na lista de transferências da §19.5, junto com xAI, Anthropic, Groq,
+> OpenAI e Meta.
 
 ### 20.3 Métricas de agente
 
@@ -2347,7 +2348,7 @@ Cifrados **antes** de chegar ao Postgres. O banco vê apenas bytes.
 | --- | --- |
 | `health_report.verbatim` | Relato de dor e lesão; dado sensível do art. 11 |
 | `body_metric.value` | Peso, medidas, sono, disposição |
-| `athlete_profile.injuries` | JSONB com histórico de lesão |
+| `athlete_profile.injuries` | Histórico de lesão; JSON serializado e então cifrado |
 | `raw_message.payload` | Texto bruto do usuário |
 | `raw_message.transcript` | Transcrição de áudio |
 | `session_summary.narrative` | Narrativa da sessão, pode conter relato pessoal |
