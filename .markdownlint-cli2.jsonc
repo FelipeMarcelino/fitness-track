@@ -1,0 +1,19 @@
+{
+  // Regras relaxadas de forma deliberada, com o motivo de cada uma.
+  "config": {
+    // Tabelas de decisão (AD-01..AD-27) e de agentes passam de 120 colunas por
+    // natureza; quebrá-las tornaria a fonte ilegível. Prosa segue limitada.
+    "MD013": { "line_length": 120, "tables": false, "code_blocks": false },
+
+    // Diagramas ASCII e árvores de diretório não têm linguagem para declarar.
+    "MD040": false,
+
+    // Subseções repetem títulos curtos em escopos diferentes (ex.: "Regras").
+    "MD024": { "siblings_only": true },
+
+    // Ênfase usada como rótulo em início de item de lista é intencional.
+    "MD036": false
+  },
+  "globs": ["**/*.md"],
+  "ignores": ["node_modules/**", ".venv/**"]
+}
