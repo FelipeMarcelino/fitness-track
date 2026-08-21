@@ -56,9 +56,11 @@ associada.
    determinístico via as tools da §16. O LLM escolhe a tool e narra o resultado. Um número no texto
    final que não veio de um resultado de tool é bug, não estilo.
 
-2. **`voice_agent` é a única saída.** Nenhum outro nó escreve em `outbound_queue` nem chama a API
-   do WhatsApp. Se precisar responder ao usuário de um lugar novo, adicione um bloco em
-   `state.outbound` — não crie um segundo caminho de saída.
+2. **Um único caminho de saída, em dois papéis.** `voice_agent` é o único nó que **decide** o que
+   o usuário vê (texto, reação ou silêncio); `deliver` é o único que **enfileira** em
+   `outbound_queue` e fala com a API do WhatsApp. Nenhum outro nó faz nem uma coisa nem outra.
+   Para responder de um lugar novo, acrescente um bloco em `state.outbound` — não crie um segundo
+   caminho de saída. Ver §8.2 e §13.
 
 3. **`tenant_id` nunca vem do LLM.** É injetado pelo código em toda query, toda tool e todo filtro
    do Qdrant. Buscas em `user_sessions` sem filtro de tenant devem levantar exceção, não retornar
@@ -177,21 +179,19 @@ rastreados em `doc/sprints/`. Cada sprint define escopo, critério de saída ver
 da spec que cobre. Uma fase só é dada por concluída quando seu critério de saída da §24 é
 atingido — não quando o código foi escrito.
 
-## Aviso: a raiz do git está no lugar errado
-
-O repositório git foi inicializado em **`doc/`**, não na raiz do projeto:
+## Estado do repositório
 
 ```
-fitness-track/          ← raiz real do projeto (NÃO é repo git)
-├── CLAUDE.md           ← não rastreado
-└── doc/                ← raiz do repo git (remote: FelipeMarcelino/fitness-track)
-    ├── .git/
-    └── spec.md         ← aparece na raiz do GitHub
+fitness-track/          ← raiz do projeto e raiz do git
+├── .git/
+├── .gitignore
+├── CLAUDE.md
+└── doc/
+    └── spec.md
 ```
 
-Consequência: quando o código da §23 chegar, ele cairia em `doc/src/`, `doc/docker-compose.yml`.
-Isso precisa ser corrigido movendo o `.git` um nível acima e reposicionando `spec.md` em
-`doc/spec.md` dentro do repo. O commit `0a52946` já foi publicado, então a correção envolve
-reescrever a árvore e um push — **confirme com o Felipe antes de mexer.**
+Remote: `github.com/FelipeMarcelino/fitness-track`, branch padrão `main`.
 
-Enquanto não for corrigido, arquivos criados na raiz do projeto não estão sob controle de versão.
+Ainda não existe `.github/workflows/`. Enquanto for assim, `gh pr checks` retorna
+`no checks reported` e o item 2 do checklist de merge não pode ser cumprido — criar o CI é
+pré-requisito do fluxo descrito acima.

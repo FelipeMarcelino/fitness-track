@@ -175,7 +175,11 @@ t=7.00s  quarta mensagem
 
 t=17.0s  flush_check dispara e a chave debounce:{wa_id} expirou
          worker: adquire lock:{wa_id} (Redlock, TTL 120s, renovação automática)
-         worker: LRANGE + DEL buffer:{wa_id}  → lote de 4 mensagens
+         worker: RENAME buffer:{wa_id} → drain:{wa_id}:{batch_id}   (atômico)
+                 LRANGE drain:... + DEL drain:...  → lote de 4 mensagens
+                 (NUNCA LRANGE+DEL sobre buffer: o ingress não pega o lock e
+                  pode inserir entre as duas chamadas — a mensagem seria
+                  apagada sem entrar no lote. Ver §17.3.)
          worker: para cada item com type=audio:
                    baixa mídia via GET /{media_id} (token WABA)
                    POST Groq /audio/transcriptions (whisper-large-v3,
@@ -244,12 +248,17 @@ exercise (global) ────────────────┘
 -- IDENTIDADE E TENANCY
 -- ============================================================
 
+-- Extensões exigidas pelo schema. Devem vir na primeira migração, antes de
+-- qualquer índice trigram — `gin_trgm_ops` não existe sem pg_trgm.
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE EXTENSION IF NOT EXISTS unaccent;   -- normalização de alias (§10)
+
 CREATE TYPE plan_tier   AS ENUM ('free', 'pro', 'trial');
 CREATE TYPE tenant_state AS ENUM ('onboarding', 'active', 'suspended', 'deleted');
 
 CREATE TABLE tenant (
     id              BIGSERIAL PRIMARY KEY,
-    wa_id           TEXT NOT NULL UNIQUE,          -- telefone E.164, ex: 5511999998888
+    wa_id           TEXT NOT NULL,                 -- telefone E.164, ex: 5511999998888
     display_name    TEXT,
     locale          TEXT NOT NULL DEFAULT 'pt-BR',
     timezone        TEXT NOT NULL DEFAULT 'America/Sao_Paulo',
@@ -258,7 +267,10 @@ CREATE TABLE tenant (
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     deleted_at      TIMESTAMPTZ
 );
-CREATE INDEX ix_tenant_wa_id ON tenant(wa_id) WHERE deleted_at IS NULL;
+-- Unicidade apenas entre tenants ativos. UNIQUE na coluna impediria alguém de
+-- se recadastrar com o mesmo número após exclusão (LGPD, §19.5).
+CREATE UNIQUE INDEX ux_tenant_wa_id_active
+    ON tenant(wa_id) WHERE deleted_at IS NULL;
 
 -- Consentimentos LGPD granulares. Registro de treino e dado de saúde são separados.
 CREATE TYPE consent_kind AS ENUM (
@@ -440,6 +452,14 @@ CREATE INDEX ix_set_session ON exercise_set(session_id) WHERE deleted_at IS NULL
 CREATE INDEX ix_set_tenant_exercise ON exercise_set(tenant_id, exercise_id, created_at DESC)
     WHERE deleted_at IS NULL;
 
+-- Idempotência de reprocessamento (§17.4). NULLS NOT DISTINCT (PG15+) é
+-- obrigatório: sem ele, séries com source_message_id nulo escapariam da
+-- unicidade e o retry de um batch duplicaria o volume do treino.
+CREATE UNIQUE INDEX ux_set_idempotency
+    ON exercise_set (session_id, exercise_id, set_index, source_message_id)
+    NULLS NOT DISTINCT
+    WHERE deleted_at IS NULL;
+
 -- Volume por série, materializado para as queries analíticas
 CREATE VIEW v_set_volume AS
 SELECT s.*,
@@ -531,9 +551,14 @@ CREATE TABLE plan_item (
 -- MENSAGENS, CUSTO E OPERAÇÃO
 -- ============================================================
 
+-- CASCADE, não SET NULL: o payload traz texto do usuário e transcrições de
+-- áudio. Com SET NULL a linha sobreviveria à exclusão da conta, sem o
+-- tenant_id necessário para localizá-la — violando a erasure da §19.5.
+-- Consequência: no primeiro contato o ingress faz UPSERT do tenant (state=
+-- 'onboarding') ANTES de inserir raw_message. Não existe mensagem órfã.
 CREATE TABLE raw_message (
     id            BIGSERIAL PRIMARY KEY,
-    tenant_id     BIGINT REFERENCES tenant(id) ON DELETE SET NULL,
+    tenant_id     BIGINT NOT NULL REFERENCES tenant(id) ON DELETE CASCADE,
     wa_message_id TEXT NOT NULL UNIQUE,
     direction     TEXT NOT NULL,       -- inbound | outbound
     msg_type      TEXT NOT NULL,       -- text | audio | image | interactive | reaction | template
@@ -571,8 +596,10 @@ CREATE TABLE usage_ledger (
     trace_id       TEXT,
     was_fallback   BOOLEAN NOT NULL DEFAULT false
 );
-CREATE INDEX ix_usage_tenant_month
-    ON usage_ledger(tenant_id, date_trunc('month', occurred_at));
+-- date_trunc('month', timestamptz) é STABLE, não IMMUTABLE (depende do
+-- TimeZone da sessão), e expressão de índice exige IMMUTABLE — o CREATE INDEX
+-- falharia. Índice de range resolve as mesmas queries de quota mensal.
+CREATE INDEX ix_usage_tenant_time ON usage_ledger(tenant_id, occurred_at DESC);
 
 CREATE TABLE outbound_queue (
     id           BIGSERIAL PRIMARY KEY,
@@ -586,12 +613,17 @@ CREATE TABLE outbound_queue (
 );
 CREATE INDEX ix_outbound_pending ON outbound_queue(scheduled_at) WHERE sent_at IS NULL;
 
--- Janela de 24h da Cloud API: última mensagem recebida do usuário
+-- Janela de 24h da Cloud API: última mensagem recebida do usuário.
+-- `timestamptz + interval` é STABLE (sensível a fuso/DST) e coluna gerada
+-- exige IMMUTABLE — o CREATE TABLE falharia. A expiração é calculada na
+-- consulta, que é o único lugar onde importa.
 CREATE TABLE conversation_window (
     tenant_id       BIGINT PRIMARY KEY REFERENCES tenant(id) ON DELETE CASCADE,
-    last_inbound_at TIMESTAMPTZ NOT NULL,
-    expires_at      TIMESTAMPTZ GENERATED ALWAYS AS (last_inbound_at + INTERVAL '24 hours') STORED
+    last_inbound_at TIMESTAMPTZ NOT NULL
 );
+
+-- Predicado canônico para "a janela de 24h está aberta?" (§14.3, §18.4):
+--     WHERE last_inbound_at > now() - INTERVAL '24 hours'
 ```
 
 ### 5.3 Checkpoints do LangGraph
@@ -1481,12 +1513,36 @@ async with redlock(f"lock:{wa_id}", ttl=120, auto_extend=True) as lock:
 O `auto_extend` renova o lock a cada 30s enquanto o job estiver vivo, evitando que uma análise
 longa perca o lock e permita processamento concorrente.
 
+**O lock não protege o buffer.** Ele serializa apenas os workers entre si — o `ingress` escreve em
+`buffer:{wa_id}` sem adquiri-lo, para responder à Meta em menos de 200 ms. Portanto o esvaziamento
+tem de ser atômico do lado do Redis:
+
+```python
+# CORRETO — RENAME é atômico; o que chegar depois cai num buffer novo
+batch_key = f"drain:{wa_id}:{batch_id}"
+try:
+    await redis.rename(f"buffer:{wa_id}", batch_key)
+except ResponseError:      # "no such key" — nada a processar
+    return
+items = await redis.lrange(batch_key, 0, -1)
+await redis.delete(batch_key)
+
+# ERRADO — mensagem que chegar entre as duas chamadas é apagada sem processar
+items = await redis.lrange(f"buffer:{wa_id}", 0, -1)
+await redis.delete(f"buffer:{wa_id}")
+```
+
+A chave `drain:` sobrevive à falha do worker e é varrida pelo job de manutenção, de modo que uma
+queda entre o `RENAME` e o `DEL` não perde o lote.
+
 ### 17.4 Idempotência
 
 - **Webhook:** dedup por `message_id` em Redis + `UNIQUE` em `raw_message.wa_message_id`.
-- **Persistência:** `exercise_set` tem índice único parcial em
-  `(session_id, exercise_id, set_index, source_message_id)`, de modo que reprocessar o mesmo batch
-  não duplica séries.
+- **Persistência:** `ux_set_idempotency` (§5.2) é um índice único parcial em
+  `(session_id, exercise_id, set_index, source_message_id)` com **`NULLS NOT DISTINCT`**, de modo
+  que reprocessar o mesmo batch não duplica séries. O `NULLS NOT DISTINCT` é a parte que importa:
+  sem ele, séries com `source_message_id` nulo não colidiriam entre si e o retry inflaria o volume
+  do treino silenciosamente. A gravação usa `ON CONFLICT DO NOTHING` contra esse índice.
 - **Envio:** `outbound_queue` só marca `sent_at` após 200 da Meta; retry usa o mesmo registro.
 
 ### 17.5 Capacidade estimada
@@ -1567,13 +1623,48 @@ converter automaticamente para template, se houver um adequado; senão, adia a m
 - Todo repositório recebe `tenant_id` no construtor; não existe método que consulte sem ele.
 - Row Level Security no Postgres como segunda barreira:
 
+A RLS precisa cobrir **toda** tabela com `tenant_id`, não uma amostra. Uma tabela de fora da
+lista é um vazamento silencioso: basta um repositório esquecer o predicado de tenant para o
+Postgres devolver linhas de outro usuário.
+
 ```sql
-ALTER TABLE exercise_set ENABLE ROW LEVEL SECURITY;
-CREATE POLICY tenant_isolation ON exercise_set
-    USING (tenant_id = current_setting('app.tenant_id')::bigint);
+-- Aplicar a cada tabela tenant-scoped, sem exceção:
+--   athlete_profile, consent, subscription, exercise (privados),
+--   exercise_alias, workout_session, exercise_set, session_summary,
+--   body_metric, health_report, workout_plan, raw_message,
+--   processing_batch, usage_ledger, outbound_queue, conversation_window
+DO $$
+DECLARE t text;
+BEGIN
+  FOREACH t IN ARRAY ARRAY[
+    'athlete_profile','consent','subscription','exercise','exercise_alias',
+    'workout_session','exercise_set','session_summary','body_metric',
+    'health_report','workout_plan','raw_message','processing_batch',
+    'usage_ledger','outbound_queue','conversation_window'
+  ] LOOP
+    EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
+    EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', t);
+    EXECUTE format($f$
+      CREATE POLICY tenant_isolation ON %I
+        USING (tenant_id IS NOT DISTINCT FROM
+               NULLIF(current_setting('app.tenant_id', true), '')::bigint)
+    $f$, t);
+  END LOOP;
+END $$;
 ```
 
-O worker executa `SET LOCAL app.tenant_id = $1` no início de cada transação.
+Notas:
+
+- **`FORCE ROW LEVEL SECURITY`** é necessário porque o dono da tabela ignora RLS por padrão — sem
+  ele a barreira não existe para o usuário das migrações.
+- **`exercise` e `exercise_alias`** têm `tenant_id` nulo nas linhas globais; `IS NOT DISTINCT FROM`
+  as mantém visíveis apenas quando `app.tenant_id` também está ausente. Para leitura do catálogo
+  global use uma role dedicada de leitura, ou uma policy adicional `USING (tenant_id IS NULL)`.
+- O worker executa `SET LOCAL app.tenant_id = $1` no início de cada transação. O
+  `current_setting(..., true)` evita erro quando a variável não foi definida.
+- Um teste de integração deve verificar que **cada** tabela da lista bloqueia leitura cruzada
+  (`tests/test_tenant_isolation.py`), parametrizado sobre a lista — assim uma tabela nova sem
+  policy quebra o teste.
 
 - Qdrant: filtro obrigatório por `tenant_id` em `user_sessions` (§15.4).
 
