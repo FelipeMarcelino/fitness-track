@@ -6,7 +6,8 @@ cd "$(dirname "$0")/.."
 PY=.venv/bin/python
 echo "--- ruff check ---";  $PY -m ruff check .
 echo "--- ruff format ---"; $PY -m ruff format --check .
-echo "--- mypy ---";        PYTHONPATH=src $PY -m mypy src
-echo "--- pytest ---";      PYTHONPATH=src $PY -m pytest -q
+echo "--- mypy ---";        PYTHONPATH=src $PY -m mypy src evals
+echo "--- pytest ---";      PYTHONPATH=src:. $PY -m pytest -q
+echo "--- evals ---";       PYTHONPATH=src:. $PY -m evals.run --suite all
 echo "--- compose ---";     docker compose config --quiet && echo "compose ok"
 echo "ALL GREEN"
