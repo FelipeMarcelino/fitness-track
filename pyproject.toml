@@ -39,6 +39,9 @@ packages = ["src/fittrack"]
 line-length = 100
 target-version = "py312"
 src = ["src", "tests"]
+# doc/ contém trechos ilustrativos de Python dentro de markdown, alguns
+# deliberadamente pseudo-código. Formatá-los reescreveria a documentação.
+extend-exclude = ["doc", ".venv"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "PT", "SIM", "ARG", "RUF"]
