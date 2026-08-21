@@ -46,6 +46,7 @@ navegável:
 | Criptografia e prompt injection | §22 |
 | Estrutura de diretórios prevista | §23 |
 | Ordem de construção | §24 |
+| Sprint corrente e cadência | `doc/sprints/` |
 
 **As 27 decisões da §2 já foram tomadas** numa entrevista de arquitetura e estão fechadas. Não as
 relitigue por iniciativa própria. Se encontrar evidência de que uma delas está errada, diga em uma
@@ -197,10 +198,10 @@ Verificar os quatro, sempre, nesta ordem:
 
 ### 6. Sprints
 
-O trabalho segue o roadmap da §24 da spec (Fase 1.0 → 1.1 → 1.2 → 1.3), quebrado em sprints
-rastreados em `doc/sprints/`. Cada sprint define escopo, critério de saída verificável e as seções
-da spec que cobre. Uma fase só é dada por concluída quando seu critério de saída da §24 é
-atingido — não quando o código foi escrito.
+O trabalho segue o roadmap da §24 da spec (Fase 1.0 → 1.1 → 1.2 → 1.3), quebrado em sprints de
+2 semanas rastreados em `doc/sprints/` — comece por `doc/sprints/README.md`. Cada sprint define
+escopo, critério de saída verificável e as seções da spec que cobre. Uma fase só é dada por
+concluída quando seu critério de saída da §24 é atingido — não quando o código foi escrito.
 
 ## Estado do repositório
 

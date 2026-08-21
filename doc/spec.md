@@ -651,12 +651,17 @@ CREATE TABLE workout_plan (
     FOREIGN KEY (phase_id, program_id)
         REFERENCES program_phase(id, program_id),
     CONSTRAINT ck_plan_phase_needs_program
-        CHECK (phase_id IS NULL OR program_id IS NOT NULL)
+        CHECK (phase_id IS NULL OR program_id IS NOT NULL),
+    UNIQUE (id, tenant_id)            -- alvo da FK composta em plan_item
 );
 
+-- tenant_id obrigatório pelo mesmo motivo de program_phase: RLS é por tabela
+-- e não se propaga por FK. Sem ele, uma query direta em plan_item leria os
+-- itens de ficha de todos os tenants.
 CREATE TABLE plan_item (
     id           BIGSERIAL PRIMARY KEY,
-    plan_id      BIGINT NOT NULL REFERENCES workout_plan(id) ON DELETE CASCADE,
+    tenant_id    BIGINT NOT NULL REFERENCES tenant(id) ON DELETE CASCADE,
+    plan_id      BIGINT NOT NULL,
     day_label    TEXT NOT NULL,   -- "A" | "Push" | "Segunda"
     day_order    SMALLINT NOT NULL,
     item_order   SMALLINT NOT NULL,
@@ -666,7 +671,9 @@ CREATE TABLE plan_item (
     target_reps_max SMALLINT,
     target_rpe   NUMERIC(3,1),
     rest_s       INTEGER,
-    note         TEXT
+    note         TEXT,
+    FOREIGN KEY (plan_id, tenant_id)
+        REFERENCES workout_plan(id, tenant_id) ON DELETE CASCADE
 );
 
 -- ============================================================
@@ -2258,18 +2265,18 @@ Postgres devolver linhas de outro usuário.
 -- Aplicar a cada tabela tenant-scoped, sem exceção:
 --   athlete_profile, consent, subscription, exercise (privados),
 --   exercise_alias, workout_session, exercise_set, session_summary,
---   body_metric, health_report, workout_plan, training_program,
---   raw_message, processing_batch, usage_ledger, outbound_queue,
---   program_phase, program_milestone, conversation_window
+--   body_metric, health_report, workout_plan, plan_item,
+--   training_program, program_phase, program_milestone, raw_message,
+--   processing_batch, usage_ledger, outbound_queue, conversation_window
 DO $$
 DECLARE t text;
 BEGIN
   FOREACH t IN ARRAY ARRAY[
     'athlete_profile','consent','subscription','exercise','exercise_alias',
     'workout_session','exercise_set','session_summary','body_metric',
-    'health_report','workout_plan','training_program','program_phase',
-    'program_milestone','raw_message','processing_batch','usage_ledger',
-    'outbound_queue','conversation_window'
+    'health_report','workout_plan','plan_item','training_program',
+    'program_phase','program_milestone','raw_message','processing_batch',
+    'usage_ledger','outbound_queue','conversation_window'
   ] LOOP
     EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
     EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', t);
@@ -2880,7 +2887,8 @@ fitness-track/
 ## 24. Roadmap de entrega
 
 O desenho completo está nesta spec. As fases abaixo são uma sugestão de ordem de construção —
-nada sai do escopo, apenas se distribui no tempo.
+nada sai do escopo, apenas se distribui no tempo. Cada fase é fatiada em sprints de 2 semanas
+em `doc/sprints/`; uma fase só é dada por concluída quando seu critério de saída é atingido.
 
 ### Fase 1.0 — Registro confiável (fundação)
 
