@@ -17,7 +17,7 @@ import redis.asyncio as aioredis
 
 from fittrack.services.batch import MAX_ATTEMPTS, Batch, BatchStore
 from fittrack.services.debounce import BurstBuffer
-from fittrack.services.lock import UserLock
+from fittrack.services.lock import LockLostError, UserLock
 
 log = logging.getLogger(__name__)
 
@@ -62,7 +62,7 @@ class Pipeline:
                 # Nothing buffered, or the window has not closed. A previous
                 # attempt may still owe work, though: the drain took its
                 # messages, so only the database knows about it.
-                return await self._resume(bsuid)
+                return await self._resume(bsuid, lock)
 
             # Read without dropping. Deleting here and persisting afterwards
             # leaves a window where a dying worker loses the burst from both
@@ -81,9 +81,9 @@ class Pipeline:
             # Durable now; Redis can let go.
             await self._buffer.discard(bsuid, batch_id)
 
-            return await self._run(batch)
+            return await self._run(batch, lock)
 
-    async def _resume(self, bsuid: str) -> Batch | None:
+    async def _resume(self, bsuid: str, lock: UserLock) -> Batch | None:
         """Picks up a batch a previous attempt left pending.
 
         The retry job carries only the user id, and Redis no longer holds the
@@ -97,12 +97,12 @@ class Pipeline:
             return None
 
         log.info("resuming batch %s after a previous failure", batch.id)
-        return await self._run(batch)
+        return await self._run(batch, lock)
 
     async def _tenant_of(self, bsuid: str) -> int | None:
         return await self._batches.tenant_id_for(bsuid)
 
-    async def _run(self, batch: Batch) -> Batch:
+    async def _run(self, batch: Batch, lock: UserLock) -> Batch:
         """Runs the handler, counting the attempt before rather than after.
 
         Counting afterwards means a handler that crashes the process never
@@ -115,7 +115,16 @@ class Pipeline:
         # given up on.
         batch = replace(batch, attempts=attempts)
         try:
-            await self._handler(batch)
+            # Under the lock's guard: if the lease is lost mid-handler another
+            # worker is already on this user, and continuing would write the
+            # same sets twice.
+            await lock.guard(self._handler(batch))
+        except LockLostError:
+            # Not the batch's fault, so it is left pending rather than being
+            # marked failed. The row keeps its incremented attempt, which is
+            # the honest count of how many times it has been picked up.
+            log.warning("gave up batch %s: the lock was lost mid-flight", batch.id)
+            raise
         except Exception as exc:
             if attempts >= MAX_ATTEMPTS:
                 log.exception("batch %s exhausted its retries", batch.id)

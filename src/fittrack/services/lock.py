@@ -15,14 +15,18 @@ blow that budget. That is why draining the buffer has to be atomic on its own
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import uuid
+from collections.abc import Awaitable
 from types import TracebackType
-from typing import Final, Self
+from typing import Final, Self, TypeVar
 
 import redis.asyncio as aioredis
 
 log = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 LOCK_PREFIX: Final = "lock:"
 DEFAULT_TTL_SECONDS: Final = 120
@@ -45,6 +49,14 @@ if redis.call('GET', KEYS[1]) == ARGV[1] then
 end
 return 0
 """
+
+
+class LockLostError(Exception):
+    """The lock expired while its holder was still working.
+
+    Raised rather than logged: the work has to stop, because by the time
+    renewal fails another worker may already be writing the same user's sets.
+    """
 
 
 class UserLock:
@@ -70,11 +82,40 @@ class UserLock:
         # else's lock.
         self._token = uuid.uuid4().hex
         self.acquired = False
+        # Set when renewal finds the key gone or held by someone else. The
+        # holder has to be able to notice: without a signal it keeps working
+        # while a second worker starts the same user, which is the exact
+        # interleaving this lock exists to prevent.
+        self.lost = asyncio.Event()
         self._renewal: asyncio.Task[None] | None = None
 
     async def acquire(self) -> bool:
         self.acquired = bool(await self._redis.set(self.key, self._token, nx=True, ex=self._ttl))
         return self.acquired
+
+    async def guard(self, work: Awaitable[T]) -> T:
+        """Runs `work`, abandoning it if the lock is lost underneath it.
+
+        Losing the lock and carrying on regardless is worse than losing it:
+        two workers then write the same user concurrently, believing they are
+        each the only one. Cancelling is the only safe response, and it has to
+        come from here because the work itself has no idea a lock exists.
+        """
+        task = asyncio.ensure_future(work)
+        watcher = asyncio.ensure_future(self.lost.wait())
+        try:
+            done, _ = await asyncio.wait({task, watcher}, return_when=asyncio.FIRST_COMPLETED)
+            if task in done:
+                return await task
+            task.cancel()
+            # Let the cancellation actually land before reporting it.
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            raise LockLostError(f"{self.key} expired while the work was still running")
+        finally:
+            watcher.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await watcher
 
     async def release(self) -> None:
         if self._renewal is not None:
@@ -117,6 +158,7 @@ class UserLock:
                     # Someone else holds it now; stop pretending we do.
                     log.warning("lost the lock on %s while working", self.key)
                     self.acquired = False
+                    self.lost.set()
                     return
         except asyncio.CancelledError:
             return

@@ -16,7 +16,7 @@ import pytest_asyncio
 import redis.asyncio as aioredis
 from testcontainers.redis import RedisContainer
 
-from fittrack.services.lock import UserLock
+from fittrack.services.lock import LockLostError, UserLock
 
 pytestmark = pytest.mark.integration
 
@@ -54,10 +54,16 @@ async def test_the_same_user_serialises(client: aioredis.Redis) -> None:
     await asyncio.gather(work("a"), work("b"))
 
     # One got in and finished; the other was refused rather than interleaved.
-    assert "a-start" in order or "b-start" in order
-    assert order.count("refused") == 0 or True
     starts = [o for o in order if o.endswith("-start")]
+    refused = [o for o in order if o.endswith("-refused")]
     assert len(starts) == 1, f"two holders at once: {order}"
+    assert len(refused) == 1, f"the contender was not refused: {order}"
+
+    # The refusal lands between the holder's start and end -- the contender is
+    # turned away while the holder is still working, which is the point. What
+    # must never appear is a second start.
+    winner = starts[0].removesuffix("-start")
+    assert order.index(f"{winner}-end") > order.index(f"{winner}-start"), order
 
 
 async def test_different_users_run_at_the_same_time(
@@ -141,3 +147,42 @@ async def test_the_lock_is_extended_while_work_continues(
 
     assert still_held is not None, "the lock expired while work was still running"
     assert ttl > 0
+
+
+async def test_work_is_abandoned_when_the_lock_is_lost(client: aioredis.Redis) -> None:
+    """Noticing the loss is not enough; the work has to stop.
+
+    Renewal can fail -- a Redis failover, a paused process, a key evicted --
+    and by then another worker may already be writing this user's sets. A
+    holder that logs the loss and keeps going produces exactly the concurrent
+    write the lock exists to prevent.
+    """
+    finished = False
+
+    async def slow_work() -> str:
+        nonlocal finished
+        await asyncio.sleep(5.0)
+        finished = True
+        return "done"
+
+    lock = UserLock(client, "LOSE-ME", ttl_seconds=2, renew_every=0.2)
+    async with lock:
+        assert lock.acquired
+        # Someone else takes the key: renewal will find a token that is not ours.
+        await client.set(lock.key, "another-worker")
+
+        with pytest.raises(LockLostError):
+            await lock.guard(slow_work())
+
+    # Give a leaked task a chance to finish, if cancellation did not land.
+    await asyncio.sleep(0.3)
+    assert not finished, "the work carried on after the lock was gone"
+
+    # And the stolen lock is still the other worker's: release must not take it.
+    assert await client.get(lock.key) == "another-worker"
+
+
+async def test_work_that_finishes_in_time_is_not_disturbed(client: aioredis.Redis) -> None:
+    """The guard must be invisible when nothing goes wrong."""
+    async with UserLock(client, "KEEP-ME", ttl_seconds=5, renew_every=0.2) as lock:
+        assert await lock.guard(asyncio.sleep(0.3, result="ok")) == "ok"
