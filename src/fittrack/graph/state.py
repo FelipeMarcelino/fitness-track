@@ -1,11 +1,17 @@
 """The shared graph state (§8.1).
 
-One rule governs this file, and getting it wrong fails in production rather
-than in a type check: **any key that two parallel branches might write needs a
-reducer.** Without one, LangGraph raises InvalidUpdateError when both branches
+Two rules govern this file, and both fail in production rather than in a type
+check.
+
+**Any key two parallel branches might write needs a reducer.** Without one, LangGraph raises InvalidUpdateError when both branches
 land in the same super-step, and the user gets an error instead of a partial
 answer. "fiz supino 80x8, compara com semana passada" is exactly that case --
 the logger and the analyst both want to add a bubble to `outbound` (§8.7).
+
+**Any accumulating key also needs a way to start over.** These channels are
+checkpointed, so an appending reducer keeps its contents between invocations
+and turn 2 inherits turn 1's bubbles. That is why they use `accumulate` rather
+than `operator.add`, and why the first node of every run resets them.
 
 Training context deliberately does not live here. It comes from Postgres
 through tools, every time. State that caches it would go stale between turns
@@ -14,10 +20,11 @@ and there would be no way to tell which of the two was right.
 
 from __future__ import annotations
 
-import operator
 from typing import Annotated, Any, Literal, TypedDict
 
 from langgraph.graph.message import add_messages
+
+from fittrack.graph.reducers import accumulate
 
 
 class RouteStep(TypedDict):
@@ -55,8 +62,8 @@ class GraphState(TypedDict, total=False):
 
     # --- subgraph results ---
     # Fields written by branches that can run in parallel NEED a reducer.
-    extracted_sets: Annotated[list[dict[str, Any]], operator.add]
-    persisted_set_ids: Annotated[list[int], operator.add]
+    extracted_sets: Annotated[list[dict[str, Any]], accumulate]
+    persisted_set_ids: Annotated[list[int], accumulate]
     # These three are written by one branch each, so they cannot collide.
     analysis_result: dict[str, Any] | None
     recommendation: dict[str, Any] | None
@@ -65,13 +72,14 @@ class GraphState(TypedDict, total=False):
     health_flag: dict[str, Any] | None
 
     # --- output control ---
-    outbound: Annotated[list[dict[str, Any]], operator.add]
+    outbound: Annotated[list[dict[str, Any]], accumulate]
     # Any branch can fail, and two failing at once is the case worth surviving:
     # an errors key without a reducer turns two failures into an unrelated
-    # third one. The spec declares this field twice, the second time without
-    # the reducer -- in Python the second wins, which would have silently
-    # removed it.
-    errors: Annotated[list[str], operator.add]
+    # third one. §8.1 used to declare this field twice, the second
+    # time without the reducer -- in Python the second wins, which silently
+    # removed it. Corrected in the spec; kept here as a note because the
+    # mistake is invisible on inspection.
+    errors: Annotated[list[str], accumulate]
     ack_mode: Literal["reaction", "text", "silent"]
     confidence: float
     pending_clarification: dict[str, Any] | None
@@ -79,7 +87,7 @@ class GraphState(TypedDict, total=False):
     # --- diagnostics ---
     # Which nodes ran. Not part of the product; it is how a topology change
     # becomes visible to a test instead of to a user.
-    trace: Annotated[list[str], operator.add]
+    trace: Annotated[list[str], accumulate]
 
 
 def initial_state(

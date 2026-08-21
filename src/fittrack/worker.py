@@ -114,9 +114,17 @@ async def startup(ctx: dict[str, Any]) -> None:
     saver_cm = checkpointer(settings.database_url.get_secret_value())
     ctx["_saver_cm"] = saver_cm
     saver = await saver_cm.__aenter__()
-    runner = GraphRunner(build_graph(checkpointer=saver), outbound, ctx["redis_queue"])
-    ctx["graph_runner"] = runner
-    ctx["pipeline"] = Pipeline(redis, buffer, batches, runner.handle)
+    try:
+        runner = GraphRunner(build_graph(checkpointer=saver), outbound, ctx["redis_queue"])
+        ctx["graph_runner"] = runner
+        ctx["pipeline"] = Pipeline(redis, buffer, batches, runner.handle)
+    except BaseException:
+        # ARQ does not call on_shutdown when on_startup raises, so a failure
+        # here would leave the checkpointer's connection open for the life of
+        # a process that is about to be restarted -- and restarted again.
+        await saver_cm.__aexit__(None, None, None)
+        ctx.pop("_saver_cm", None)
+        raise
 
 
 async def shutdown(ctx: dict[str, Any]) -> None:

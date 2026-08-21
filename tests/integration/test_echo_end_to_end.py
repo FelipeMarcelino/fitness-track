@@ -7,6 +7,7 @@ that they are actually connected, which is the thing unit tests never catch.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -96,3 +97,36 @@ async def test_a_graph_that_says_nothing_queues_nothing(
 
     assert await queue.claim_next(tenant_id) is None
     assert scheduler.jobs == []
+
+
+async def test_a_retried_batch_does_not_queue_the_reply_twice(
+    migrated: str, app_dsn: str, owner_conn: AsyncConnection
+) -> None:
+    """The batch is retried when the worker dies after the enqueue commits.
+
+    With a fresh group id per attempt, the same reply is inserted again and the
+    user reads it twice -- and there is no signal anywhere that it happened,
+    because both groups are perfectly valid.
+    """
+    tenant_id = await _tenant(owner_conn, "e2e-retry")
+    engine = create_async_engine(app_dsn)
+    queue = OutboundQueue(engine)
+
+    await setup_checkpoint_tables(migrated)
+    async with checkpointer(app_dsn) as saver:
+        runner = GraphRunner(build_graph(checkpointer=saver), queue, FakeScheduler())
+        batch = Batch(
+            id=99,
+            tenant_id=tenant_id,
+            combined_text="oi",
+            message_ids=["wamid.retry"],
+            attempts=1,
+        )
+        await runner.handle(batch, "e2e-retry")
+        # Same batch, second attempt.
+        await runner.handle(replace(batch, attempts=2), "e2e-retry")
+
+    first = await queue.claim_next(tenant_id)
+    assert first is not None
+    await queue.mark_sent(first, "wamid.sent")
+    assert await queue.claim_next(tenant_id) is None, "the reply was queued twice"

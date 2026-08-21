@@ -238,3 +238,58 @@ async def test_concurrent_threads_do_not_interleave(checkpointed_graph: Any) -> 
 
 def _content(message: Any) -> str:
     return str(getattr(message, "content", None) or message.get("content", ""))
+
+
+async def test_a_second_turn_does_not_resend_the_first_turns_bubbles(
+    checkpointed_graph: Any,
+) -> None:
+    """The accumulating reducers span turns unless something clears them.
+
+    `outbound` is checkpointed and uses an appending reducer, so turn 2's
+    result carries turn 1's bubbles too -- passing outbound=[] in the input
+    does not clear the channel. Left alone, every message would re-deliver
+    every acknowledgement the user has ever received, growing by one each time.
+    """
+    graph, thread = checkpointed_graph
+
+    first = await graph.ainvoke(
+        initial_state(
+            tenant_id=1, bsuid="BSUID-1", batch_id=1, input_text="oi", message_ids=["m1"]
+        ),
+        config=thread,
+    )
+    assert len(first["outbound"]) == 1
+
+    second = await graph.ainvoke(
+        initial_state(
+            tenant_id=1, bsuid="BSUID-1", batch_id=2, input_text="tudo bem?", message_ids=["m2"]
+        ),
+        config=thread,
+    )
+
+    assert len(second["outbound"]) == 1, "the previous turn's bubbles came back"
+    assert second["outbound"][0]["payload"]["message_ids"] == ["m2"]
+
+    third = await graph.ainvoke(
+        initial_state(
+            tenant_id=1, bsuid="BSUID-1", batch_id=3, input_text="beleza", message_ids=["m3"]
+        ),
+        config=thread,
+    )
+    assert len(third["outbound"]) == 1
+
+
+async def test_the_trace_is_per_turn_too(checkpointed_graph: Any) -> None:
+    """Same mechanism, and the one that would make the growth obvious in a
+    log long before anyone noticed the duplicate messages."""
+    graph, thread = checkpointed_graph
+
+    for i in range(3):
+        result = await graph.ainvoke(
+            initial_state(
+                tenant_id=1, bsuid="BSUID-1", batch_id=i, input_text="x", message_ids=[f"m{i}"]
+            ),
+            config=thread,
+        )
+
+    assert result["trace"].count("echo") == 1

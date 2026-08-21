@@ -54,10 +54,12 @@ async def setup_checkpoint_tables(owner_dsn: str) -> None:
     "permission denied for schema public" -- on the first deploy, on the first
     message.
 
-    Deliberately not an Alembic migration. These tables belong to the library
-    and it changes their shape between versions; pinning that in our own
-    migration would break on the next upgrade. `setup()` is idempotent, so
-    this is a startup step instead.
+    Deliberately not an Alembic migration: these tables belong to the library
+    and it changes their shape between versions, so pinning that in our own
+    migration would break on the next upgrade. It is a **deploy-time** step
+    instead -- scripts/bootstrap.py, alongside `alembic upgrade head` -- and
+    not something the worker does when it starts. `setup()` is idempotent, so
+    running it on every deploy costs nothing.
     """
     psycopg_dsn = to_psycopg_dsn(owner_dsn)
     async with AsyncPostgresSaver.from_conn_string(psycopg_dsn) as saver:

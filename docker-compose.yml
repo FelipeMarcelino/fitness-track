@@ -24,6 +24,7 @@ services:
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
+      bootstrap: { condition: service_completed_successfully }
     healthcheck:
       test: ["CMD", "python", "-c",
              "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health',timeout=3).status==200 else 1)"]
@@ -31,6 +32,18 @@ services:
       timeout: 5s
       retries: 5
       start_period: 20s
+
+  # Runs once and exits. Both the schema and the LangGraph checkpoint tables
+  # need owner privileges, and the worker connects as fittrack_app -- which
+  # cannot create tables (§19.1). Without this the first message fails with
+  # "relation checkpoints does not exist".
+  bootstrap:
+    build: .
+    env_file: [.env]
+    command: ["python", "scripts/bootstrap.py"]
+    restart: "no"
+    depends_on:
+      postgres: { condition: service_healthy }
 
   worker:
     build: .
@@ -40,6 +53,7 @@ services:
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
+      bootstrap: { condition: service_completed_successfully }
 
   # POSTGRES_USER is the owner and a superuser; it runs migrations only.
   # The application connects as fittrack_app (see .env.example), because a

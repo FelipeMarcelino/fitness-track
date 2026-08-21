@@ -15,6 +15,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 
 from fittrack.graph.prune import prune_messages
+from fittrack.graph.reducers import per_turn_reset
 from fittrack.graph.state import GraphState
 
 log = logging.getLogger(__name__)
@@ -23,10 +24,26 @@ log = logging.getLogger(__name__)
 ACK_EMOJI = "✅"
 
 
+async def begin_turn(state: GraphState) -> dict[str, Any]:
+    """Clears what last turn accumulated, and nothing else.
+
+    A node of its own rather than part of load_context, because LangGraph
+    applies one update per key per node: a node that returned both the reset
+    and its own trace entry would have the entry overwrite the reset, and the
+    channel would keep growing.
+
+    The reset cannot live in the input either. These channels are checkpointed
+    and their reducer appends, so passing an empty list appends an empty list
+    to what is already stored. Without this, every message re-delivers every
+    acknowledgement the user has ever received.
+    """
+    return per_turn_reset()
+
+
 async def load_context(state: GraphState) -> dict[str, Any]:
     """Where the profile, the open session and the local clock will come from.
 
-    Empty for now, but the node exists so that adding those is a change inside
+    Empty for now, but the node exists so that adding them is a change inside
     one node rather than a change to the topology of a running graph.
     """
     return {"trace": ["load_context"]}
@@ -77,19 +94,20 @@ async def deliver(state: GraphState) -> dict[str, Any]:
     """
     pruned = prune_messages(list(state.get("messages", [])))
     return {
-        # add_messages merges by id, so replacing the window means handing back
-        # the list we want rather than the delta.
+        # A delta, not the window: add_messages appends, so returning the
+        # shorter list would leave the long one in place. What goes back is a
+        # RemoveMessage per dropped message.
         "messages": _replace_window(state, pruned),
         "trace": ["deliver"],
     }
 
 
 def _replace_window(state: GraphState, pruned: list[Any]) -> list[Any]:
-    """Turns a pruned window into an update add_messages will accept.
+    """Returns the removals that shrink the window to `pruned`.
 
-    The reducer appends, so simply returning the shorter list would leave the
-    long one in place. Messages that survived are re-sent unchanged (merged by
-    id), and the dropped ones are removed explicitly.
+    add_messages appends and merges by id, so it has no notion of "here is the
+    new list". The only way to drop a message is to send a RemoveMessage for
+    it; the survivors are left untouched rather than re-sent.
     """
     from langchain_core.messages import RemoveMessage
 
@@ -111,12 +129,14 @@ def build_graph(checkpointer: BaseCheckpointSaver[Any] | None = None) -> Any:
     already knows how to do nothing.
     """
     graph = StateGraph(GraphState)
+    graph.add_node("begin_turn", begin_turn)
     graph.add_node("load_context", load_context)
     graph.add_node("echo", echo)
     graph.add_node("voice_stub", voice_stub)
     graph.add_node("deliver", deliver)
 
-    graph.add_edge(START, "load_context")
+    graph.add_edge(START, "begin_turn")
+    graph.add_edge("begin_turn", "load_context")
     graph.add_edge("load_context", "echo")
     graph.add_edge("echo", "voice_stub")
     graph.add_edge("voice_stub", "deliver")

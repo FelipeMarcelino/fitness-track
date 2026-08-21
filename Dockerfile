@@ -12,6 +12,11 @@ RUN pip install --no-cache-dir hatchling && \
     pip install --no-cache-dir -e .
 
 COPY src/ ./src/
+# The bootstrap step runs inside this image, so what it needs has to be here.
+# Without alembic.ini the migration cannot find its config, and `command.upgrade`
+# fails with a path error that reads like a broken install.
+COPY alembic.ini ./
+COPY scripts/ ./scripts/
 
 # Never root: an exploit in the process does not become root in the container.
 RUN useradd --create-home --uid 10001 fittrack && chown -R fittrack:fittrack /app
