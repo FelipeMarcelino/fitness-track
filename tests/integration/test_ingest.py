@@ -12,6 +12,8 @@ from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 from fittrack.channels.whatsapp.ingest import Ingest
 from fittrack.channels.whatsapp.payload import InboundMessage
 from fittrack.crypto.aesgcm import Encryptor, KeyRing
+from fittrack.services.outbound import Bubble, OutboundQueue
+from fittrack.services.retry_policy import classify
 
 pytestmark = pytest.mark.integration
 
@@ -262,3 +264,48 @@ async def test_a_dead_queue_does_not_lose_the_delivery(app_dsn: str) -> None:
     await service.accept_message(_message("wamid.noqueue"), {"raw": True})
 
     assert len(buffer.pushed) == 1
+
+
+async def test_a_new_message_releases_bubbles_the_closed_window_parked(
+    app_dsn: str, owner_conn: AsyncConnection
+) -> None:
+    """The inbound message is the event that reopens the 24h window (§18.5).
+
+    A bubble parked by a 131047 is waiting for exactly this and nothing else;
+    on a timer alone it would sit there long after the window reopened.
+    """
+    engine = create_async_engine(app_dsn)
+    queue = OutboundQueue(engine)
+    scheduler = FakeScheduler()
+    service = Ingest(engine, ENCRYPTOR, FakeBuffer(), scheduler, WINDOW, queue)
+
+    # First contact creates the tenant.
+    await service.accept_message(_message("wamid.win0", bsuid="BSUID-window"), {"raw": True})
+    row = await owner_conn.execute(
+        text("SELECT id FROM tenant WHERE bsuid = :b"), {"b": "BSUID-window"}
+    )
+    tenant_id = int(row.scalar_one())
+
+    await queue.enqueue(tenant_id, [Bubble(kind="image", payload={"id": "m1"})])
+    bubble = await queue.claim_next(tenant_id)
+    assert bubble is not None
+    await queue.mark_failed(bubble, classify("131047"), "out of window", code="131047")
+    assert await OutboundQueue(engine).claim_next(tenant_id) is None
+
+    scheduler.jobs.clear()
+    await service.accept_message(_message("wamid.win1", bsuid="BSUID-window"), {"raw": True})
+
+    assert await OutboundQueue(engine).claim_next(tenant_id) is not None
+    assert "deliver_outbound" in [job[0] for job in scheduler.jobs], (
+        "the bubbles were released but nothing was told to send them"
+    )
+
+
+async def test_a_message_without_parked_bubbles_does_not_wake_the_dispatcher(
+    ingest: tuple[Ingest, FakeBuffer, FakeScheduler],
+) -> None:
+    """Waking a dispatcher that has nothing to send is a job per message."""
+    service, _, scheduler = ingest
+    await service.accept_message(_message("wamid.nopark"), {"raw": True})
+
+    assert [job[0] for job in scheduler.jobs] == ["flush_user"]

@@ -278,3 +278,81 @@ async def test_an_account_block_alerts_without_retrying(
     row = await queue.get(tenant_id, bubble.id)
     assert row is not None
     assert row.dead_at is not None
+
+
+async def test_a_parked_bubble_is_released_when_the_window_reopens(
+    app_dsn: str, owner_conn: AsyncConnection
+) -> None:
+    """Parking on a timer is guessing at something unguessable.
+
+    A 131047 bubble waits for the user to write again, which no delay can
+    predict. Left on a fixed 24h park, a message arriving five minutes later
+    leaves the reply sitting there for the rest of the day.
+    """
+    tenant_id = await _tenant(owner_conn, "out-reopen")
+    queue = _queue(app_dsn)
+    await queue.enqueue(tenant_id, [Bubble(kind="image", payload={"id": "media-1"})])
+    bubble = await queue.claim_next(tenant_id)
+    assert bubble is not None
+    await queue.mark_failed(bubble, classify("131047"), "out of window", code="131047")
+
+    assert await _queue(app_dsn).claim_next(tenant_id) is None
+
+    assert await queue.release_parked(tenant_id) == 1
+
+    released = await _queue(app_dsn).claim_next(tenant_id)
+    assert released is not None
+    assert released.id == bubble.id
+
+
+async def test_releasing_does_not_disturb_a_backoff(
+    app_dsn: str, owner_conn: AsyncConnection
+) -> None:
+    """A rate-limited bubble is waiting on Meta, not on the user. Releasing it
+    early sends it straight back into the limit that caused it."""
+    tenant_id = await _tenant(owner_conn, "out-reopen-scope")
+    queue = _queue(app_dsn)
+    await queue.enqueue(tenant_id, _bubbles("devagar"))
+    bubble = await queue.claim_next(tenant_id)
+    assert bubble is not None
+    await queue.mark_failed(bubble, classify("130429"), "rate limited", code="130429")
+
+    assert await queue.release_parked(tenant_id) == 0
+    assert await _queue(app_dsn).claim_next(tenant_id) is None
+
+
+async def test_the_backoff_it_reports_is_the_one_it_stored(
+    app_dsn: str, owner_conn: AsyncConnection
+) -> None:
+    """The caller schedules a wake-up from this number.
+
+    Drawing jitter twice -- once for the row, once for the job -- lets the job
+    fire before the row is eligible. That pass finds nothing, sends nothing and
+    reschedules nothing, so the bubble waits for an unrelated event.
+    """
+    tenant_id = await _tenant(owner_conn, "out-delay")
+    queue = _queue(app_dsn)
+    await queue.enqueue(tenant_id, _bubbles("espera"))
+    bubble = await queue.claim_next(tenant_id)
+    assert bubble is not None
+
+    delay = await queue.mark_failed(bubble, classify("130429"), "rate limited", code="130429")
+    assert delay is not None
+
+    # Eligible after the reported delay, and not a moment before.
+    assert await queue.claim_next(tenant_id, now_offset=int(delay) - 1) is None
+    assert await queue.claim_next(tenant_id, now_offset=int(delay) + 2) is not None
+
+
+async def test_a_terminal_failure_reports_no_delay(
+    app_dsn: str, owner_conn: AsyncConnection
+) -> None:
+    """Waking up for a bubble that can never be sent is how a dead letter turns
+    into a loop."""
+    tenant_id = await _tenant(owner_conn, "out-nodelay")
+    queue = _queue(app_dsn)
+    await queue.enqueue(tenant_id, _bubbles("fim"))
+    bubble = await queue.claim_next(tenant_id)
+    assert bubble is not None
+
+    assert await queue.mark_failed(bubble, classify("100"), "invalid", code="100") is None

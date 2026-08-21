@@ -11,13 +11,16 @@ global poller to come back around.
 from __future__ import annotations
 
 import logging
-from typing import Any, Protocol
+from typing import Any, Final, Protocol
 
 from fittrack.channels.base import Channel, SendError
 from fittrack.services.outbound import OutboundQueue, QueuedBubble
-from fittrack.services.retry_policy import Action, backoff_seconds, classify
+from fittrack.services.retry_policy import classify
 
 log = logging.getLogger(__name__)
+
+# Margin on top of the backoff, so the job wakes after eligibility.
+WAKE_MARGIN_SECONDS: Final = 1.0
 
 
 class Scheduler(Protocol):
@@ -66,9 +69,14 @@ class Dispatcher:
 
     async def _on_failure(self, bubble: QueuedBubble, exc: SendError, bsuid: str) -> None:
         decision = classify(exc.code, status=exc.status)
-        await self._queue.mark_failed(bubble, decision, str(exc), code=exc.code)
+        # The queue picks the delay and reports it back. Drawing our own would
+        # draw different jitter: a shorter one wakes the job before the row is
+        # eligible, and that pass finds nothing, sends nothing and reschedules
+        # nothing -- the bubble waits for some unrelated event to wake the
+        # tenant again.
+        delay = await self._queue.mark_failed(bubble, decision, str(exc), code=exc.code)
 
-        if decision.action is not Action.RETRY or bubble.attempts >= decision.max_attempts:
+        if delay is None:
             return
         if self._scheduler is None:
             # Without a scheduler the row is still correct -- it carries its
@@ -77,7 +85,12 @@ class Dispatcher:
             log.warning("bubble %s is scheduled to retry but nothing will wake it", bubble.id)
             return
 
-        delay = backoff_seconds(decision, attempt=bubble.attempts)
         await self._scheduler.enqueue_job(
-            "deliver_outbound", bubble.tenant_id, bsuid, _defer_by=delay
+            "deliver_outbound",
+            bubble.tenant_id,
+            bsuid,
+            # After the row is eligible, not exactly at it: ARQ's poll interval
+            # and clock skew can land the job a hair early, which costs a whole
+            # round trip through the queue for nothing.
+            _defer_by=delay + WAKE_MARGIN_SECONDS,
         )

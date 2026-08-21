@@ -41,6 +41,10 @@ CLAIM_LEASE_SECONDS: Final = 60
 # defer rather than give up -- so this is a ceiling, not a schedule.
 WINDOW_WAIT_SECONDS: Final = 24 * 3600
 
+# The Cloud API code for "the 24h window closed" (§18.5). Named because the
+# inbound path looks for exactly these rows when the window reopens.
+OUT_OF_WINDOW: Final = "131047"
+
 # Kinds that have a template equivalent (§18.5). Media and interactive bubbles
 # do not: a template with an image header needs an approved template per image,
 # which is not something the runtime can conjure.
@@ -68,6 +72,7 @@ class QueuedBubble:
     attempts: int
     sent_at: object | None = None
     dead_at: object | None = None
+    next_retry_at: object | None = None
     error_code: str | None = None
     retryable: bool | None = None
     last_error: str | None = None
@@ -197,21 +202,26 @@ class OutboundQueue:
         decision: Decision,
         error: str,
         code: str | None = None,
-    ) -> None:
+    ) -> float | None:
         """Applies the §18.5 policy to a failed send.
 
         `code` is recorded on the row because the daily dead-letter report
         groups by it: one error class growing is a change in Meta's behaviour,
         not a run of bad luck, and that is invisible without the code.
+
+        Returns the backoff it chose, or None when the bubble will not be
+        retried. The caller needs the same number: the delay is jittered, so
+        drawing it twice would let the wake-up job fire before the row is
+        eligible -- it would find nothing, send nothing, and reschedule
+        nothing, stranding the bubble until something else woke the tenant.
         """
         bubble = replace(bubble, error_code=code or bubble.error_code)
         if decision.action is Action.RETRY and bubble.attempts < decision.max_attempts:
-            await self._reschedule(bubble, decision, error)
-            return
+            return await self._reschedule(bubble, decision, error)
 
         if decision.action is Action.TEMPLATE:
             await self._to_template(bubble, error)
-            return
+            return None
 
         if decision.action is Action.SUSPEND:
             # The recipient, not the message. Every other message to them fails
@@ -230,6 +240,7 @@ class OutboundQueue:
             )
 
         await self.kill_group(bubble, error)
+        return None
 
     async def kill_group(self, bubble: QueuedBubble, error: str) -> None:
         """Gives up on this bubble and everything after it in the reply.
@@ -259,7 +270,7 @@ class OutboundQueue:
             row = await conn.execute(
                 text(
                     "SELECT id, tenant_id, group_id, seq, kind, payload, attempts, "
-                    "sent_at, dead_at, error_code, retryable, last_error "
+                    "sent_at, dead_at, next_retry_at, error_code, retryable, last_error "
                     "FROM outbound_queue WHERE id = :i"
                 ),
                 {"i": bubble_id},
@@ -273,14 +284,14 @@ class OutboundQueue:
             rows = await conn.execute(
                 text(
                     "SELECT id, tenant_id, group_id, seq, kind, payload, attempts, "
-                    "sent_at, dead_at, error_code, retryable, last_error "
+                    "sent_at, dead_at, next_retry_at, error_code, retryable, last_error "
                     "FROM outbound_queue WHERE group_id = :g ORDER BY seq"
                 ),
                 {"g": str(group_id)},
             )
             return [_row(row) for row in rows.all()]
 
-    async def _reschedule(self, bubble: QueuedBubble, decision: Decision, error: str) -> None:
+    async def _reschedule(self, bubble: QueuedBubble, decision: Decision, error: str) -> float:
         delay = backoff_seconds(decision, attempt=bubble.attempts)
         async with self._engine.begin() as conn:
             await self._scope(conn, bubble.tenant_id)
@@ -292,6 +303,7 @@ class OutboundQueue:
                 ),
                 {"i": bubble.id, "d": delay, "c": bubble.error_code, "e": error[:1000]},
             )
+        return delay
 
     async def _to_template(self, bubble: QueuedBubble, error: str) -> None:
         """Handles 131047, where the 24h window closed mid-reply.
@@ -299,8 +311,10 @@ class OutboundQueue:
         A template is the only thing Meta will accept outside the window, and
         only text bubbles have an equivalent: a template with a media header
         needs its own approved template, which the runtime cannot invent. What
-        cannot be converted is parked until the window reopens rather than
-        killed -- the user writing again is all it takes.
+        cannot be converted is parked rather than killed -- the user writing
+        again is all it takes, and `release_parked` is what notices. The delay
+        set here is a backstop for the case where they never do, not a
+        prediction of when the window reopens.
         """
         convertible = bubble.kind in TEMPLATE_EQUIVALENT
         async with self._engine.begin() as conn:
@@ -321,6 +335,27 @@ class OutboundQueue:
                     "d": WINDOW_WAIT_SECONDS,
                 },
             )
+
+    async def release_parked(self, tenant_id: int) -> int:
+        """Makes out-of-window bubbles eligible again, and says how many.
+
+        A bubble parked by 131047 is waiting for something no timer can
+        predict: the user writing again. Parking it on a fixed delay means a
+        message that reopens the window five minutes later leaves the reply
+        sitting there for the rest of the day. So the inbound path calls this
+        instead, and the ceiling in `_to_template` is only a backstop.
+        """
+        async with self._engine.begin() as conn:
+            await self._scope(conn, tenant_id)
+            result = await conn.execute(
+                text(
+                    "UPDATE outbound_queue SET scheduled_at = now(), next_retry_at = now() "
+                    "WHERE tenant_id = :t AND sent_at IS NULL AND dead_at IS NULL "
+                    "AND error_code = :c AND scheduled_at > now()"
+                ),
+                {"t": tenant_id, "c": OUT_OF_WINDOW},
+            )
+            return int(result.rowcount)
 
     async def _suspend(self, tenant_id: int) -> None:
         async with self._engine.begin() as conn:
@@ -348,6 +383,7 @@ def _row(found: Any) -> QueuedBubble:
         attempts=int(found.attempts),
         sent_at=found.sent_at,
         dead_at=found.dead_at,
+        next_retry_at=found.next_retry_at,
         error_code=found.error_code,
         retryable=found.retryable,
         last_error=found.last_error,

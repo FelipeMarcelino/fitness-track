@@ -167,3 +167,55 @@ async def test_a_later_reply_does_not_overtake_a_stalled_one(
 
     assert sent == 0
     assert channel.sent == [], "the second reply jumped the queue"
+
+
+async def test_the_wake_up_lands_after_the_row_is_eligible(
+    app_dsn: str, owner_conn: AsyncConnection
+) -> None:
+    """The delay must be drawn once, not once per user of it.
+
+    The backoff is jittered. Drawing it again for the ARQ `_defer_by` gives a
+    different number, and when it comes out shorter the job fires before the
+    row is eligible: that pass claims nothing, sends nothing and reschedules
+    nothing, so the bubble waits for some unrelated event to wake the tenant.
+    Ten bubbles because one coin flip proves nothing.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    tenant_id = await _tenant(owner_conn, "disp-jitter")
+    queue = OutboundQueue(create_async_engine(app_dsn))
+    for i in range(10):
+        await queue.enqueue(tenant_id, _bubbles(f"bolha {i}"))
+
+    for _ in range(10):
+        channel = FakeChannel(fail_on={0: SendError("rate limited", code="130429", status=400)})
+        scheduler = FakeScheduler()
+        before = datetime.now(UTC)
+        await Dispatcher(queue, channel, scheduler).deliver(tenant_id, "disp-jitter")
+
+        assert len(scheduler.jobs) == 1
+        _, _, kwargs = scheduler.jobs[0]
+        wakes_at = before + timedelta(seconds=float(kwargs["_defer_by"]))
+
+        eligible = await _last_failed(queue, tenant_id)
+        assert eligible is not None
+        assert wakes_at >= eligible, (
+            f"the job wakes at {wakes_at}, before the row is eligible at {eligible}"
+        )
+
+
+async def _last_failed(queue: OutboundQueue, tenant_id: int) -> Any:
+    """When the most recently failed bubble becomes claimable again."""
+    from sqlalchemy import text as sql
+
+    async with queue._engine.begin() as conn:
+        await conn.execute(sql(f"SET LOCAL app.tenant_id = '{tenant_id}'"))
+        row = await conn.execute(
+            sql(
+                "SELECT next_retry_at FROM outbound_queue "
+                "WHERE tenant_id = :t AND sent_at IS NULL AND dead_at IS NULL "
+                "AND error_code = '130429' ORDER BY id DESC LIMIT 1"
+            ),
+            {"t": tenant_id},
+        )
+        return row.scalar_one_or_none()

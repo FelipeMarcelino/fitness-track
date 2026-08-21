@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from fittrack.channels.whatsapp.payload import InboundMessage, StatusUpdate
 from fittrack.crypto.aesgcm import Encryptor
+from fittrack.services.outbound import OutboundQueue
 
 log = logging.getLogger(__name__)
 
@@ -56,18 +57,25 @@ class Ingest:
         buffer: Buffer,
         scheduler: Scheduler,
         window_seconds: int,
+        outbound: OutboundQueue | None = None,
     ) -> None:
         self._engine = engine
         self._encryptor = encryptor
         self._buffer = buffer
         self._scheduler = scheduler
         self._window = window_seconds
+        self._outbound = outbound if outbound is not None else OutboundQueue(engine)
 
     async def accept_message(self, message: InboundMessage, envelope: dict[str, Any]) -> None:
         stored = await self._store(message, envelope)
         if stored is None:
             log.info("ignoring redelivery of %s", message.message_id)
             return
+
+        # This message reopened the 24h window (§18.5). Anything parked by a
+        # 131047 has been waiting for exactly this, and no timer could have
+        # predicted it -- so release it here rather than leaving it to expire.
+        await self._reopen_window(stored, message.bsuid)
 
         if message.is_actionable:
             await self._buffer.push(
@@ -82,6 +90,18 @@ class Ingest:
                 },
             )
             await self._schedule_flush(message.bsuid)
+
+    async def _reopen_window(self, tenant_id: int, bsuid: str) -> None:
+        try:
+            released = await self._outbound.release_parked(tenant_id)
+            if released:
+                log.info("the window reopened; %d parked bubbles can go out", released)
+                await self._scheduler.enqueue_job("deliver_outbound", tenant_id, bsuid)
+        except Exception:
+            # The delivery is already persisted. A parked bubble stays parked
+            # until the next message, which is a delay rather than a loss --
+            # and far better than making Meta redeliver what we already have.
+            log.exception("could not release parked bubbles for %s", bsuid)
 
     async def _schedule_flush(self, bsuid: str) -> None:
         """Asks a worker to look at this user once the window has closed.
