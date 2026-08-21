@@ -1,6 +1,6 @@
 # Sprint 01 — Walking skeleton
 
-| | |
+| Campo | Valor |
 | --- | --- |
 | Fase | 1.0 — Registro confiável |
 | Duração | 2 semanas |
@@ -31,8 +31,9 @@ graça e determinística.
 ### Dentro
 
 - `docker-compose.yml` com Postgres 16, Redis 7, Qdrant, Caddy e a aplicação
-- Schema completo da §5.2 via Alembic: 18 tabelas, constraints, índices, RLS em todas as tabelas
-  com `tenant_id`, colunas cifradas já como `BYTEA`
+- Schema completo da §5.2 via Alembic: **21 tabelas**, constraints, índices, RLS nas 20 que têm
+  `tenant_id`, colunas cifradas já como `BYTEA`. A migração é considerada completa quando
+  `SELECT count(*) FROM information_schema.tables WHERE table_schema='public'` bate com a spec
 - `settings.py` com pydantic-settings e o `.env.example` do Apêndice A
 - `ingress`: `GET`/`POST /webhook/whatsapp`, validação HMAC-SHA256, dedup por `message_id`,
   persistência em `raw_message`, resposta em menos de 200 ms
@@ -43,6 +44,7 @@ graça e determinística.
 - Grafo mínimo: `load_context` → `echo` → `voice_stub` → `deliver`
 - Criptografia de coluna: helper de cifra/decifra e as colunas da §22.2 em uso
 - Suíte de testes com containers efêmeros, incluindo o teste de isolamento entre tenants
+- Harness de avaliação com o conjunto de calibração do judge, ligado ao CI (AD-31)
 - O job `python` do CI saindo de `skipping`
 
 ### Fora — e por quê
@@ -54,7 +56,7 @@ graça e determinística.
 | STT via Groq | Sprint 03 |
 | Coleções do Qdrant e RAG | Sprint 04 |
 | Catálogo de exercícios semeado | Sprint 02 (o resolver precisa) |
-| Golden set e judge | Sprint 02 (não há saída de LLM para avaliar) |
+| Casos de golden set e rubricas de judge | Sprint 02 — não há saída de LLM para avaliar |
 | Langfuse e Datadog | Sprint 02 (o que instrumentar ainda não existe) |
 | Billing, proativo, análise | Fases 1.1–1.3 |
 
@@ -128,6 +130,11 @@ Buffer, timer de 10s renovável e esvaziamento atômico.
 **Testes primeiro:**
 
 - Quatro mensagens em 7s produzem **um** lote de quatro
+- **Renovação do timer:** seis mensagens espaçadas de 6s cada (36s no total, cada intervalo
+  abaixo dos 10s) produzem **um** lote de seis, não quatro lotes. Sem este caso, uma
+  implementação que agenda um único flush 10s após a *primeira* mensagem passaria no teste
+  anterior e quebraria rajadas longas em produção
+- O flush ocorre **10s após a última** mensagem, não 10s após a primeira
 - Mensagem chegando entre o `RENAME` e o `DEL` **não** se perde — o teste que prova por que
   `LRANGE`+`DEL` estava errado (§17.3)
 - Buffer vazio no flush não cria lote
@@ -155,7 +162,28 @@ Interface `Channel`, cliente WhatsApp, `outbound_queue` com ordenação e retry 
 - `100` não repete e alerta
 - Bolha `dead` marca as seguintes do grupo como `dead`
 
-### 8. `feat/echo-graph`
+### 8. `feat/eval-harness`
+
+O runner de avaliação, o formato de dataset, o conjunto de calibração do judge e a ligação com o
+CI — **antes** do primeiro código sob `src/fittrack/graph/`.
+
+Motivo: a §21.4 dispara o job do judge quando o diff toca `src/fittrack/graph/**`, e a tarefa 9
+cria exatamente esse diretório. Sem o harness, a primeira PR de grafo acionaria um job que não
+existe. Além disso, o AD-31 exige judge desde a primeira PR de código; adiar o harness inteiro
+para o sprint 02 contradiria a decisão.
+
+O que **não** entra: casos de extração e rubricas de recomendação, que precisam de saída de LLM
+para existir. O harness nasce com zero casos de LLM e com os 20 casos de calibração, que são
+independentes do produto.
+
+**Testes primeiro:** runner com dataset vazio sai 0 e reporta "sem casos"; runner com caso que
+falha sai diferente de 0; calibração com mais de 2 erros reporta "judge não calibrado" e **não**
+reprova a PR (§21.2).
+
+**Pronto quando:** `python -m evals.run --suite all` roda no CI, sai 0, e o job aparece nos checks
+em vez de ausente.
+
+### 9. `feat/echo-graph`
 
 `GraphState` tipado com os reducers da §8.1, checkpointer Postgres, e o grafo mínimo
 `load_context → echo → voice_stub → deliver`.
@@ -183,6 +211,7 @@ Verificáveis, na ordem em que devem ser conferidos:
 | 9 | Latência do webhook | p99 < 200 ms sob carga local |
 | 10 | CI real | Job `python` roda e passa, não mais `skipping` |
 | 11 | Nada em claro | `SELECT verbatim FROM health_report` devolve bytes, não texto |
+| 12 | Harness de eval existe | `python -m evals.run --suite all` sai 0 e o job aparece nos checks |
 
 ## Riscos
 
