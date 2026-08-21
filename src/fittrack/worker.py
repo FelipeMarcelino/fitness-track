@@ -14,9 +14,12 @@ from arq import cron
 from arq.connections import RedisSettings
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from fittrack.channels.whatsapp.client import WhatsAppChannel
 from fittrack.crypto.aesgcm import Encryptor, KeyRing
 from fittrack.services.batch import Batch, BatchStore
 from fittrack.services.debounce import BurstBuffer
+from fittrack.services.dispatcher import Dispatcher
+from fittrack.services.outbound import OutboundQueue
 from fittrack.services.pipeline import BUSY_RETRY_SECONDS, Pipeline
 from fittrack.settings import get_settings
 
@@ -60,6 +63,19 @@ async def flush_user(ctx: dict[str, Any], bsuid: str) -> None:
         await ctx["redis_queue"].enqueue_job("flush_user", bsuid, _defer_by=BUSY_RETRY_SECONDS)
 
 
+async def deliver_outbound(ctx: dict[str, Any], tenant_id: int, bsuid: str) -> None:
+    """Drains one tenant's outbound queue (§18.5).
+
+    Per tenant rather than a global sweep: RLS is FORCEd per tenant (§19.1), so
+    a cross-tenant poll would see nothing, and ordering is per reply anyway.
+    A backoff reschedules this same job rather than waiting for a poller.
+    """
+    dispatcher: Dispatcher = ctx["dispatcher"]
+    sent = await dispatcher.deliver(tenant_id, bsuid)
+    if sent:
+        log.info("delivered %d bubbles to tenant %s", sent, tenant_id)
+
+
 async def reclaim_orphans(ctx: dict[str, Any]) -> None:
     """Returns batches stranded by a worker that died mid-drain (§17.3)."""
     reclaimed = await ctx["buffer"].reclaim_orphans()
@@ -82,13 +98,19 @@ async def startup(ctx: dict[str, Any]) -> None:
         decode_responses=True,
     )
     buffer = BurstBuffer(redis, window_seconds=settings.debounce_window_s)
-    batches = BatchStore(create_async_engine(settings.database_url.get_secret_value()))
+    engine = create_async_engine(settings.database_url.get_secret_value())
+    batches = BatchStore(engine)
+    channel = WhatsAppChannel(
+        settings.waba_phone_number_id,
+        settings.waba_token.get_secret_value(),
+    )
 
     ctx["settings"] = settings
     ctx["redis_text"] = redis
     ctx["buffer"] = buffer
     ctx["encryptor"] = Encryptor(KeyRing({1: key}, current_version=1))
     ctx["pipeline"] = Pipeline(redis, buffer, batches, _handle)
+    ctx["dispatcher"] = Dispatcher(OutboundQueue(engine), channel, ctx["redis_queue"])
 
 
 async def shutdown(ctx: dict[str, Any]) -> None:
@@ -107,7 +129,7 @@ class WorkerSettings:
     fine.
     """
 
-    functions: ClassVar[list[Any]] = [flush_user, reclaim_orphans]
+    functions: ClassVar[list[Any]] = [flush_user, deliver_outbound, reclaim_orphans]
     # Unregistered, reclaim_orphans never runs, and a worker killed between the
     # RENAME and the batch insert strands that burst in its drain key forever
     # once the lease expires -- messages the user sent and the bot never sees.
