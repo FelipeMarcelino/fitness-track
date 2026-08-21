@@ -34,4 +34,4 @@ def test_importing_the_module_does_not_require_an_environment() -> None:
     import importlib
 
     module = importlib.import_module("fittrack.worker")
-    assert module.WorkerSettings.functions == []
+    assert module.WorkerSettings.functions, "the worker must register its jobs"
