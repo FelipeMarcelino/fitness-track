@@ -89,8 +89,8 @@ atravessam a spec inteira:
 | AD-25 | Idioma | pt-BR, i18n preparado | Foco em qualidade de um idioma. |
 | AD-26 | Persona | Adaptativa por perfil e contexto | Curta durante treino, extensa fora dele. |
 | AD-27 | Guardrail de saúde | Conservador com registro do relato | Não diagnostica, mas aproveita o dado. |
-| AD-28 | Programa de treino | Um único `program_agent` cobrindo template, periodização e metas | Menos peças e uma decisão coerente. Custo aceito: prompt grande e avaliação por dimensão em vez de por agente (§21.4). |
-| AD-29 | Observabilidade | Langfuse self-hosted (plano LLM) + Datadog (plano infra), sem PII no Datadog | Conteúdo do usuário não sai da infra (preserva o AD-22) e ainda assim há APM real. Correlação por `trace_id`. |
+| AD-28 | Programa de treino | Um único `program_agent` cobrindo template, periodização e metas | Menos peças e uma decisão coerente. Custo aceito: prompt grande e avaliação por dimensão em vez de por agente (§21.3). |
+| AD-29 | Observabilidade | Langfuse self-hosted (plano LLM) + Datadog (plano infra), sem **conteúdo de usuário** no Datadog | Conteúdo do usuário não sai da infra (preserva o AD-22) e ainda assim há APM real. Correlação por `trace_id`. |
 | AD-30 | Criptografia | Coluna sensível cifrada na aplicação + TLS + disco | Protege contra dump de banco e backup vazado, não só contra roubo de máquina. Custo: campo cifrado não é agregável em SQL (§22.2). |
 | AD-31 | Avaliação | LLM-as-judge desde a primeira PR de código; bloqueia apenas segurança e fidelidade numérica | Judge tem variância; bloquear tudo produziria CI vermelho por ruído e corroeria a confiança no sinal. |
 | AD-32 | Eval de recomendação | Validadores determinísticos + judge só para o qualitativo | Restrição (equipamento, lesão, catálogo, volume) é verificável por código. Judge só onde não há gabarito. |
@@ -321,7 +321,8 @@ CREATE TABLE athlete_profile (
     training_days_week  SMALLINT,
     session_minutes     SMALLINT,
     equipment_access    TEXT[],        -- ['academia_completa','halteres','peso_corporal']
-    injuries            JSONB DEFAULT '[]'::jsonb,   -- [{"region":"ombro_direito","since":"2026-03","note":"..."}]
+    injuries            BYTEA,        -- CIFRADA (§22.2); JSON serializado antes de cifrar
+    injuries_key_version SMALLINT NOT NULL DEFAULT 1,
     preferences         JSONB DEFAULT '{}'::jsonb,   -- {"disliked_exercises":[...], "verbosity":"short"}
     persona_style       TEXT DEFAULT 'parceiro',     -- parceiro | tecnico | motivacional
     onboarded_at        TIMESTAMPTZ,
@@ -494,7 +495,8 @@ WHERE s.deleted_at IS NULL AND s.is_warmup = false;
 CREATE TABLE session_summary (
     session_id      BIGINT PRIMARY KEY REFERENCES workout_session(id) ON DELETE CASCADE,
     tenant_id       BIGINT NOT NULL REFERENCES tenant(id) ON DELETE CASCADE,
-    narrative       TEXT NOT NULL,      -- resumo em linguagem natural (indexado no RAG)
+    narrative       BYTEA NOT NULL,     -- CIFRADA (§22.2); resumo indexado no RAG
+    key_version     SMALLINT NOT NULL DEFAULT 1,
     total_volume_kg NUMERIC(10,2),
     total_sets      SMALLINT,
     duration_min    SMALLINT,
@@ -515,7 +517,8 @@ CREATE TABLE body_metric (
     measured_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     local_date   DATE NOT NULL,
     kind         TEXT NOT NULL,   -- peso | cintura | braco | sono_h | disposicao | dor
-    value        NUMERIC(8,2) NOT NULL,
+    value        BYTEA NOT NULL,  -- CIFRADA (§22.2); não agregável em SQL
+    key_version  SMALLINT NOT NULL DEFAULT 1,
     unit         TEXT NOT NULL,   -- kg | cm | h | escala_0_10
     note         TEXT,
     source_text  TEXT
@@ -529,7 +532,8 @@ CREATE TABLE health_report (
     region       TEXT,            -- ombro_direito | lombar | joelho_esquerdo
     severity     TEXT,            -- leve | moderada | intensa
     category     TEXT NOT NULL,   -- dor | lesao | tontura | mal_estar | outro
-    verbatim     TEXT NOT NULL,
+    verbatim     BYTEA NOT NULL,  -- CIFRADA (§22.2)
+    key_version  SMALLINT NOT NULL DEFAULT 1,
     guidance_given TEXT,
     resolved_at  TIMESTAMPTZ
 );
@@ -557,17 +561,24 @@ CREATE TABLE training_program (
     started_at      TIMESTAMPTZ,
     ends_at         TIMESTAMPTZ,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT ck_program_horizon CHECK (horizon_weeks BETWEEN 2 AND 24)
+    CONSTRAINT ck_program_horizon CHECK (horizon_weeks BETWEEN 4 AND 16),
+    -- Chave alternativa: permite FK composta nas filhas, garantindo que
+    -- referência e referenciado pertençam ao MESMO tenant.
+    UNIQUE (id, tenant_id)
 );
 -- No máximo um programa ativo por tenant
 CREATE UNIQUE INDEX ux_program_one_active
     ON training_program(tenant_id) WHERE status = 'active';
 
+-- tenant_id é OBRIGATÓRIO nas filhas. A RLS do PostgreSQL é por tabela e NÃO
+-- se propaga por chave estrangeira: sem esta coluna, uma query direta em
+-- program_phase leria as fases de todos os tenants.
 CREATE TABLE program_phase (
     id                BIGSERIAL PRIMARY KEY,
-    program_id        BIGINT NOT NULL REFERENCES training_program(id) ON DELETE CASCADE,
+    tenant_id         BIGINT NOT NULL REFERENCES tenant(id) ON DELETE CASCADE,
+    program_id        BIGINT NOT NULL,
     phase_order       SMALLINT NOT NULL,
-    name              TEXT NOT NULL,        -- acumulacao | intensificacao | deload | teste
+    name              TEXT NOT NULL,        -- base | acumulacao | intensificacao | deload | teste
     weeks             SMALLINT NOT NULL,
     weekly_sets_min   SMALLINT,             -- volume alvo por grupo muscular
     weekly_sets_max   SMALLINT,
@@ -575,27 +586,33 @@ CREATE TABLE program_phase (
     rpe_max           NUMERIC(3,1),
     intensity_note    TEXT,
     is_deload         BOOLEAN NOT NULL DEFAULT false,
-    UNIQUE (program_id, phase_order)
+    UNIQUE (program_id, phase_order),
+    UNIQUE (id, program_id),          -- alvo da FK composta em workout_plan
+    FOREIGN KEY (program_id, tenant_id)
+        REFERENCES training_program(id, tenant_id) ON DELETE CASCADE
 );
 
 CREATE TABLE program_milestone (
     id            BIGSERIAL PRIMARY KEY,
-    program_id    BIGINT NOT NULL REFERENCES training_program(id) ON DELETE CASCADE,
+    tenant_id     BIGINT NOT NULL REFERENCES tenant(id) ON DELETE CASCADE,
+    program_id    BIGINT NOT NULL,
     description   TEXT NOT NULL,            -- "supino reto 100kg x 1"
     metric        TEXT NOT NULL,            -- e1rm | load | volume | distance | duration
     exercise_id   BIGINT REFERENCES exercise(id),
     target_value  NUMERIC(10,2) NOT NULL,
     target_date   DATE,
     achieved_at   TIMESTAMPTZ,
-    achieved_value NUMERIC(10,2)
+    achieved_value NUMERIC(10,2),
+    FOREIGN KEY (program_id, tenant_id)
+        REFERENCES training_program(id, tenant_id) ON DELETE CASCADE
 );
 CREATE INDEX ix_milestone_open ON program_milestone(program_id) WHERE achieved_at IS NULL;
 
 CREATE TABLE workout_plan (
     id           BIGSERIAL PRIMARY KEY,
     tenant_id    BIGINT REFERENCES tenant(id) ON DELETE CASCADE,  -- NULL = template global
-    program_id   BIGINT REFERENCES training_program(id) ON DELETE CASCADE,
-    phase_id     BIGINT REFERENCES program_phase(id),
+    program_id   BIGINT,
+    phase_id     BIGINT,
     week_number  SMALLINT,        -- semana do programa que esta ficha materializa
     name         TEXT NOT NULL,
     goal         TEXT,
@@ -605,7 +622,16 @@ CREATE TABLE workout_plan (
     rationale    TEXT,            -- por que foi recomendada (gerado por LLM)
     source       TEXT NOT NULL DEFAULT 'generated',  -- generated | template | user | program
     active       BOOLEAN NOT NULL DEFAULT true,
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- FKs compostas: a ficha só referencia programa do PRÓPRIO tenant, e
+    -- a fase tem de pertencer AO MESMO programa. Com FKs independentes,
+    -- apagar o programa de um tenant apagaria ficha de outro por CASCADE.
+    FOREIGN KEY (program_id, tenant_id)
+        REFERENCES training_program(id, tenant_id) ON DELETE CASCADE,
+    FOREIGN KEY (phase_id, program_id)
+        REFERENCES program_phase(id, program_id),
+    CONSTRAINT ck_plan_phase_needs_program
+        CHECK (phase_id IS NULL OR program_id IS NOT NULL)
 );
 
 CREATE TABLE plan_item (
@@ -638,8 +664,9 @@ CREATE TABLE raw_message (
     wa_message_id TEXT NOT NULL UNIQUE,
     direction     TEXT NOT NULL,       -- inbound | outbound
     msg_type      TEXT NOT NULL,       -- text | audio | image | interactive | reaction | template
-    payload       JSONB NOT NULL,
-    transcript    TEXT,                -- preenchido se áudio
+    payload       BYTEA NOT NULL,      -- CIFRADA (§22.2); JSON serializado antes de cifrar
+    transcript    BYTEA,               -- CIFRADA (§22.2); preenchida se áudio
+    key_version   SMALLINT NOT NULL DEFAULT 1,
     received_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     processed_at  TIMESTAMPTZ
 );
@@ -1337,7 +1364,7 @@ com volume estável (antecipa o deload). Toda mudança de fase é comunicada ao 
 `proactive_coach`, respeitando a janela de 24h (§14).
 
 **Avaliação.** Por dimensão, não por agente (AD-28): template, periodização e metas são pontuados
-separadamente na §21.4, de modo que uma regressão em metas não se esconda atrás de um bom template.
+separadamente na §21.3, de modo que uma regressão em metas não se esconda atrás de um bom template.
 
 ---
 
@@ -1903,16 +1930,16 @@ Postgres devolver linhas de outro usuário.
 --   exercise_alias, workout_session, exercise_set, session_summary,
 --   body_metric, health_report, workout_plan, training_program,
 --   raw_message, processing_batch, usage_ledger, outbound_queue,
---   conversation_window
--- program_phase e program_milestone herdam o isolamento via program_id.
+--   program_phase, program_milestone, conversation_window
 DO $$
 DECLARE t text;
 BEGIN
   FOREACH t IN ARRAY ARRAY[
     'athlete_profile','consent','subscription','exercise','exercise_alias',
     'workout_session','exercise_set','session_summary','body_metric',
-    'health_report','workout_plan','training_program','raw_message',
-    'processing_batch','usage_ledger','outbound_queue','conversation_window'
+    'health_report','workout_plan','training_program','program_phase',
+    'program_milestone','raw_message','processing_batch','usage_ledger',
+    'outbound_queue','conversation_window'
   ] LOOP
     EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
     EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', t);
@@ -2007,7 +2034,7 @@ no domínio.
 | Retenção | `raw_message` payload bruto: 90 dias. Áudio: descartado. Traces Langfuse: 60 dias. Dado de treino: enquanto a conta existir. |
 | Opt-out | "parar" / "sair" → `proactive_msg = false` + resposta de confirmação. "cancelar conta" → fluxo de exclusão. |
 | Encarregado (DPO) | E-mail de contato na política, respondido pelo operador. |
-| Transferência internacional | Declarada: xAI, Anthropic, Groq, OpenAI (embeddings), Meta. Listada na política de privacidade. |
+| Transferência internacional | Declarada: xAI, Anthropic, Groq, OpenAI (embeddings), Meta e **Datadog**. O Datadog não recebe conteúdo, mas recebe `tenant_id`, que é dado pessoal por ser correlacionável a um usuário (§20.2). Todos listados na política de privacidade. |
 
 ---
 
@@ -2231,6 +2258,19 @@ coisas num julgamento subjetivo desperdiça o que é checável por código (AD-3
 | Coerência de progressão | As fases progridem de forma sensata, sem salto nem estagnação? |
 | Personalização | A saída reflete o histórico real, ou serviria para qualquer usuário? |
 
+**Pontuação por dimensão do programa.** O `program_agent` decide três coisas num agente só
+(AD-28), então a avaliação as separa — senão uma regressão em metas fica escondida atrás de um bom
+template:
+
+| Dimensão | O que é pontuado | Rubricas que a compõem |
+| --- | --- | --- |
+| Template | A escolha de PPL/upper-lower/full-body casa com dias disponíveis, nível e equipamento? | Adequação ao objetivo, Personalização |
+| Periodização | Fases, durações, progressão de volume e posicionamento do deload | Coerência de progressão, Fundamento |
+| Metas | Os `milestones` são específicos, mensuráveis e alcançáveis no horizonte? | Adequação ao objetivo, Fundamento |
+
+Cada dimensão tem sua própria série temporal no Langfuse. Queda em uma delas abre issue mesmo com
+a média geral estável.
+
 O teste de personalização é o mais revelador: o mesmo prompt roda com dois perfis contrastantes
 (iniciante em casa com halteres vs. avançado em academia completa) e o judge avalia se as saídas
 são **substancialmente diferentes**. Saídas parecidas indicam que o histórico não está entrando no
@@ -2312,12 +2352,24 @@ Cifrados **antes** de chegar ao Postgres. O banco vê apenas bytes.
 | `raw_message.transcript` | Transcrição de áudio |
 | `session_summary.narrative` | Narrativa da sessão, pode conter relato pessoal |
 
+Essas colunas já nascem `BYTEA` no schema da §5.2, cada uma com sua `key_version` ao lado — **não
+existe migração de conversão**, porque a criptografia entra na fase 1.0 justamente para evitá-la
+(§24). Converter depois exigiria ler, cifrar e reescrever todas as linhas com o serviço parado.
+
+> ⚠️ Nunca use `ALTER COLUMN ... TYPE BYTEA USING NULL` para converter uma coluna existente: isso
+> descarta silenciosamente todo o conteúdo. Se algum dia for necessário cifrar uma coluna que já
+> tem dado, o caminho é adicionar a coluna nova ao lado, backfill em lotes, trocar a leitura e só
+> então remover a antiga.
+
+**Rotação de chave**, que é a operação que de fato vai acontecer:
+
 ```sql
--- Colunas cifradas são BYTEA, não TEXT, e ganham a versão da chave ao lado
--- para permitir rotação sem reescrever tudo de uma vez.
-ALTER TABLE health_report
-    ALTER COLUMN verbatim TYPE BYTEA USING NULL,
-    ADD COLUMN key_version SMALLINT NOT NULL DEFAULT 1;
+-- Nova chave passa a valer para escritas novas; o histórico é reescrito em
+-- lotes por um job de manutenção, sem downtime.
+UPDATE health_report
+   SET verbatim = :reencrypted, key_version = 2
+ WHERE key_version = 1
+   AND id IN (SELECT id FROM health_report WHERE key_version = 1 LIMIT 1000);
 ```
 
 **Três consequências que precisam estar claras antes da implementação:**
