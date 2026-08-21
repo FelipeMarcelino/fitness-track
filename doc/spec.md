@@ -27,7 +27,7 @@ Sistema:  exercise=supino_reto_barra  load=10.0kg  reps=8  rpe=4  session=#182  
 Bot:      ✅ (reação de emoji)
 ```
 
-O sistema é **multi-tenant** (centenas a milhares de usuários), com o telefone WhatsApp (`wa_id`)
+O sistema é **multi-tenant** (centenas a milhares de usuários), com o telefone WhatsApp (`bsuid`)
 como identidade primária do tenant, e opera sobre um **único número WABA** compartilhado.
 
 ### 1.1 Princípios de design
@@ -50,7 +50,7 @@ como identidade primária do tenant, e opera sobre um **único número WABA** co
 | # | Decisão | Escolha | Justificativa |
 |---|---|---|---|
 | AD-01 | Canal WhatsApp | WhatsApp Cloud API (Meta) | Oficial, sem risco de ban, webhook HTTP estável. Custo: janela de 24h e templates aprovados para proativo. |
-| AD-02 | Escala | Multi-tenant, centenas/milhares | Tenant = `wa_id`. Exige isolamento, quota, LGPD. |
+| AD-02 | Escala | Multi-tenant, centenas/milhares | Tenant = `bsuid`. Exige isolamento, quota, LGPD. |
 | AD-03 | Persistência relacional | PostgreSQL 16 | Domínio fortemente relacional; também hospeda checkpoints LangGraph. |
 | AD-04 | Vector store | Qdrant (dedicado) | Busca híbrida (densa + esparsa), filtros por tenant, payload rico. |
 | AD-05 | Deploy | VPS + Docker Compose | Custo previsível, controle total. Workers I/O-bound. |
@@ -60,7 +60,7 @@ como identidade primária do tenant, e opera sobre um **único número WABA** co
 | AD-09 | Modalidades | Musculação + cardio + calistenia + métricas corporais | Discriminador `set_type` com colunas tipadas. |
 | AD-10 | Agrupamento de mensagens | Debounce por janela de silêncio (10s) | 1 chamada de LLM por rajada em vez de N. |
 | AD-11 | STT | Whisper large-v3 via Groq | Baixa latência, bom em pt-BR, custo baixo. |
-| AD-12 | Fila | Redis + ARQ, lock FIFO por `wa_id` | Redis já necessário para debounce e cache. |
+| AD-12 | Fila | Redis + ARQ, lock FIFO por `bsuid` | Redis já necessário para debounce e cache. |
 | AD-13 | Confirmação | Reação de emoji quando confiante, texto na dúvida | Mínimo ruído no chat durante o treino. |
 | AD-14 | Roteamento | Supervisor LLM em toda mensagem, retornando um **plano** | Suporta pedidos compostos nativamente. |
 | AD-15 | Estado | 1 thread LangGraph por usuário + `interrupt()` com TTL | Continuidade conversacional + esclarecimento nativo. |
@@ -97,9 +97,9 @@ como identidade primária do tenant, e opera sobre um **único número WABA** co
                 ▼
 ┌───────────────────────────────────────────────────────────────────────┐
 │  Redis                                                                │
-│  • buffer:{wa_id}      lista de mensagens da rajada                   │
-│  • debounce:{wa_id}    chave TTL 10s (renovada a cada msg)            │
-│  • lock:{wa_id}        lock FIFO por usuário                          │
+│  • buffer:{bsuid}      lista de mensagens da rajada                   │
+│  • debounce:{bsuid}    chave TTL 10s (renovada a cada msg)            │
+│  • lock:{bsuid}        lock FIFO por usuário                          │
 │  • fila ARQ  (default / analysis / proactive)                         │
 │  • cache: catálogo, perfil, quota                                     │
 └───────────────┬───────────────────────────────────────────────────────┘
@@ -164,18 +164,18 @@ t=0.00s  Meta → POST /webhook/whatsapp
          ingress: verifica HMAC SHA-256 do header X-Hub-Signature-256
          ingress: SETNX seen:{message_id} EX 86400  → se existe, descarta (dedup)
          ingress: INSERT raw_message (payload completo, para auditoria)
-         ingress: RPUSH buffer:{wa_id} <envelope_json>
-         ingress: SET debounce:{wa_id} 1 EX 10
-         ingress: enfileira flush_check(wa_id) com delay=10s
+         ingress: RPUSH buffer:{bsuid} <envelope_json>
+         ingress: SET debounce:{bsuid} 1 EX 10
+         ingress: enfileira flush_check(bsuid) com delay=10s
          ingress: 200 OK                                     ← Meta satisfeita
 
 t=3.00s  segunda mensagem da rajada → mesma sequência, timer reiniciado
 t=5.00s  terceira mensagem
 t=7.00s  quarta mensagem
 
-t=17.0s  flush_check dispara e a chave debounce:{wa_id} expirou
-         worker: adquire lock:{wa_id} (Redlock, TTL 120s, renovação automática)
-         worker: RENAME buffer:{wa_id} → drain:{wa_id}:{batch_id}   (atômico)
+t=17.0s  flush_check dispara e a chave debounce:{bsuid} expirou
+         worker: adquire lock:{bsuid} (Redlock, TTL 120s, renovação automática)
+         worker: RENAME buffer:{bsuid} → drain:{bsuid}:{batch_id}   (atômico)
                  LRANGE drain:... + DEL drain:...  → lote de 4 mensagens
                  (NUNCA LRANGE+DEL sobre buffer: o ingress não pega o lock e
                   pode inserir entre as duas chamadas — a mensagem seria
@@ -203,7 +203,7 @@ t=17.0s  flush_check dispara e a chave debounce:{wa_id} expirou
 
 t=19.0s  worker: POST /messages {"type":"reaction","emoji":"✅",
                   "message_id": <última msg da rajada>}
-         worker: registra custo por tenant, libera lock:{wa_id}
+         worker: registra custo por tenant, libera lock:{bsuid}
 
 t=+90min scheduler: sessão #182 sem série nova há 90min
          → fecha, gera resumo, indexa no Qdrant, envia texto de resumo
@@ -211,7 +211,7 @@ t=+90min scheduler: sessão #182 sem série nova há 90min
 
 ### 4.1 Garantias de ordenação
 
-- **Dentro de um usuário:** o lock `lock:{wa_id}` serializa o processamento. A série 2 nunca é
+- **Dentro de um usuário:** o lock `lock:{bsuid}` serializa o processamento. A série 2 nunca é
   gravada antes da série 1.
 - **Entre usuários:** total paralelismo — N workers × M tarefas concorrentes cada.
 - **Retry:** o job ARQ tem `max_tries=3` com backoff exponencial. Como o lote foi removido do
@@ -258,7 +258,7 @@ CREATE TYPE tenant_state AS ENUM ('onboarding', 'active', 'suspended', 'deleted'
 
 CREATE TABLE tenant (
     id              BIGSERIAL PRIMARY KEY,
-    wa_id           TEXT NOT NULL,                 -- telefone E.164, ex: 5511999998888
+    bsuid           TEXT NOT NULL,                 -- telefone E.164, ex: 5511999998888
     display_name    TEXT,
     locale          TEXT NOT NULL DEFAULT 'pt-BR',
     timezone        TEXT NOT NULL DEFAULT 'America/Sao_Paulo',
@@ -269,8 +269,8 @@ CREATE TABLE tenant (
 );
 -- Unicidade apenas entre tenants ativos. UNIQUE na coluna impediria alguém de
 -- se recadastrar com o mesmo número após exclusão (LGPD, §19.5).
-CREATE UNIQUE INDEX ux_tenant_wa_id_active
-    ON tenant(wa_id) WHERE deleted_at IS NULL;
+CREATE UNIQUE INDEX ux_tenant_bsuid_active
+    ON tenant(bsuid) WHERE deleted_at IS NULL;
 
 -- Consentimentos LGPD granulares. Registro de treino e dado de saúde são separados.
 CREATE TYPE consent_kind AS ENUM (
@@ -815,7 +815,7 @@ class RouteStep(TypedDict):
 class GraphState(TypedDict):
     # --- entrada ---
     tenant_id: int
-    wa_id: str
+    bsuid: str
     batch_id: int
     input_text: str                  # rajada concatenada
     message_ids: list[str]
@@ -1478,9 +1478,9 @@ backlog (fase 2), com whitelist de tabelas, `LIMIT` forçado, timeout e `tenant_
 | Chave | Tipo | TTL | Uso |
 |---|---|---|---|
 | `seen:{message_id}` | string | 24h | Dedup de webhook (Meta reentrega) |
-| `buffer:{wa_id}` | list | 1h | Mensagens da rajada aguardando flush |
-| `debounce:{wa_id}` | string | 10s | Timer de silêncio; renovado a cada mensagem |
-| `lock:{wa_id}` | string | 120s | Lock FIFO de processamento (Redlock) |
+| `buffer:{bsuid}` | list | 1h | Mensagens da rajada aguardando flush |
+| `debounce:{bsuid}` | string | 10s | Timer de silêncio; renovado a cada mensagem |
+| `lock:{bsuid}` | string | 120s | Lock FIFO de processamento (Redlock) |
 | `interrupt:{tenant_id}` | string | 20min | TTL do esclarecimento pendente |
 | `quota:{tenant_id}:{yyyy-mm}` | hash | 40 dias | Contadores de uso do mês |
 | `profile:{tenant_id}` | string | 5min | Cache do perfil + plano |
@@ -1501,11 +1501,11 @@ usuários.
 ### 17.3 Lock por usuário
 
 ```python
-async with redlock(f"lock:{wa_id}", ttl=120, auto_extend=True) as lock:
+async with redlock(f"lock:{bsuid}", ttl=120, auto_extend=True) as lock:
     if not lock.acquired:
         # outra rajada do mesmo usuário está em processamento;
         # reenfileira com delay de 5s (o buffer preserva a ordem)
-        await ctx.enqueue_job("process_batch", wa_id, _defer_by=5)
+        await ctx.enqueue_job("process_batch", bsuid, _defer_by=5)
         return
     ...
 ```
@@ -1514,22 +1514,22 @@ O `auto_extend` renova o lock a cada 30s enquanto o job estiver vivo, evitando q
 longa perca o lock e permita processamento concorrente.
 
 **O lock não protege o buffer.** Ele serializa apenas os workers entre si — o `ingress` escreve em
-`buffer:{wa_id}` sem adquiri-lo, para responder à Meta em menos de 200 ms. Portanto o esvaziamento
+`buffer:{bsuid}` sem adquiri-lo, para responder à Meta em menos de 200 ms. Portanto o esvaziamento
 tem de ser atômico do lado do Redis:
 
 ```python
 # CORRETO — RENAME é atômico; o que chegar depois cai num buffer novo
-batch_key = f"drain:{wa_id}:{batch_id}"
+batch_key = f"drain:{bsuid}:{batch_id}"
 try:
-    await redis.rename(f"buffer:{wa_id}", batch_key)
+    await redis.rename(f"buffer:{bsuid}", batch_key)
 except ResponseError:      # "no such key" — nada a processar
     return
 items = await redis.lrange(batch_key, 0, -1)
 await redis.delete(batch_key)
 
 # ERRADO — mensagem que chegar entre as duas chamadas é apagada sem processar
-items = await redis.lrange(f"buffer:{wa_id}", 0, -1)
-await redis.delete(f"buffer:{wa_id}")
+items = await redis.lrange(f"buffer:{bsuid}", 0, -1)
+await redis.delete(f"buffer:{bsuid}")
 ```
 
 A chave `drain:` sobrevive à falha do worker e é varrida pelo job de manutenção, de modo que uma
@@ -1592,20 +1592,20 @@ POST https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages
 Authorization: Bearer {WABA_TOKEN}
 
 # texto
-{"messaging_product":"whatsapp","to":wa_id,"type":"text",
+{"messaging_product":"whatsapp","to":bsuid,"type":"text",
  "text":{"body":texto,"preview_url":false}}
 
 # reação
-{"messaging_product":"whatsapp","to":wa_id,"type":"reaction",
+{"messaging_product":"whatsapp","to":bsuid,"type":"reaction",
  "reaction":{"message_id":last_msg_id,"emoji":"✅"}}
 
 # botões (máx. 3)
-{"messaging_product":"whatsapp","to":wa_id,"type":"interactive",
+{"messaging_product":"whatsapp","to":bsuid,"type":"interactive",
  "interactive":{"type":"button","body":{"text":pergunta},
    "action":{"buttons":[{"type":"reply","reply":{"id":"opt_1","title":"Supino reto"}}, ...]}}}
 
 # template (fora da janela de 24h)
-{"messaging_product":"whatsapp","to":wa_id,"type":"template",
+{"messaging_product":"whatsapp","to":bsuid,"type":"template",
  "template":{"name":"retomada_treino","language":{"code":"pt_BR"},
    "components":[{"type":"body","parameters":[{"type":"text","text":"Felipe"},...]}]}}
 ```
@@ -2134,6 +2134,6 @@ ACK_CONFIDENCE_THRESHOLD=0.85
 | **e1RM** | Estimated 1 Rep Max. Carga máxima estimada para uma repetição. |
 | **Volume** | Σ (carga × repetições). Principal driver de hipertrofia. |
 | **Deload** | Semana de volume/intensidade reduzidos para recuperação. |
-| **Tenant** | Um usuário do sistema, identificado pelo `wa_id`. |
+| **Tenant** | Um usuário do sistema, identificado pelo `bsuid`. |
 | **Janela de 24h** | Período após a última mensagem do usuário em que a Cloud API permite mensagens livres. |
 | **Tier** | Classe de modelo (rápido/raciocínio) associada a um papel de agente. |

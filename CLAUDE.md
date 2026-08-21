@@ -20,7 +20,7 @@ físico, e usa esse histórico para análise de evolução e recomendação de f
    → exercise=supino_reto_barra  load=10.0kg  reps=8  rpe=4  session=#182  set_index=1
 ```
 
-Sistema multi-agente em LangGraph, multi-tenant (tenant = `wa_id`, o telefone), sobre um único
+Sistema multi-agente em LangGraph, multi-tenant (tenant = `bsuid`, o telefone), sobre um único
 número WABA compartilhado.
 
 ## `doc/spec.md` é a fonte da verdade
@@ -85,7 +85,7 @@ Necessário para ler o código sem tropeçar:
 - **Série (set)** — uma execução: carga × repetições × RPE. Unidade atômica. `3x10` vira **três**
   linhas em `exercise_set`, não uma (AD-07).
 - **Rajada (burst)** — mensagens consecutivas do mesmo usuário dentro da janela de debounce (10s),
-  processadas como uma unidade só. É por isso que existe `buffer:{wa_id}` no Redis.
+  processadas como uma unidade só. É por isso que existe `buffer:{bsuid}` no Redis.
 - **RPE** — esforço percebido, 0 a 10. Inferido de linguagem natural pelo mapa da §9.5.
 - **RIR** — repetições na reserva. `RIR ≈ 10 − RPE`.
 - **e1RM** — carga máxima estimada para 1 repetição. Fórmulas na §16.2.
