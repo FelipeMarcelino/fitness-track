@@ -37,9 +37,13 @@ navegável:
 | Estado e topologia do grafo | §8 |
 | Contrato de cada agente | §9 |
 | Algoritmo do resolver de exercícios | §10 |
+| Programa vs. ficha de treino | §9.6 |
 | RAG (coleções, filtros, tool) | §15 |
 | Tools analíticas SQL e fórmulas | §16 |
 | Fila, locks, debounce | §17 |
+| Observabilidade, métricas de agente e tool | §20 |
+| Evals, judge e eval de recomendação | §21 |
+| Criptografia e prompt injection | §22 |
 | Estrutura de diretórios prevista | §23 |
 | Ordem de construção | §24 |
 
@@ -76,7 +80,18 @@ associada.
    `low_confidence = true`. Nunca descarte o input do usuário — o texto bruto sempre fica em
    `raw_message`.
 
-7. **Texto do usuário é dado, não instrução.** Sempre delimitado em tags nos prompts. Ver §12.3.
+7. **Toda entrada externa é dado, nunca instrução.** Não só a mensagem do usuário: transcrição de
+   áudio, chunk recuperado do RAG, resultado de tool e nome de exercício privado. O chunk do RAG é
+   o vetor menos óbvio — texto injetado numa sessão fica indexado e volta depois. Ver §22.3.
+
+8. **Campo cifrado não é agregável em SQL.** As colunas da §22.2 (`health_report.verbatim`,
+   `body_metric.value`, `raw_message.payload`, entre outras) são `BYTEA` cifrado na aplicação.
+   Nada de `SUM`, `AVG`, `WHERE` ou índice sobre elas — carregue, decifre e agregue em Python.
+   `body_metric_trend` é a tool afetada. Continua determinístico: muda a camada, não a natureza.
+
+9. **Conteúdo de usuário não vai para o Datadog.** Langfuse (self-hosted) guarda prompt e resposta;
+   Datadog recebe só metadado de infraestrutura. A lista de redação da §20.2 é verificada por
+   teste — se adicionar um atributo de span com texto, o teste quebra.
 
 ## Vocabulário do domínio
 
