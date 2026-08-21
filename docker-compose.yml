@@ -41,6 +41,9 @@ services:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
 
+  # POSTGRES_USER is the owner and a superuser; it runs migrations only.
+  # The application connects as fittrack_app (see .env.example), because a
+  # superuser bypasses row level security even with FORCE.
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped

@@ -17,9 +17,16 @@ config = context.config
 
 
 def _dsn() -> str:
-    override = os.environ.get("ALEMBIC_DSN")
+    """Migrations run as the owner; the application runs as fittrack_app.
+
+    Using DATABASE_URL here would run DDL as a role that has no rights to
+    create tables -- and, worse, would invite pointing the application at the
+    owner, which silently bypasses row level security.
+    """
+    override = os.environ.get("ALEMBIC_DSN") or os.environ.get("MIGRATION_DATABASE_URL")
     if override:
         return override
+
     from fittrack.settings import get_settings
 
     return get_settings().database_url.get_secret_value()
