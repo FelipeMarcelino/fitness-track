@@ -10,39 +10,32 @@ import base64
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any, Literal
+from typing import Literal
 
+import redis.asyncio as aioredis
 from fastapi import FastAPI
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from fittrack.channels.whatsapp.ingest import Ingest
 from fittrack.channels.whatsapp.webhook import router as whatsapp_router
 from fittrack.crypto.aesgcm import Encryptor, KeyRing
+from fittrack.services.debounce import BurstBuffer
 from fittrack.settings import Settings, get_settings
 
 log = logging.getLogger(__name__)
 
 
-class NullBuffer:
-    """Placeholder until feat/burst-debounce lands.
-
-    Logs and drops rather than silently discarding, so a message that goes
-    nowhere is visible in the logs instead of vanishing.
-    """
-
-    async def push(self, bsuid: str, message: dict[str, Any]) -> None:
-        log.warning(
-            "no buffer configured; dropping message %s for %s",
-            message.get("message_id"),
-            bsuid,
-        )
-
-
-def build_ingest(settings: Settings) -> Ingest:
+def build_ingest(settings: Settings) -> tuple[Ingest, aioredis.Redis]:
     key = base64.b64decode(settings.fittrack_encryption_key.get_secret_value())
     encryptor = Encryptor(KeyRing({1: key}, current_version=1))
     engine = create_async_engine(settings.database_url.get_secret_value())
-    return Ingest(engine, encryptor, NullBuffer())
+    # redis-py ships from_url untyped; the client itself is typed.
+    redis: aioredis.Redis = aioredis.from_url(  # type: ignore[no-untyped-call]
+        settings.redis_url.get_secret_value(),
+        decode_responses=True,
+    )
+    buffer = BurstBuffer(redis, window_seconds=settings.debounce_window_s)
+    return Ingest(engine, encryptor, buffer), redis
 
 
 @asynccontextmanager
@@ -55,8 +48,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
     settings = get_settings()
     app.state.settings = settings
-    app.state.ingest = build_ingest(settings)
-    yield
+    app.state.ingest, redis = build_ingest(settings)
+    try:
+        yield
+    finally:
+        await redis.aclose()
 
 
 app = FastAPI(title="FitTrack", docs_url=None, redoc_url=None, lifespan=lifespan)
