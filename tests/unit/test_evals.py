@@ -472,3 +472,29 @@ def test_a_score_off_the_scale_is_a_mistake_not_a_pass() -> None:
 
     assert outcome.errors == 2
     assert any("off the 1-5 scale" in mistake for mistake in outcome.mistakes)
+
+
+# --- the deploy path -------------------------------------------------------
+
+
+def test_the_image_carries_what_bootstrap_needs() -> None:
+    """The bootstrap step runs inside the image, so its inputs have to be in it.
+
+    Copying only src/ left alembic.ini and scripts/ outside, which fails at
+    deploy time with a path error that reads like a broken install rather than
+    a missing COPY.
+    """
+    dockerfile = Path("Dockerfile").read_text()
+
+    assert "COPY alembic.ini" in dockerfile
+    assert "COPY scripts/" in dockerfile
+
+
+def test_nothing_starts_before_the_database_is_prepared() -> None:
+    """The checkpoint tables need owner privileges and the worker connects as
+    fittrack_app. Starting first means the first message fails with "relation
+    checkpoints does not exist"."""
+    compose = Path("docker-compose.yml").read_text()
+
+    assert "bootstrap:" in compose
+    assert compose.count("bootstrap: { condition: service_completed_successfully }") == 2

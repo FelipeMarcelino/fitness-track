@@ -89,3 +89,29 @@ async def as_tenant(conn: AsyncConnection):
         return conn
 
     return _set
+
+
+@pytest_asyncio.fixture
+async def checkpointed_graph(
+    migrated: str, app_dsn: str
+) -> AsyncIterator[tuple[object, dict[str, object]]]:
+    """The echo graph, checkpointed in the real database.
+
+    Not MemorySaver: what these tests need to prove is that state survives
+    something, and a saver that lives in the process survives nothing. The
+    checkpointer connects as fittrack_app, the same role production uses, so a
+    permission it lacks fails here rather than on the first deploy.
+    """
+    from fittrack.graph.build import build_graph
+    from fittrack.graph.checkpoint import (
+        checkpointer,
+        setup_checkpoint_tables,
+        thread_config,
+    )
+
+    # Created by the owner, used by the app role -- the same split the
+    # migrations use, and the reason this fixture connects as fittrack_app:
+    # a privilege the role lacks fails here rather than on the first deploy.
+    await setup_checkpoint_tables(migrated)
+    async with checkpointer(app_dsn) as saver:
+        yield build_graph(checkpointer=saver), thread_config("BSUID-1")

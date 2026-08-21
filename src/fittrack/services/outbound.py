@@ -110,14 +110,23 @@ class OutboundQueue:
     def __init__(self, engine: AsyncEngine) -> None:
         self._engine = engine
 
-    async def enqueue(self, tenant_id: int, bubbles: list[Bubble]) -> UUID:
+    async def enqueue(
+        self, tenant_id: int, bubbles: list[Bubble], group_id: UUID | None = None
+    ) -> UUID:
         """Queues a whole reply under one group_id.
 
         The bubbles are written in a single transaction: a partially queued
         reply would start going out and then be missing its ending, which is
         the failure the group exists to prevent.
+
+        Pass `group_id` to make the write idempotent. A batch that is retried
+        -- because the worker died after this committed but before the batch
+        was marked done -- would otherwise insert a second group with a fresh
+        UUID, and the user would receive the same reply twice. With a
+        deterministic id the UNIQUE (group_id, seq) constraint turns the retry
+        into a no-op.
         """
-        group_id = uuid4()
+        group_id = group_id or uuid4()
         async with self._engine.begin() as conn:
             await self._scope(conn, tenant_id)
             for seq, bubble in enumerate(bubbles):
@@ -125,7 +134,8 @@ class OutboundQueue:
                     text(
                         "INSERT INTO outbound_queue "
                         "(tenant_id, kind, payload, group_id, seq) "
-                        "VALUES (:t, :k, CAST(:p AS jsonb), :g, :s)"
+                        "VALUES (:t, :k, CAST(:p AS jsonb), :g, :s) "
+                        "ON CONFLICT (group_id, seq) DO NOTHING"
                     ),
                     {
                         "t": tenant_id,

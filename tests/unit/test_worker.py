@@ -74,8 +74,25 @@ def test_the_queue_client_is_the_one_that_can_enqueue(
     class FakePool:
         """Stands in for ArqRedis: the only thing that matters is enqueue_job."""
 
-        async def enqueue_job(self, _function: str, *_args: object, **_kwargs: object) -> None:
+        async def enqueue_job(self, function: str, *args: object, **kwargs: object) -> None:
             return None
+
+    # startup opens the graph checkpointer, which wants a real Postgres. This
+    # test is about which client ends up in ctx, so the checkpointer is stubbed
+    # rather than the assertion being weakened to something a unit test can
+    # reach without a container.
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    class FakeSaver:
+        async def __aenter__(self) -> object:
+            # A real saver, because compile() type-checks it. In memory only:
+            # this test never persists anything.
+            return InMemorySaver()
+
+        async def __aexit__(self, *_exc: object) -> None:
+            return None
+
+    monkeypatch.setattr("fittrack.worker.checkpointer", lambda _dsn: FakeSaver())
 
     ctx: dict[str, object] = {"redis": FakePool()}
     asyncio.run(startup(ctx))

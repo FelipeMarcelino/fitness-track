@@ -1,6 +1,8 @@
-"""ARQ worker: drains bursts and processes them (§17.2).
+"""ARQ worker: drains bursts, runs them through the graph, sends the reply (§17.2).
 
-Sprint 01 ends at the batch. feat/echo-graph replaces `_handle` with the graph.
+The three stages are deliberately separate jobs rather than one: a send that
+fails should not re-run the graph, and a graph that fails should not re-drain
+the buffer.
 """
 
 from __future__ import annotations
@@ -16,7 +18,10 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from fittrack.channels.whatsapp.client import WhatsAppChannel
 from fittrack.crypto.aesgcm import Encryptor, KeyRing
-from fittrack.services.batch import Batch, BatchStore
+from fittrack.graph.build import build_graph
+from fittrack.graph.checkpoint import checkpointer
+from fittrack.graph.runtime import GraphRunner
+from fittrack.services.batch import BatchStore
 from fittrack.services.debounce import BurstBuffer
 from fittrack.services.dispatcher import Dispatcher
 from fittrack.services.outbound import OutboundQueue
@@ -39,15 +44,6 @@ class _LazyRedisSettings:
 
     def __get__(self, obj: object, objtype: type | None = None) -> RedisSettings:
         return RedisSettings.from_dsn(get_settings().redis_url.get_secret_value())
-
-
-async def _handle(batch: Batch) -> None:
-    """Placeholder for the graph.
-
-    Logging rather than passing silently: a batch that reaches here and does
-    nothing should be visible while the graph is still missing.
-    """
-    log.info("batch %s ready for the graph: %r", batch.id, batch.combined_text[:120])
 
 
 async def flush_user(ctx: dict[str, Any], bsuid: str) -> None:
@@ -109,11 +105,32 @@ async def startup(ctx: dict[str, Any]) -> None:
     ctx["redis_text"] = redis
     ctx["buffer"] = buffer
     ctx["encryptor"] = Encryptor(KeyRing({1: key}, current_version=1))
-    ctx["pipeline"] = Pipeline(redis, buffer, batches, _handle)
-    ctx["dispatcher"] = Dispatcher(OutboundQueue(engine), channel, ctx["redis_queue"])
+    outbound = OutboundQueue(engine)
+    ctx["dispatcher"] = Dispatcher(outbound, channel, ctx["redis_queue"])
+
+    # The checkpointer's tables are created by the owner at deploy time, not
+    # here: the app role cannot create tables (§19.1), and finding that out on
+    # the first message is the wrong time.
+    saver_cm = checkpointer(settings.database_url.get_secret_value())
+    ctx["_saver_cm"] = saver_cm
+    saver = await saver_cm.__aenter__()
+    try:
+        runner = GraphRunner(build_graph(checkpointer=saver), outbound, ctx["redis_queue"])
+        ctx["graph_runner"] = runner
+        ctx["pipeline"] = Pipeline(redis, buffer, batches, runner.handle)
+    except BaseException:
+        # ARQ does not call on_shutdown when on_startup raises, so a failure
+        # here would leave the checkpointer's connection open for the life of
+        # a process that is about to be restarted -- and restarted again.
+        await saver_cm.__aexit__(None, None, None)
+        ctx.pop("_saver_cm", None)
+        raise
 
 
 async def shutdown(ctx: dict[str, Any]) -> None:
+    saver_cm = ctx.get("_saver_cm")
+    if saver_cm is not None:
+        await saver_cm.__aexit__(None, None, None)
     # Only ours; ARQ closes its own pool.
     redis = ctx.get("redis_text")
     if redis is not None:
