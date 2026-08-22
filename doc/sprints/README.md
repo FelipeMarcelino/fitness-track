@@ -26,7 +26,8 @@ não decide arquitetura, ele **executa** uma fatia dela e aponta as seções que
 
 | Sprint | Objetivo | Fase | Estado |
 | --- | --- | --- | --- |
-| [01](sprint-01-walking-skeleton.md) | Uma mensagem atravessa o sistema inteiro e volta | 1.0 | planejado |
+| [01](sprint-01-walking-skeleton.md) | Uma mensagem atravessa o sistema inteiro e volta | 1.0 | código pronto; critérios 1, 4 e 9 dependem da conta Meta |
+| [02](sprint-02-first-extraction.md) | A primeira extração, já medida | 1.0 | planejado |
 
 ## Definição de pronto
 
