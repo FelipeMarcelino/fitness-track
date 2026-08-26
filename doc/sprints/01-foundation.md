@@ -250,16 +250,24 @@ erros de validação.
 2. Configurar Alembic assíncrono sem incluir tabelas internas do LangGraph nas migrações.
 3. Implementar o schema completo da §5.2, preservando `BYTEA` e `key_version` desde a criação.
 4. Criar a role `fittrack_app` como `NOSUPERUSER NOBYPASSRLS`; migrações usam role proprietária
-   separada.
-5. Testar upgrade em banco vazio, downgrade somente no banco descartável de teste e novo upgrade.
-6. Comparar tabelas, colunas, FKs, checks e índices relevantes com um contrato parametrizado.
+   separada. Provisionar `fittrack_runtime` como principal `LOGIN` não privilegiado e membro apenas
+   de `fittrack_app`; a senha vem de secret fora da migração.
+5. Vincular `raw_message` a `channel_identity` e deduplicar por
+   `(identity_id, channel_message_id)`, cobrindo IDs iguais em identidades diferentes.
+6. Manter `processing_batch.combined_text` e `outbound_queue.payload` como `BYTEA` versionado desde
+   a primeira migração.
+7. Testar upgrade em banco vazio, downgrade somente no banco descartável de teste e novo upgrade.
+8. Comparar tabelas, colunas, FKs, checks e índices relevantes com um contrato parametrizado.
 
 **Critérios de aceite:**
 
 - `alembic upgrade head` funciona em Postgres vazio;
 - `alembic current` aponta para uma única head;
-- a aplicação não conecta como superusuário nem como dona das tabelas;
+- a aplicação e os testes conectam como `fittrack_runtime`, nunca como superusuário, role
+  `BYPASSRLS` ou dona das tabelas;
 - campos da §22.2 são `BYTEA` desde a migração inicial;
+- duas identidades podem persistir o mesmo `channel_message_id` sem colisão, mas uma repetição na
+  mesma identidade é deduplicada;
 - tabelas do checkpointer/store são criadas pelo bootstrap do LangGraph, não pelo Alembic;
 - testes de schema e ciclo de migração passam em container limpo.
 
@@ -289,11 +297,17 @@ usuário.
 4. Implementar HMAC-SHA256 determinístico para `external_id_hash`, com pepper separado do banco.
 5. Testar nonces aleatórios: plaintexts iguais geram blobs diferentes, mas o hash pesquisável é
    estável.
-6. Testar leitura simultânea de blobs em versões antiga e nova enquanto novas escritas usam apenas
+6. Construir AAD canônico com tenant, tabela, coluna e identidade estável da linha; reservar o ID
+   antes de cifrar, usando `external_id_hash` para o primeiro `channel_identity` pré-tenant.
+7. Testar substituição de blob íntegro entre linhas, tenants e colunas; todas devem falhar
+   autenticação.
+8. Testar leitura simultânea de blobs em versões antiga e nova enquanto novas escritas usam apenas
    a versão ativa.
-7. Testar que uma chave antiga não pode ser removida enquanto o banco ainda contém sua versão, e
+9. Testar que uma chave antiga não pode ser removida enquanto o banco ainda contém sua versão, e
    que a remoção é permitida depois do backfill completo.
-8. Testar escrita/leitura cifrada sem permitir consulta ou agregação sobre ciphertext.
+10. Implementar e testar a rotação atômica do pepper: ingress pausado, tabela bloqueada, rehash em
+    uma transação, troca do secret depois do commit e rollback seguro em falha.
+11. Testar escrita/leitura cifrada sem permitir consulta ou agregação sobre ciphertext.
 
 **Critérios de aceite:**
 
@@ -301,7 +315,9 @@ usuário.
 - versão interna e `key_version` divergentes causam erro explícito;
 - versões zero, negativas ou acima de 32767 são rejeitadas na configuração;
 - ciphertexts não revelam plaintext e variam por nonce;
+- mover ciphertext íntegro para outro contexto falha por AAD;
 - rotação progressiva mantém legíveis todas as versões ainda presentes no banco;
+- rotação de pepper preserva todos os lookups e não cria tenant duplicado;
 - `external_id_hash` permite lookup sem armazenar identificador em claro;
 - nenhum teste, exceção ou log expõe chave, pepper ou identificador externo.
 
@@ -335,10 +351,13 @@ Postgres.
    atômica, `search_path` fixo, role dona `NOLOGIN BYPASSRLS`, `PUBLIC` sem `EXECUTE` e apenas
    `fittrack_app` autorizada a chamar as funções.
 6. Adicionar policies de leitura para linhas globais somente nas tabelas autorizadas pela spec.
-7. Testar leitura, escrita, update e delete cross-tenant usando a role real `fittrack_app`.
+7. Testar leitura, escrita, update e delete cross-tenant conectando como `fittrack_runtime`, que
+   herda somente a role de privilégios `fittrack_app`.
 8. Testar lookup existente, primeiro contato, identidade revogada, colisão concorrente e que a
    aplicação não consegue consultar `channel_identity` diretamente sem tenant.
 9. Testar que conexão sem tenant não retorna silenciosamente dados privados.
+10. Testar que linhas globais são legíveis, mas `INSERT`, `UPDATE` e `DELETE` globais falham com ou
+    sem `app.tenant_id`; policies de domínio exigem tenant não nulo no `WITH CHECK`.
 
 **Critérios de aceite:**
 
@@ -347,7 +366,8 @@ Postgres.
 - o ingress resolve ou cria identidade somente pela fronteira pré-tenant autorizada;
 - catálogo global autorizado é legível e não gravável pela aplicação;
 - nova tabela tenant-scoped sem policy faz o teste falhar;
-- a suíte prova que a conexão usa `NOSUPERUSER NOBYPASSRLS`.
+- a suíte prova que a conexão usa `fittrack_runtime` com `NOSUPERUSER NOBYPASSRLS` e privilégios
+  herdados somente de `fittrack_app`.
 
 ### S01-T07 — Architecture guardrails and integrated bootstrap
 
@@ -425,7 +445,7 @@ A sprint termina somente quando todos os itens abaixo forem demonstrados:
 | Risco | Impacto | Mitigação nesta sprint |
 | --- | --- | --- |
 | Schema amplo exceder a sprint | Alto | Implementar mecanicamente a §5.2, sem reabrir decisões nem criar repositórios de produto |
-| RLS existir mas ser ignorada | Crítico | Testar com `fittrack_app` real, `FORCE RLS` e assert de `NOBYPASSRLS` |
+| RLS existir mas ser ignorada | Crítico | Conectar como `fittrack_runtime`, testar `FORCE RLS` e confirmar `NOBYPASSRLS` |
 | Cifra ser adicionada depois | Crítico | Campos já nascem `BYTEA`; T05 bloqueia qualquer fixture sensível em claro |
 | Compose local divergir de produção | Médio | Base única com override somente para portas e ergonomia local |
 | CI caro ou lento cedo demais | Médio | Guardrails baratos primeiro; integração em job separado com cache |
