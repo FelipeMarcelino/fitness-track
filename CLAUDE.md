@@ -65,7 +65,6 @@ o que falta para eles rodarem de ponta a ponta:
 | `tests/` | `pytest` ter o que rodar |
 | `Makefile` | os alvos `fmt` / `lint` / `typecheck` / `test` |
 | `docker-compose.yml` + `Dockerfile` | o caminho 2 |
-| `.github/workflows/` | o item 2 do checklist de merge (§21.4) |
 
 Atualize esta tabela conforme cada peça entrar, e apague a seção quando ela esvaziar.
 
@@ -306,6 +305,9 @@ Nunca commitar direto na `main`. Todo trabalho sai em branch, **com nome em ingl
 # criar o PR a partir da branch atual
 gh pr create --base main --title "<título>" --body "<o que muda e por quê>"
 
+# solicitar a revisão do Codex imediatamente após criar o PR
+gh pr comment --body '@codex review'
+
 # ler os comentários da revisão (obrigatório antes do merge)
 gh pr view --comments
 gh pr view <n> --json reviews,comments
@@ -317,23 +319,23 @@ gh pr checks
 gh pr merge --squash --delete-branch
 ```
 
+Todo PR novo, sem exceção, deve receber o comentário `@codex review` logo depois de ser criado.
+Não presuma que o comentário significa aprovação: aguarde a revisão terminar, leia os apontamentos
+e enderece cada um antes do merge.
+
 ### 5. Checklist antes de mergear
 
-Verificar os quatro, sempre, nesta ordem:
+Verificar os cinco, sempre, nesta ordem:
 
-1. **Comentários lidos e endereçados** — `gh pr view --comments`. Não mergeie por cima de
-   comentário não respondido.
-2. **CI verde** — `gh pr checks`. Se retornar "no checks reported", isso não é aprovação: significa
-   que não há workflow configurado (ver aviso abaixo).
-3. **Testes passando localmente.**
-4. **Revisado contra a spec** — a implementação corresponde à seção correspondente de
+1. **Revisão do Codex concluída** — o PR recebeu `@codex review` e a revisão terminou. Não mergeie
+   enquanto a revisão estiver pendente.
+2. **Comentários lidos e endereçados** — confirme com `gh pr view --comments` e
+   `gh pr view <n> --json reviews,comments`. Não mergeie por cima de comentário não respondido.
+3. **CI verde** — `gh pr checks`. Se retornar "no checks reported", isso não é aprovação: significa
+   que não há workflow configurado para a mudança.
+4. **Testes passando localmente.**
+5. **Revisado contra a spec** — a implementação corresponde à seção correspondente de
    `doc/spec.md`? Divergência é ou bug de implementação ou ADR novo. Nunca divergência silenciosa.
-
-> **Ainda não existe workflow de CI neste repositório.** Enquanto `.github/workflows/` estiver
-> vazio, `gh pr checks` não tem o que reportar e o item 2 do checklist não pode ser cumprido de
-> fato. Criar o workflow é pré-requisito para o fluxo funcionar como descrito. O conteúdo dele está
-> especificado na §21.4: testes de arquitetura, lint, mypy, pytest, golden set contra os dois
-> providers e judge.
 
 ### 6. Sprints
 
@@ -360,9 +362,3 @@ fitness-track/          ← raiz do projeto e raiz do git
 ```
 
 Remote: `github.com/FelipeMarcelino/fitness-track`, branch padrão `main`.
-
-Ainda não existe `.github/workflows/`. Enquanto for assim, `gh pr checks` retorna
-`no checks reported` e o item 2 do checklist de merge não pode ser cumprido — criar o CI é
-pré-requisito do fluxo descrito acima.
-
-
