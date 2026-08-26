@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: Check repository formatting
+        run: |
+          if git grep -nI -E '[[:blank:]]+$' -- '*.nix' '.github/*.yml'; then
+            echo 'Trailing whitespace found in executable configuration.' >&2
+            exit 1
+          fi
+
+      - name: Validate Nix expressions
+        run: |
+          nix-instantiate --parse flake.nix >/dev/null
+          nix-instantiate --parse shell.nix >/dev/null
+          nix flake check --no-build
+
+      - name: Run project quality gates
+        if: ${{ hashFiles('pyproject.toml', 'Makefile') != '' }}
+        run: |
+          test -f pyproject.toml
+          test -f Makefile
+          nix develop --command make lint
+          nix develop --command make typecheck
+          nix develop --command make test
