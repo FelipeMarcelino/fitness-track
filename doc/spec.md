@@ -433,6 +433,9 @@ CREATE UNIQUE INDEX ux_channel_identity_active
 CREATE UNIQUE INDEX ux_channel_identity_primary
     ON channel_identity(tenant_id) WHERE is_primary AND revoked_at IS NULL;
 CREATE INDEX ix_channel_identity_tenant ON channel_identity(tenant_id);
+-- Chave candidata para FKs que precisam provar identidade + tenant + canal.
+ALTER TABLE channel_identity
+    ADD CONSTRAINT uq_channel_identity_scope UNIQUE (id, tenant_id, channel);
 
 -- Consentimentos LGPD granulares. Registro de treino e dado de saúde são separados.
 CREATE TYPE consent_kind AS ENUM (
@@ -834,7 +837,7 @@ CREATE TABLE plan_item (
 CREATE TABLE raw_message (
     id                 BIGSERIAL PRIMARY KEY,
     tenant_id          BIGINT NOT NULL REFERENCES tenant(id) ON DELETE CASCADE,
-    identity_id        BIGINT NOT NULL REFERENCES channel_identity(id) ON DELETE CASCADE,
+    identity_id        BIGINT NOT NULL,
     channel            channel_kind NOT NULL,
     -- id da mensagem no canal de origem. No Telegram ele é único somente
     -- dentro do chat; por isso a identidade faz parte da chave de dedup.
@@ -847,7 +850,9 @@ CREATE TABLE raw_message (
     received_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     processed_at       TIMESTAMPTZ,
 
-    UNIQUE (identity_id, channel_message_id)
+    UNIQUE (identity_id, channel_message_id),
+    FOREIGN KEY (identity_id, tenant_id, channel)
+        REFERENCES channel_identity(id, tenant_id, channel) ON DELETE CASCADE
 );
 CREATE INDEX ix_raw_tenant_time ON raw_message(tenant_id, received_at DESC);
 
@@ -2980,7 +2985,7 @@ A única exceção é o dedup de webhook, que **precisa** ser por canal: o `upda
 
 | Chave | Tipo | TTL | Uso |
 | --- | --- | --- | --- |
-| `seen:{channel}:{identity_id}:{message_id}` | string | 24h | Dedup de webhook sem colisão entre conversas |
+| `seen:{channel}:{account_hash}:{message_id}` | string | 24h | Dedup antes do lookup; `account_hash` vem do identificador externo recebido |
 | `buffer:{tenant_id}` | list | 1h | Mensagens da rajada aguardando flush |
 | `debounce:{tenant_id}` | string | 10s | Timer de silêncio; renovado a cada mensagem |
 | `lock:{tenant_id}` | string | 120s | Lock FIFO de processamento (Redlock) |
@@ -3044,9 +3049,10 @@ queda entre o `RENAME` e o `DEL` não perde o lote.
 
 ### 17.4 Idempotência
 
-- **Webhook:** dedup por `seen:{channel}:{identity_id}:{message_id}` em Redis +
-  `UNIQUE (identity_id, channel_message_id)` em `raw_message`. Os dois canais reentregam o que não
-  recebeu 200 rápido.
+- **Webhook:** antes do lookup, dedup por `seen:{channel}:{account_hash}:{message_id}` em Redis; no
+  Telegram, prefira o `update_id`, que já é global para o bot. Depois do bootstrap de identidade,
+  `UNIQUE (identity_id, channel_message_id)` em `raw_message` é a segunda barreira. Os dois canais
+  reentregam o que não recebeu 200 rápido.
 - **Persistência:** `ux_set_idempotency` (§5.2) é um índice único parcial em
   `(session_id, exercise_id, set_index, source_message_id)` com **`NULLS NOT DISTINCT`**, de modo
   que reprocessar o mesmo batch não duplica séries. O `NULLS NOT DISTINCT` é a parte que importa:
@@ -3597,10 +3603,14 @@ funções `SECURITY DEFINER` com `search_path` fixo e parâmetros tipados:
   que cria o primeiro tenant e seu vínculo na mesma transação.
 
 O privilégio `EXECUTE` é revogado de `PUBLIC` e concedido somente a `fittrack_app`; a aplicação não
-recebe a role nem `BYPASSRLS`. Essa é a única fronteira pré-tenant. Depois que uma das funções
-retorna, a transação de domínio começa com `SET LOCAL app.tenant_id`. Testes de integração devem
-provar lookup existente, primeiro contato atômico, identidade revogada, colisão concorrente e que a
-role da aplicação continua incapaz de consultar `channel_identity` diretamente sem contexto.
+recebe a role nem `BYPASSRLS`. A role dona recebe `USAGE` no schema, somente `SELECT` em
+`channel_identity`, `INSERT` em `tenant` e `channel_identity` e `USAGE` nas duas sequences
+correspondentes; não recebe acesso às demais tabelas nem privilégios de update/delete. Essa é a
+única fronteira pré-tenant. Depois que uma
+das funções retorna, a transação de domínio começa com `SET LOCAL app.tenant_id`. Testes de
+integração devem provar os grants exatos, lookup existente, primeiro contato atômico, identidade
+revogada, colisão concorrente e que a role da aplicação continua incapaz de consultar
+`channel_identity` diretamente sem contexto.
 
 Notas:
 
@@ -4106,11 +4116,12 @@ AD-32 tem em vista. Um comprometimento de máquina derrota isso, e derrota igual
 cifra.
 
 O pepper não gira em modo dual-read: hashes gerados por dois peppers diferentes também escapariam
-da constraint de unicidade. A rotação é uma manutenção atômica: pausar ingress, bloquear
-`channel_identity`, decifrar cada `external_id`, recalcular todos os hashes com o novo pepper numa
-única transação, trocar `FITTRACK_IDENTITY_PEPPER` e só então retomar tráfego. Falha faz rollback
-antes da troca do secret. O teste de rotação cobre rollback e prova que nenhum lookup ou vínculo
-duplicado é criado durante a janela.
+da constraint de unicidade. A rotação é uma manutenção atômica na aplicação: pausar ingress,
+bloquear `channel_identity`, decifrar cada `external_id` com o AAD antigo, recalcular o hash,
+recriptografar o identificador com o AAD novo e atualizar hash+ciphertext na mesma transação. Só
+depois do commit o deploy troca `FITTRACK_IDENTITY_PEPPER` e retoma tráfego. Falha faz rollback
+antes da troca do secret. O teste de rotação cobre rollback, reautenticação do ciphertext e prova
+que nenhum lookup ou vínculo duplicado é criado durante a janela.
 
 > ⚠️ Nunca use `ALTER COLUMN ... TYPE BYTEA USING NULL` para converter uma coluna existente: isso
 > descarta silenciosamente todo o conteúdo. Se algum dia for necessário cifrar uma coluna que já
@@ -4144,12 +4155,15 @@ coluna `key_version` continua existindo, mas para outro trabalho — é por ela 
 rotação filtra as linhas que ainda faltam reescrever. Divergência entre as duas é erro, não
 silêncio: indica rotação pela metade.
 
-**Associated data é obrigatório.** AES-GCM autentica também um AAD canônico e imutável contendo
-versão do contrato, tenant, tabela, coluna e identidade estável da linha. Repositórios reservam o
-`BIGSERIAL` antes de cifrar e usam esse `id`; `channel_identity.external_id`, criado antes de o
-ingress conhecer o tenant, usa `external_id_hash` como identidade estável. A decifra reconstrói o
-mesmo AAD a partir do contexto confiável, nunca do blob. Copiar um ciphertext íntegro para outra
-linha, tenant ou coluna deve falhar autenticação, assim como alterar um byte.
+**Associated data é obrigatório.** AES-GCM autentica também um AAD canônico e imutável. Para campos
+de domínio, ele contém versão do contrato, tenant, tabela, coluna e ID estável da linha;
+repositórios reservam o `BIGSERIAL` antes de cifrar. A exceção pré-tenant é explicitamente
+`channel_identity.external_id`, cujo AAD é
+`fittrack:v1|channel_identity|external_id|channel:{channel}|hash:{external_id_hash}`: não contém
+tenant nem ID de banco e pode ser construído pelo caller antes de invocar
+`create_tenant_with_identity`. A decifra reconstrói o mesmo AAD a partir do contexto confiável,
+nunca do blob. Copiar um ciphertext íntegro para outra linha, tenant, coluna, canal ou hash deve
+falhar autenticação, assim como alterar um byte.
 
 **Gestão de chave.** As chaves mestras vivem num keyring versionado em
 `FITTRACK_ENCRYPTION_KEYS` (mapa JSON `versão → chave base64 de 32 bytes`), e

@@ -253,7 +253,8 @@ erros de validação.
    separada. Provisionar `fittrack_runtime` como principal `LOGIN` não privilegiado e membro apenas
    de `fittrack_app`; a senha vem de secret fora da migração.
 5. Vincular `raw_message` a `channel_identity` e deduplicar por
-   `(identity_id, channel_message_id)`, cobrindo IDs iguais em identidades diferentes.
+   `(identity_id, channel_message_id)`, com FK composta que também exige o mesmo tenant e canal;
+   cobrir IDs iguais em identidades diferentes e rejeitar escopo inconsistente.
 6. Manter `processing_batch.combined_text` e `outbound_queue.payload` como `BYTEA` versionado desde
    a primeira migração.
 7. Testar upgrade em banco vazio, downgrade somente no banco descartável de teste e novo upgrade.
@@ -298,15 +299,17 @@ usuário.
 5. Testar nonces aleatórios: plaintexts iguais geram blobs diferentes, mas o hash pesquisável é
    estável.
 6. Construir AAD canônico com tenant, tabela, coluna e identidade estável da linha; reservar o ID
-   antes de cifrar, usando `external_id_hash` para o primeiro `channel_identity` pré-tenant.
+   antes de cifrar. Para o primeiro `channel_identity`, usar o contrato pré-tenant da §22.2 baseado
+   apenas em canal e `external_id_hash`, permitindo cifrar antes da criação atômica do tenant.
 7. Testar substituição de blob íntegro entre linhas, tenants e colunas; todas devem falhar
    autenticação.
 8. Testar leitura simultânea de blobs em versões antiga e nova enquanto novas escritas usam apenas
    a versão ativa.
 9. Testar que uma chave antiga não pode ser removida enquanto o banco ainda contém sua versão, e
    que a remoção é permitida depois do backfill completo.
-10. Implementar e testar a rotação atômica do pepper: ingress pausado, tabela bloqueada, rehash em
-    uma transação, troca do secret depois do commit e rollback seguro em falha.
+10. Implementar e testar a rotação atômica do pepper: ingress pausado, tabela bloqueada, decifra
+    com AAD antigo, rehash e recriptografia com AAD novo na mesma transação, troca do secret depois
+    do commit e rollback seguro em falha.
 11. Testar escrita/leitura cifrada sem permitir consulta ou agregação sobre ciphertext.
 
 **Critérios de aceite:**
@@ -350,13 +353,16 @@ Postgres.
 5. Implementar a fronteira pré-tenant da §19.1 com funções `SECURITY DEFINER` de lookup e criação
    atômica, `search_path` fixo, role dona `NOLOGIN BYPASSRLS`, `PUBLIC` sem `EXECUTE` e apenas
    `fittrack_app` autorizada a chamar as funções.
-6. Adicionar policies de leitura para linhas globais somente nas tabelas autorizadas pela spec.
-7. Testar leitura, escrita, update e delete cross-tenant conectando como `fittrack_runtime`, que
+6. Conceder à role dona `USAGE` no schema, somente `SELECT` em `channel_identity`, `INSERT` em
+   `tenant` e `channel_identity` e `USAGE` nas sequences correspondentes; testar ausência de
+   qualquer grant adicional.
+7. Adicionar policies de leitura para linhas globais somente nas tabelas autorizadas pela spec.
+8. Testar leitura, escrita, update e delete cross-tenant conectando como `fittrack_runtime`, que
    herda somente a role de privilégios `fittrack_app`.
-8. Testar lookup existente, primeiro contato, identidade revogada, colisão concorrente e que a
+9. Testar lookup existente, primeiro contato, identidade revogada, colisão concorrente e que a
    aplicação não consegue consultar `channel_identity` diretamente sem tenant.
-9. Testar que conexão sem tenant não retorna silenciosamente dados privados.
-10. Testar que linhas globais são legíveis, mas `INSERT`, `UPDATE` e `DELETE` globais falham com ou
+10. Testar que conexão sem tenant não retorna silenciosamente dados privados.
+11. Testar que linhas globais são legíveis, mas `INSERT`, `UPDATE` e `DELETE` globais falham com ou
     sem `app.tenant_id`; policies de domínio exigem tenant não nulo no `WITH CHECK`.
 
 **Critérios de aceite:**
