@@ -7,7 +7,7 @@
 | Versão | 2.0 |
 | Data | 2026-08-26 |
 | Status | Spec aprovada para implementação |
-| Stack | Python 3.12 · FastAPI · **LangGraph** · PostgreSQL · Qdrant · Redis · Docker Compose |
+| Stack | Python 3.13 · FastAPI · **LangGraph** · PostgreSQL · Qdrant · Redis · Docker Compose |
 | Mudanças da v1.0 | Camada agêntica reescrita sobre primitivos explícitos do LangGraph (§8, §9); canal Telegram adicionado e promovido a primeiro canal de entrega (§18, §24); identidade desacoplada do canal (§5.2) |
 
 ---
@@ -4097,11 +4097,14 @@ coluna `key_version` continua existindo, mas para outro trabalho — é por ela 
 rotação filtra as linhas que ainda faltam reescrever. Divergência entre as duas é erro, não
 silêncio: indica rotação pela metade.
 
-**Gestão de chave.** Chave mestra em variável de ambiente (`FITTRACK_ENCRYPTION_KEY`, 32 bytes
-base64), carregada uma vez na inicialização e nunca logada. `key_version` na linha permite rotação
-progressiva: nova chave passa a cifrar escritas novas enquanto um job reescreve o histórico em
-background. Perder a chave significa perder os dados cifrados — o procedimento de custódia e
-recuperação é parte do runbook de operação, não deste documento.
+**Gestão de chave.** As chaves mestras vivem num keyring versionado em
+`FITTRACK_ENCRYPTION_KEYS` (mapa JSON `versão → chave base64 de 32 bytes`), e
+`FITTRACK_ACTIVE_KEY_VERSION` seleciona a versão usada em novas escritas. A versão armazenada no
+blob seleciona a chave de leitura; portanto, todas as versões ainda presentes no banco permanecem
+no keyring durante o backfill. Uma chave antiga só pode ser removida depois que uma consulta
+comprovar que nenhuma linha ainda usa sua versão. O keyring é carregado uma vez na inicialização e
+nunca logado. Perder qualquer chave ativa significa perder os dados daquela versão — o procedimento
+de custódia e recuperação é parte do runbook de operação, não deste documento.
 
 > **Nota sobre exclusão LGPD.** Esta escolha **não** oferece crypto-shredding: como a chave é
 > global e não por tenant, apagar a chave inutilizaria os dados de todos. A exclusão da §19.5
@@ -4496,7 +4499,9 @@ MERCADOPAGO_ACCESS_TOKEN=
 MERCADOPAGO_WEBHOOK_SECRET=
 
 # Criptografia de coluna (§22.2)
-FITTRACK_DATA_KEY=             # base64, 32 bytes; rotação por key_version
+FITTRACK_ENCRYPTION_KEYS=      # JSON: {"1":"<base64-32-bytes>","2":"<base64-32-bytes>"}
+FITTRACK_ACTIVE_KEY_VERSION=1  # versão usada em novas escritas; antigas ficam até concluir backfill
+FITTRACK_IDENTITY_PEPPER=      # segredo separado usado no HMAC de external_id_hash
 
 # Configuração (§7.2, §19.3). Onde estão models.yaml e quota.yaml.
 # Recarregáveis sem redeploy: o gateway relê a cada 60s ou por SIGHUP.

@@ -37,7 +37,8 @@ Fora do escopo:
 - debounce, filas ARQ funcionais e processamento de rajadas;
 - `LLMGateway`, providers, prompts e chamadas de LLM;
 - grafo LangGraph e agentes;
-- catálogo de exercícios, Qdrant funcional e golden set;
+- catálogo de exercícios, Qdrant funcional e golden set de produto; entra apenas a baseline do
+  judge exigida antes da primeira PR de código;
 - Langfuse/Datadog instrumentados na aplicação;
 - deploy, DNS, TLS público e credenciais reais.
 
@@ -88,18 +89,26 @@ comandos para desenvolvimento e CI.
 - `Makefile`;
 - `src/fittrack/__init__.py`;
 - `tests/unit/` e `tests/integration/`;
+- `evals/run_judge.py`, `evals/rubrics/` e datasets de calibração/baseline;
 - `.github/workflows/ci.yml`;
 - ajustes em `flake.nix`, `shell.nix`, `.gitignore` e `CLAUDE.md` quando necessários.
 
 **Plano de implementação:**
 
 1. Criar um teste de importação de `fittrack` e vê-lo falhar porque o pacote ainda não existe.
-2. Definir metadados, Python 3.13 e dependências separadas por runtime, dev e testes.
+2. Confirmar Python 3.13 em `doc/spec.md`, Nix e metadados do pacote antes de fixar
+   `requires-python`; qualquer divergência remanescente bloqueia o PR.
 3. Configurar Ruff, mypy e pytest em `pyproject.toml`.
 4. Criar os alvos `fmt`, `lint`, `typecheck` e `test`; cada alvo deve falhar se sua ferramenta
    falhar.
-5. Fazer o CI chamar os mesmos alvos do `Makefile`, sem duplicar comandos.
-6. Atualizar a tabela “Estado atual” do `CLAUDE.md` removendo apenas itens realmente entregues.
+5. Antes de introduzir código de aplicação, implementar o runner do judge, 20 casos de calibração
+   com nota humana e uma baseline de 40 respostas sintéticas cobrindo segurança e fidelidade
+   numérica. A calibração segue a política da §21.2; os agentes reais substituem os casos sintéticos
+   nas sprints em que forem implementados.
+6. Adicionar `make eval-judge` e o job condicional por paths da §21.4. Segurança ou fidelidade
+   numérica abaixo de 5 bloqueiam; judge não calibrado é reportado sem reprovar a PR.
+7. Fazer o CI chamar os mesmos alvos do `Makefile`, sem duplicar comandos.
+8. Atualizar a tabela “Estado atual” do `CLAUDE.md` removendo apenas itens realmente entregues.
 
 **Critérios de aceite:**
 
@@ -107,6 +116,8 @@ comandos para desenvolvimento e CI.
 - `make fmt`, `make lint`, `make typecheck` e `make test` terminam com sucesso;
 - `pytest` descobre a suíte e o teste de importação passa;
 - o job `Quality` do CI usa o `Makefile` e fica verde;
+- o judge acerta pelo menos 18 dos 20 casos de calibração e avalia a baseline de 40 casos;
+- os testes do runner provam os gates bloqueantes sem depender de uma resposta ao vivo;
 - nenhum artefato de ambiente ou secret entra no Git.
 
 **Validação:**
@@ -118,6 +129,7 @@ make fmt
 make lint
 make typecheck
 make test
+make eval-judge
 ```
 
 ### S01-T02 — Local infrastructure
@@ -147,24 +159,29 @@ integração, sem expor bancos publicamente.
    entrypoints mínimos de health/smoke; nenhum deles implementa comportamento de negócio.
 4. Publicar somente Caddy no compose de produção; portas de desenvolvimento ficam exclusivamente
    no override local.
-5. Garantir ordem por healthcheck, encerramento previsível e persistência dos volumes.
+5. Configurar CA/certificados internos e TLS verificado para Postgres (`sslmode=verify-full`), Redis
+   e Qdrant. Certificados de desenvolvimento são gerados para teste e nunca reutilizados em
+   produção.
+6. Garantir ordem por healthcheck, encerramento previsível e persistência dos volumes.
 
 **Critérios de aceite:**
 
-- `docker compose config --quiet` valida os dois arquivos;
-- `docker compose up --wait` deixa todos os serviços previstos saudáveis;
+- `docker compose -f docker-compose.yml -f docker-compose.dev.yml config --quiet` valida a
+  configuração combinada;
+- o compose combinado deixa todos os serviços previstos saudáveis;
 - Postgres, Redis e Qdrant não publicam portas no compose de produção;
-- `docker compose run --rm worker pytest` executa a suíte;
+- clientes da aplicação verificam a CA e conexões plaintext ou com certificado inválido falham;
+- o worker executa a suíte usando explicitamente os dois arquivos Compose;
 - `.env.example` contém apenas nomes e valores seguros de exemplo.
 
 **Validação:**
 
 ```bash
-docker compose config --quiet
-docker compose up --wait
-docker compose ps
-docker compose run --rm worker pytest
-docker compose down
+docker compose -f docker-compose.yml -f docker-compose.dev.yml config --quiet
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up --wait
+docker compose -f docker-compose.yml -f docker-compose.dev.yml ps
+docker compose -f docker-compose.yml -f docker-compose.dev.yml run --rm worker pytest
+docker compose -f docker-compose.yml -f docker-compose.dev.yml down
 ```
 
 ### S01-T03 — Typed configuration and secret boundaries
@@ -199,10 +216,10 @@ que secrets sejam serializados ou logados.
 - nomes de modelos existem apenas em `config/models.yaml`;
 - testes cobrem defaults, overrides e falhas de validação.
 
-**Nota de consistência.** A §22.2 usa `FITTRACK_ENCRYPTION_KEY`, enquanto o Apêndice A e o
-`CLAUDE.md` usam `FITTRACK_DATA_KEY`. Antes de implementar T05, o PR desta tarefa deve normalizar a
-spec para um único nome. Até essa correção, o plano adota `FITTRACK_ENCRYPTION_KEY`, por ser o nome
-da seção que define o contrato criptográfico em detalhe.
+**Contrato criptográfico.** Validar `FITTRACK_ENCRYPTION_KEYS` como keyring versionado,
+`FITTRACK_ACTIVE_KEY_VERSION` como uma versão existente no keyring e
+`FITTRACK_IDENTITY_PEPPER` como segredo independente. Nenhum dos três pode aparecer em logs ou
+erros de validação.
 
 ### S01-T04 — Initial database schema
 
@@ -262,17 +279,23 @@ usuário.
 
 1. Testar vetores de round-trip, adulteração, versão desconhecida e divergência de versão.
 2. Implementar AES-256-GCM no formato `version || nonce || ciphertext+tag` definido na §22.2.
-3. Validar chave base64 de 32 bytes e manter material criptográfico fora de logs e erros.
+3. Validar todas as chaves base64 de 32 bytes do keyring e a versão ativa, mantendo material
+   criptográfico fora de logs e erros.
 4. Implementar HMAC-SHA256 determinístico para `external_id_hash`, com pepper separado do banco.
 5. Testar nonces aleatórios: plaintexts iguais geram blobs diferentes, mas o hash pesquisável é
    estável.
-6. Testar escrita/leitura cifrada sem permitir consulta ou agregação sobre ciphertext.
+6. Testar leitura simultânea de blobs em versões antiga e nova enquanto novas escritas usam apenas
+   a versão ativa.
+7. Testar que uma chave antiga não pode ser removida enquanto o banco ainda contém sua versão, e
+   que a remoção é permitida depois do backfill completo.
+8. Testar escrita/leitura cifrada sem permitir consulta ou agregação sobre ciphertext.
 
 **Critérios de aceite:**
 
 - adulterar qualquer byte do blob causa falha fechada;
 - versão interna e `key_version` divergentes causam erro explícito;
 - ciphertexts não revelam plaintext e variam por nonce;
+- rotação progressiva mantém legíveis todas as versões ainda presentes no banco;
 - `external_id_hash` permite lookup sem armazenar identificador em claro;
 - nenhum teste, exceção ou log expõe chave, pepper ou identificador externo.
 
