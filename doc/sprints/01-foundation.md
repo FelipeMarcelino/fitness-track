@@ -147,6 +147,7 @@ integração, sem expor bancos publicamente.
 - `docker-compose.yml` e `docker-compose.dev.yml`;
 - `Caddyfile`;
 - `.env.example`;
+- `.github/workflows/ci.yml`;
 - healthchecks e scripts mínimos de inicialização.
 
 **Plano de implementação:**
@@ -162,7 +163,9 @@ integração, sem expor bancos publicamente.
 5. Configurar CA/certificados internos e TLS verificado para Postgres (`sslmode=verify-full`), Redis
    e Qdrant. Certificados de desenvolvimento são gerados para teste e nunca reutilizados em
    produção.
-6. Garantir ordem por healthcheck, encerramento previsível e persistência dos volumes.
+6. Criar em T02 o job de CI com Postgres, Redis e Qdrant saudáveis, antes de qualquer PR de banco.
+   O job executa a marca de integração separadamente e preserva logs dos serviços em caso de falha.
+7. Garantir ordem por healthcheck, encerramento previsível e persistência dos volumes.
 
 **Critérios de aceite:**
 
@@ -172,6 +175,7 @@ integração, sem expor bancos publicamente.
 - Postgres, Redis e Qdrant não publicam portas no compose de produção;
 - clientes da aplicação verificam a CA e conexões plaintext ou com certificado inválido falham;
 - o worker executa a suíte usando explicitamente os dois arquivos Compose;
+- o job de integração do CI está verde e é obrigatório antes de iniciar T04;
 - `.env.example` contém apenas nomes e valores seguros de exemplo.
 
 **Validação:**
@@ -216,8 +220,9 @@ que secrets sejam serializados ou logados.
 - nomes de modelos existem apenas em `config/models.yaml`;
 - testes cobrem defaults, overrides e falhas de validação.
 
-**Contrato criptográfico.** Validar `FITTRACK_ENCRYPTION_KEYS` como keyring versionado,
-`FITTRACK_ACTIVE_KEY_VERSION` como uma versão existente no keyring e
+**Contrato criptográfico.** Validar `FITTRACK_ENCRYPTION_KEYS` como keyring versionado cujas versões
+estão no intervalo compartilhado `1..32767` (`SMALLINT` positivo e dois bytes no blob),
+`FITTRACK_ACTIVE_KEY_VERSION` como uma versão do mesmo intervalo existente no keyring e
 `FITTRACK_IDENTITY_PEPPER` como segredo independente. Nenhum dos três pode aparecer em logs ou
 erros de validação.
 
@@ -280,7 +285,7 @@ usuário.
 1. Testar vetores de round-trip, adulteração, versão desconhecida e divergência de versão.
 2. Implementar AES-256-GCM no formato `version || nonce || ciphertext+tag` definido na §22.2.
 3. Validar todas as chaves base64 de 32 bytes do keyring e a versão ativa, mantendo material
-   criptográfico fora de logs e erros.
+   criptográfico fora de logs e erros; rejeitar versões fora de `1..32767` antes do boot.
 4. Implementar HMAC-SHA256 determinístico para `external_id_hash`, com pepper separado do banco.
 5. Testar nonces aleatórios: plaintexts iguais geram blobs diferentes, mas o hash pesquisável é
    estável.
@@ -294,6 +299,7 @@ usuário.
 
 - adulterar qualquer byte do blob causa falha fechada;
 - versão interna e `key_version` divergentes causam erro explícito;
+- versões zero, negativas ou acima de 32767 são rejeitadas na configuração;
 - ciphertexts não revelam plaintext e variam por nonce;
 - rotação progressiva mantém legíveis todas as versões ainda presentes no banco;
 - `external_id_hash` permite lookup sem armazenar identificador em claro;
@@ -311,24 +317,34 @@ Postgres.
 **Arquivos previstos:**
 
 - `src/fittrack/repositories/base.py` e primeiros repositórios de suporte;
+- fronteira de bootstrap em `src/fittrack/services/identity.py`;
 - migração/policies de RLS;
 - `tests/test_tenant_isolation.py`;
+- `tests/integration/test_identity_bootstrap.py`;
 - `tests/integration/test_repository_tenant_context.py`.
 
 **Plano de implementação:**
 
 1. Criar um teste parametrizado que demonstre leitura cruzada antes das policies.
-2. Habilitar e forçar RLS em todas as tabelas listadas na §19.1.
+2. Habilitar e forçar RLS na tabela raiz `tenant` (`id = app.tenant_id`) e em todas as tabelas
+   tenant-scoped listadas na §19.1.
 3. Aplicar `SET LOCAL app.tenant_id` no início de cada transação da aplicação.
-4. Exigir `tenant_id` no construtor/contexto dos repositórios; não oferecer método sem escopo.
-5. Adicionar policies de leitura para linhas globais somente nas tabelas autorizadas pela spec.
-6. Testar leitura, escrita, update e delete cross-tenant usando a role real `fittrack_app`.
-7. Testar que conexão sem tenant não retorna silenciosamente dados privados.
+4. Exigir `tenant_id` no construtor/contexto dos repositórios de domínio; não oferecer método sem
+   escopo.
+5. Implementar a fronteira pré-tenant da §19.1 com funções `SECURITY DEFINER` de lookup e criação
+   atômica, `search_path` fixo, role dona `NOLOGIN BYPASSRLS`, `PUBLIC` sem `EXECUTE` e apenas
+   `fittrack_app` autorizada a chamar as funções.
+6. Adicionar policies de leitura para linhas globais somente nas tabelas autorizadas pela spec.
+7. Testar leitura, escrita, update e delete cross-tenant usando a role real `fittrack_app`.
+8. Testar lookup existente, primeiro contato, identidade revogada, colisão concorrente e que a
+   aplicação não consegue consultar `channel_identity` diretamente sem tenant.
+9. Testar que conexão sem tenant não retorna silenciosamente dados privados.
 
 **Critérios de aceite:**
 
-- o teste percorre todas as tabelas tenant-scoped, não uma amostra;
+- o teste percorre `tenant` e todas as tabelas tenant-scoped, não uma amostra;
 - tenant A não lê nem altera dados de tenant B;
+- o ingress resolve ou cria identidade somente pela fronteira pré-tenant autorizada;
 - catálogo global autorizado é legível e não gravável pela aplicação;
 - nova tabela tenant-scoped sem policy faz o teste falhar;
 - a suíte prova que a conexão usa `NOSUPERUSER NOBYPASSRLS`.
@@ -359,7 +375,8 @@ a futura implementação coloque dependências nas camadas erradas.
 4. Implementar bootstrap idempotente para migrações e setup explícito das tabelas internas do
    LangGraph quando a dependência estiver disponível; nenhuma chamada de Telegram ou seed faz parte
    desta sprint.
-5. Separar jobs baratos, unitários e de integração no CI; serviços usam healthchecks.
+5. Consolidar a ordem dos jobs baratos, unitários e de integração criada em T02; serviços usam
+   healthchecks.
 6. Documentar setup, comandos, troubleshooting e teardown.
 7. Executar a suíte completa duas vezes, sendo a segunda sobre ambiente já inicializado, para
    demonstrar idempotência.
@@ -398,7 +415,7 @@ A sprint termina somente quando todos os itens abaixo forem demonstrados:
 - [ ] ambiente sobe saudável e testes rodam dentro do worker;
 - [ ] migração completa chega a uma única `head` em Postgres vazio;
 - [ ] campos sensíveis nascem cifrados e a identidade é pesquisada por HMAC;
-- [ ] teste parametrizado comprova RLS em todas as tabelas tenant-scoped;
+- [ ] teste parametrizado comprova RLS em `tenant` e todas as tabelas tenant-scoped;
 - [ ] bootstrap é idempotente;
 - [ ] CI obrigatório está verde;
 - [ ] documentação e tabela de estado do `CLAUDE.md` refletem o repositório real.
@@ -421,7 +438,8 @@ A sprint termina somente quando todos os itens abaixo forem demonstrados:
   Qdrant e Langfuse fica para sprints posteriores.
 - `ingress`, `worker` e `scheduler` têm apenas entrypoints mínimos necessários a health/smoke.
 - O schema integral da §5.2 é criado agora para que criptografia e isolamento não virem retrofit.
-- O nome definitivo da variável de chave será resolvido no PR T03 antes de implementar criptografia.
+- O contrato criptográfico usa `FITTRACK_ENCRYPTION_KEYS`, `FITTRACK_ACTIVE_KEY_VERSION` e
+  `FITTRACK_IDENTITY_PEPPER`; T03 apenas o valida, não reabre a decisão.
 
 ## Relatório de encerramento
 

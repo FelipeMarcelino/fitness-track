@@ -3488,8 +3488,11 @@ seria um erro caro em dois sentidos opostos.
 
 ### 19.1 Isolamento
 
-- Toda tabela de domínio tem `tenant_id` com FK e `ON DELETE CASCADE`.
-- Todo repositório recebe `tenant_id` no construtor; não existe método que consulte sem ele.
+- Toda tabela de domínio pertencente a um usuário tem `tenant_id` com FK e `ON DELETE CASCADE`; a
+  tabela raiz `tenant` usa o próprio `id` como fronteira de RLS.
+- Todo repositório de domínio recebe `tenant_id` no construtor; não existe método que consulte sem
+  ele. A única exceção é a fronteira de bootstrap de identidade descrita abaixo, porque o ingress
+  ainda não conhece o tenant quando recebe `(channel, external_id_hash)`.
 - Row Level Security no Postgres como segunda barreira:
 
 A RLS precisa cobrir **toda** tabela com `tenant_id`, não uma amostra. Uma tabela de fora da
@@ -3507,6 +3510,15 @@ BEGIN
     CREATE ROLE fittrack_app NOLOGIN NOSUPERUSER NOBYPASSRLS;
   END IF;
 END $$;
+
+-- `tenant` é a raiz do isolamento e usa `id`, não `tenant_id`.
+ALTER TABLE tenant ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tenant FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_self ON tenant
+  USING (id IS NOT DISTINCT FROM
+         NULLIF(current_setting('app.tenant_id', true), '')::bigint)
+  WITH CHECK (id IS NOT DISTINCT FROM
+              NULLIF(current_setting('app.tenant_id', true), '')::bigint);
 
 GRANT USAGE ON SCHEMA public TO fittrack_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO fittrack_app;
@@ -3564,6 +3576,21 @@ BEGIN
 END $$;
 ```
 
+**Bootstrap antes de conhecer o tenant.** O ingress não pode fazer `SELECT` direto em
+`channel_identity`: nesse momento ele conhece apenas `channel` e `external_id_hash`, e a RLS ainda
+não tem um `app.tenant_id`. A migração cria uma role `NOLOGIN BYPASSRLS` dedicada, dona de duas
+funções `SECURITY DEFINER` com `search_path` fixo e parâmetros tipados:
+
+- `resolve_tenant_for_identity(channel, external_id_hash) → tenant_id`, limitada a identidade ativa;
+- `create_tenant_with_identity(channel, external_id, external_id_hash, key_version) → tenant_id`,
+  que cria o primeiro tenant e seu vínculo na mesma transação.
+
+O privilégio `EXECUTE` é revogado de `PUBLIC` e concedido somente a `fittrack_app`; a aplicação não
+recebe a role nem `BYPASSRLS`. Essa é a única fronteira pré-tenant. Depois que uma das funções
+retorna, a transação de domínio começa com `SET LOCAL app.tenant_id`. Testes de integração devem
+provar lookup existente, primeiro contato atômico, identidade revogada, colisão concorrente e que a
+role da aplicação continua incapaz de consultar `channel_identity` diretamente sem contexto.
+
 Notas:
 
 - **`FORCE ROW LEVEL SECURITY`** é necessário porque o dono da tabela ignora RLS por padrão — sem
@@ -3577,7 +3604,7 @@ Notas:
   global use uma role dedicada de leitura, ou uma policy adicional `USING (tenant_id IS NULL)`.
 - O worker executa `SET LOCAL app.tenant_id = $1` no início de cada transação. O
   `current_setting(..., true)` evita erro quando a variável não foi definida.
-- Um teste de integração deve verificar que **cada** tabela da lista bloqueia leitura cruzada
+- Um teste de integração deve verificar `tenant` e **cada** tabela da lista contra leitura cruzada
   (`tests/test_tenant_isolation.py`), parametrizado sobre a lista — assim uma tabela nova sem
   policy quebra o teste.
 
