@@ -1,0 +1,143 @@
+[build-system]
+requires = ["hatchling>=1.25,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fittrack"
+version = "0.1.0"
+description = "Telegram and WhatsApp bot that turns natural language into structured training data"
+readme = "README.md"
+requires-python = "==3.13.*"
+license = "MIT"
+authors = [{ name = "Felipe Marcelino" }]
+
+# Runtime contract for phase 1.0 (spec section 24). Every bound is closed on
+# both sides: an orchestration or driver minor that changes reducer, checkpoint
+# or wire semantics must turn the build red instead of failing in production.
+dependencies = [
+    # Orchestration. Section 8 requires a lower *and* upper bound on langgraph:
+    # Send, Command, interrupt, defer=True, RetryPolicy, AsyncPostgresSaver and
+    # AsyncPostgresStore are stable from the 0.6 line onwards.
+    "langgraph>=0.6,<0.8",
+    "langgraph-checkpoint-postgres>=2.0,<3",
+    "langchain-core>=0.3,<0.4",
+
+    # Contracts and configuration.
+    "pydantic>=2.9,<3",
+    "pydantic-settings>=2.5,<3",
+    "pyyaml>=6,<7",
+
+    # Ingress, worker and scheduler.
+    "fastapi>=0.115,<0.130",
+    "uvicorn[standard]>=0.32,<0.40",
+    "httpx>=0.27,<0.29",
+    "arq>=0.26,<0.27",
+    "apscheduler>=3.10,<4",
+
+    # Storage.
+    "sqlalchemy[asyncio]>=2.0,<2.1",
+    "alembic>=1.13,<2",
+    "asyncpg>=0.30,<0.32",
+    "redis>=5.1,<7",
+    "qdrant-client>=1.12,<2",
+
+    # Security. Section 22.2 column encryption.
+    "cryptography>=43,<48",
+
+    # LLM providers. ADR-0001: groq primary, anthropic fallback and judge,
+    # openai for embeddings only.
+    "groq>=0.13,<1",
+    "anthropic>=0.40,<1",
+    "openai>=1.50,<3",
+
+    # Observability.
+    "structlog>=24,<26",
+]
+
+[project.urls]
+Repository = "https://github.com/FelipeMarcelino/fitness-track"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.13,<2",
+    "ruff>=0.8,<0.15",
+    "types-pyyaml>=6,<7",
+]
+test = [
+    "pytest>=8.3,<10",
+    "pytest-asyncio>=0.24,<2",
+    "pytest-cov>=6,<8",
+]
+
+[tool.uv]
+default-groups = ["dev", "test"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fittrack"]
+
+# --------------------------------------------------------------------------- #
+# Quality gates. `make` is the only entry point; these tables are what it runs.
+# --------------------------------------------------------------------------- #
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["src", "tests", "evals", "scripts"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",      # pycodestyle
+    "F",           # pyflakes
+    "I",           # isort
+    "N",           # pep8-naming
+    "UP",          # pyupgrade
+    "B",           # bugbear
+    "A",           # builtins shadowing
+    "C4",          # comprehensions
+    "DTZ",         # naive datetimes
+    "T20",         # print
+    "SIM",         # simplify
+    "PTH",         # pathlib
+    "RUF",
+]
+ignore = [
+    "RUF001",  # ambiguous unicode: the domain and the docs are pt-BR
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# The eval runners are command line entry points; stdout is their output.
+"evals/**" = ["T20"]
+"scripts/**" = ["T20"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["fittrack", "evals"]
+
+[tool.mypy]
+python_version = "3.13"
+files = ["src", "tests", "evals"]
+strict = true
+warn_unreachable = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["tests.*", "evals.*"]
+disallow_untyped_decorators = false
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+# `src` for the package, `.` so the eval runners are importable by their tests
+# without being part of the shipped distribution.
+pythonpath = ["src", "."]
+testpaths = ["tests"]
+addopts = ["--strict-markers", "--strict-config", "-ra"]
+asyncio_mode = "auto"
+markers = [
+    "integration: requires Postgres, Redis or Qdrant (spec section 21.4)",
+    "judge: calls a live LLM judge and needs provider credentials",
+]
+
+[tool.coverage.run]
+source = ["src/fittrack", "evals"]
+branch = true
