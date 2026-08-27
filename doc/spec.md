@@ -7,7 +7,7 @@
 | Versão | 2.0 |
 | Data | 2026-08-26 |
 | Status | Spec aprovada para implementação |
-| Stack | Python 3.12 · FastAPI · **LangGraph** · PostgreSQL · Qdrant · Redis · Docker Compose |
+| Stack | Python 3.13 · FastAPI · **LangGraph** · PostgreSQL · Qdrant · Redis · Docker Compose |
 | Mudanças da v1.0 | Camada agêntica reescrita sobre primitivos explícitos do LangGraph (§8, §9); canal Telegram adicionado e promovido a primeiro canal de entrega (§18, §24); identidade desacoplada do canal (§5.2) |
 
 ---
@@ -433,6 +433,9 @@ CREATE UNIQUE INDEX ux_channel_identity_active
 CREATE UNIQUE INDEX ux_channel_identity_primary
     ON channel_identity(tenant_id) WHERE is_primary AND revoked_at IS NULL;
 CREATE INDEX ix_channel_identity_tenant ON channel_identity(tenant_id);
+-- Chave candidata para FKs que precisam provar identidade + tenant + canal.
+ALTER TABLE channel_identity
+    ADD CONSTRAINT uq_channel_identity_scope UNIQUE (id, tenant_id, channel);
 
 -- Consentimentos LGPD granulares. Registro de treino e dado de saúde são separados.
 CREATE TYPE consent_kind AS ENUM (
@@ -834,11 +837,10 @@ CREATE TABLE plan_item (
 CREATE TABLE raw_message (
     id                 BIGSERIAL PRIMARY KEY,
     tenant_id          BIGINT NOT NULL REFERENCES tenant(id) ON DELETE CASCADE,
+    identity_id        BIGINT NOT NULL,
     channel            channel_kind NOT NULL,
-    -- id da mensagem no canal de origem. Só é único DENTRO do canal: o
-    -- Telegram numera message_id por chat e o WhatsApp usa um wamid opaco.
-    -- Um UNIQUE global na coluna colidiria no dia em que dois canais
-    -- coexistissem, e colidiria em produção, não em teste.
+    -- id da mensagem no canal de origem. No Telegram ele é único somente
+    -- dentro do chat; por isso a identidade faz parte da chave de dedup.
     channel_message_id TEXT NOT NULL,
     direction          TEXT NOT NULL,  -- inbound | outbound
     msg_type           TEXT NOT NULL,  -- text | voice | image | button_reply | reaction | template
@@ -848,7 +850,9 @@ CREATE TABLE raw_message (
     received_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     processed_at       TIMESTAMPTZ,
 
-    UNIQUE (channel, channel_message_id)
+    UNIQUE (identity_id, channel_message_id),
+    FOREIGN KEY (identity_id, tenant_id, channel)
+        REFERENCES channel_identity(id, tenant_id, channel) ON DELETE CASCADE
 );
 CREATE INDEX ix_raw_tenant_time ON raw_message(tenant_id, received_at DESC);
 
@@ -856,7 +860,8 @@ CREATE TABLE processing_batch (
     id            BIGSERIAL PRIMARY KEY,
     tenant_id     BIGINT NOT NULL REFERENCES tenant(id) ON DELETE CASCADE,
     message_ids   TEXT[] NOT NULL,
-    combined_text TEXT NOT NULL,
+    combined_text BYTEA NOT NULL, -- CIFRADA (§22.2); concatenação não pode duplicar texto em claro
+    key_version   SMALLINT NOT NULL DEFAULT 1,
     status        TEXT NOT NULL DEFAULT 'pending',  -- pending | done | failed
     attempts      SMALLINT NOT NULL DEFAULT 0,
     error         TEXT,
@@ -893,7 +898,8 @@ CREATE TABLE outbound_queue (
     identity_id   BIGINT NOT NULL REFERENCES channel_identity(id) ON DELETE CASCADE,
     channel       channel_kind NOT NULL,
     kind          TEXT NOT NULL,      -- text | reaction | buttons | media | template
-    payload       JSONB NOT NULL,
+    payload       BYTEA NOT NULL,     -- CIFRADA (§22.2); JSON serializado antes de cifrar
+    key_version   SMALLINT NOT NULL DEFAULT 1,
 
     -- Split em bolhas (§13.6): as bolhas de uma mesma resposta compartilham
     -- group_id e são enviadas em ordem de seq. Sem isso, um restart do worker
@@ -2979,7 +2985,7 @@ A única exceção é o dedup de webhook, que **precisa** ser por canal: o `upda
 
 | Chave | Tipo | TTL | Uso |
 | --- | --- | --- | --- |
-| `seen:{channel}:{message_id}` | string | 24h | Dedup de webhook (os dois canais reentregam) |
+| `seen:{channel}:{account_hash}:{message_id}` | string | 24h | Dedup antes do lookup; `account_hash` vem do identificador externo recebido |
 | `buffer:{tenant_id}` | list | 1h | Mensagens da rajada aguardando flush |
 | `debounce:{tenant_id}` | string | 10s | Timer de silêncio; renovado a cada mensagem |
 | `lock:{tenant_id}` | string | 120s | Lock FIFO de processamento (Redlock) |
@@ -3043,8 +3049,10 @@ queda entre o `RENAME` e o `DEL` não perde o lote.
 
 ### 17.4 Idempotência
 
-- **Webhook:** dedup por `seen:{channel}:{message_id}` em Redis + `UNIQUE (channel,
-  channel_message_id)` em `raw_message`. Os dois canais reentregam o que não recebeu 200 rápido.
+- **Webhook:** antes do lookup, dedup por `seen:{channel}:{account_hash}:{message_id}` em Redis; no
+  Telegram, prefira o `update_id`, que já é global para o bot. Depois do bootstrap de identidade,
+  `UNIQUE (identity_id, channel_message_id)` em `raw_message` é a segunda barreira. Os dois canais
+  reentregam o que não recebeu 200 rápido.
 - **Persistência:** `ux_set_idempotency` (§5.2) é um índice único parcial em
   `(session_id, exercise_id, set_index, source_message_id)` com **`NULLS NOT DISTINCT`**, de modo
   que reprocessar o mesmo batch não duplica séries. O `NULLS NOT DISTINCT` é a parte que importa:
@@ -3184,8 +3192,8 @@ Não há rota `GET` de verificação: o Telegram não faz *challenge*. O registr
    update de tipo não solicitado nunca chega, o que reduz a superfície de parsing.
 3. Responder **200 em menos de 200 ms**, sempre. O Telegram reentrega o mesmo `update_id` com
    backoff quando o endpoint demora ou falha; um handler lento vira uma tempestade de duplicatas.
-4. Dedup por `update_id` em Redis (`seen:tg:{update_id}`, TTL 24h) + `UNIQUE (channel,
-   channel_message_id)` em `raw_message`.
+4. Dedup por `update_id` em Redis (`seen:tg:{update_id}`, TTL 24h) +
+   `UNIQUE (identity_id, channel_message_id)` em `raw_message`.
 5. `max_connections=40` (padrão) e rate limit por IP no Caddy, restrito às faixas do Telegram.
 
 > **A pegadinha do 409.** `getUpdates` e `setWebhook` são mutuamente exclusivos: chamar `getUpdates`
@@ -3288,7 +3296,7 @@ Fase 2.0. O adaptador implementa a mesma interface da §18.1.
    em tempo constante. Falha → 403 sem processar.
 2. Responder **200 em menos de 200 ms**, sempre. A Meta desabilita webhooks lentos ou que falham
    repetidamente.
-3. Dedup por `message_id` em Redis + `UNIQUE (channel, channel_message_id)` em `raw_message`.
+3. Dedup por `message_id` em Redis + `UNIQUE (identity_id, channel_message_id)` em `raw_message`.
 4. Rate limit por IP no Caddy (a Meta usa faixas conhecidas).
 
 #### Tipos de mensagem tratados
@@ -3488,8 +3496,11 @@ seria um erro caro em dois sentidos opostos.
 
 ### 19.1 Isolamento
 
-- Toda tabela de domínio tem `tenant_id` com FK e `ON DELETE CASCADE`.
-- Todo repositório recebe `tenant_id` no construtor; não existe método que consulte sem ele.
+- Toda tabela de domínio pertencente a um usuário tem `tenant_id` com FK e `ON DELETE CASCADE`; a
+  tabela raiz `tenant` usa o próprio `id` como fronteira de RLS.
+- Todo repositório de domínio recebe `tenant_id` no construtor; não existe método que consulte sem
+  ele. A única exceção é a fronteira de bootstrap de identidade descrita abaixo, porque o ingress
+  ainda não conhece o tenant quando recebe `(channel, external_id_hash)`.
 - Row Level Security no Postgres como segunda barreira:
 
 A RLS precisa cobrir **toda** tabela com `tenant_id`, não uma amostra. Uma tabela de fora da
@@ -3507,6 +3518,24 @@ BEGIN
     CREATE ROLE fittrack_app NOLOGIN NOSUPERUSER NOBYPASSRLS;
   END IF;
 END $$;
+
+-- `fittrack_app` é a role de privilégios/policies. O processo conecta com um
+-- principal LOGIN separado, provisionado com senha fora da migração e membro
+-- somente desta role. Nunca conecta como o dono das tabelas.
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'fittrack_runtime') THEN
+    CREATE ROLE fittrack_runtime LOGIN NOSUPERUSER NOBYPASSRLS
+      IN ROLE fittrack_app;
+  END IF;
+END $$;
+
+-- `tenant` é a raiz do isolamento e usa `id`, não `tenant_id`.
+ALTER TABLE tenant ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tenant FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_self ON tenant
+  USING (id = NULLIF(current_setting('app.tenant_id', true), '')::bigint)
+  WITH CHECK (id = NULLIF(current_setting('app.tenant_id', true), '')::bigint);
 
 GRANT USAGE ON SCHEMA public TO fittrack_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO fittrack_app;
@@ -3540,9 +3569,9 @@ BEGIN
     EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY', t);
     EXECUTE format($f$
       CREATE POLICY tenant_isolation ON %I
-        USING (tenant_id IS NOT DISTINCT FROM
+        USING (tenant_id =
                NULLIF(current_setting('app.tenant_id', true), '')::bigint)
-        WITH CHECK (tenant_id IS NOT DISTINCT FROM
+        WITH CHECK (tenant_id IS NOT NULL AND tenant_id =
                NULLIF(current_setting('app.tenant_id', true), '')::bigint)
     $f$, t);
   END LOOP;
@@ -3564,20 +3593,39 @@ BEGIN
 END $$;
 ```
 
+**Bootstrap antes de conhecer o tenant.** O ingress não pode fazer `SELECT` direto em
+`channel_identity`: nesse momento ele conhece apenas `channel` e `external_id_hash`, e a RLS ainda
+não tem um `app.tenant_id`. A migração cria uma role `NOLOGIN BYPASSRLS` dedicada, dona de duas
+funções `SECURITY DEFINER` com `search_path` fixo e parâmetros tipados:
+
+- `resolve_tenant_for_identity(channel, external_id_hash) → tenant_id`, limitada a identidade ativa;
+- `create_tenant_with_identity(channel, external_id, external_id_hash, key_version) → tenant_id`,
+  que cria o primeiro tenant e seu vínculo na mesma transação.
+
+O privilégio `EXECUTE` é revogado de `PUBLIC` e concedido somente a `fittrack_app`; a aplicação não
+recebe a role nem `BYPASSRLS`. A role dona recebe `USAGE` no schema, somente `SELECT` em
+`channel_identity`, `INSERT` em `tenant` e `channel_identity` e `USAGE` nas duas sequences
+correspondentes; não recebe acesso às demais tabelas nem privilégios de update/delete. Essa é a
+única fronteira pré-tenant. Depois que uma
+das funções retorna, a transação de domínio começa com `SET LOCAL app.tenant_id`. Testes de
+integração devem provar os grants exatos, lookup existente, primeiro contato atômico, identidade
+revogada, colisão concorrente e que a role da aplicação continua incapaz de consultar
+`channel_identity` diretamente sem contexto.
+
 Notas:
 
 - **`FORCE ROW LEVEL SECURITY`** é necessário porque o dono da tabela ignora RLS por padrão — sem
   ele a barreira não existe para o usuário das migrações.
 - **`FORCE` não basta.** Superusuário e qualquer role com `BYPASSRLS` ignoram RLS de qualquer
-  forma. A aplicação conecta como `fittrack_app` (`NOSUPERUSER NOBYPASSRLS`); as migrações
-  rodam como o dono. Se `DATABASE_URL` apontar para o superusuário, as policies existem e
-  nunca são avaliadas — é falha silenciosa, não erro.
-- **`exercise` e `exercise_alias`** têm `tenant_id` nulo nas linhas globais; `IS NOT DISTINCT FROM`
-  as mantém visíveis apenas quando `app.tenant_id` também está ausente. Para leitura do catálogo
-  global use uma role dedicada de leitura, ou uma policy adicional `USING (tenant_id IS NULL)`.
+  forma. A aplicação conecta como `fittrack_runtime` (`NOSUPERUSER NOBYPASSRLS`), que herda
+  somente `fittrack_app`; as migrações rodam como o dono. Se `DATABASE_URL` apontar para o
+  superusuário, as policies existem e nunca são avaliadas — é falha silenciosa, não erro.
+- **Linhas globais nunca passam pela policy base de escrita.** Comparação com `NULL` não resulta em
+  verdadeiro, e o `WITH CHECK` exige `tenant_id IS NOT NULL`. A policy `FOR SELECT` separada torna
+  o catálogo global legível sem autorizar `INSERT`, `UPDATE` ou `DELETE` global.
 - O worker executa `SET LOCAL app.tenant_id = $1` no início de cada transação. O
   `current_setting(..., true)` evita erro quando a variável não foi definida.
-- Um teste de integração deve verificar que **cada** tabela da lista bloqueia leitura cruzada
+- Um teste de integração deve verificar `tenant` e **cada** tabela da lista contra leitura cruzada
   (`tests/test_tenant_isolation.py`), parametrizado sobre a lista — assim uma tabela nova sem
   policy quebra o teste.
 
@@ -4049,6 +4097,8 @@ Cifrados **antes** de chegar ao Postgres. O banco vê apenas bytes.
 | `athlete_profile.injuries` | Histórico de lesão; JSON serializado e então cifrado |
 | `raw_message.payload` | Texto bruto do usuário |
 | `raw_message.transcript` | Transcrição de áudio |
+| `processing_batch.combined_text` | Concatenação persistida das mensagens para retry |
+| `outbound_queue.payload` | Resposta pendente, que pode repetir dado de treino ou saúde |
 | `session_summary.narrative` | Narrativa da sessão, pode conter relato pessoal |
 
 Essas colunas já nascem `BYTEA` no schema da §5.2, cada uma com sua `key_version` ao lado — **não
@@ -4064,6 +4114,14 @@ poucos dígitos significativos). A mitigação é que o pepper vive em variável
 banco — um dump de banco sozinho não permite reverter o hash, que é exatamente o adversário que o
 AD-32 tem em vista. Um comprometimento de máquina derrota isso, e derrota igualmente a chave de
 cifra.
+
+O pepper não gira em modo dual-read: hashes gerados por dois peppers diferentes também escapariam
+da constraint de unicidade. A rotação é uma manutenção atômica na aplicação: pausar ingress,
+bloquear `channel_identity`, decifrar cada `external_id` com o AAD antigo, recalcular o hash,
+recriptografar o identificador com o AAD novo e atualizar hash+ciphertext na mesma transação. Só
+depois do commit o deploy troca `FITTRACK_IDENTITY_PEPPER` e retoma tráfego. Falha faz rollback
+antes da troca do secret. O teste de rotação cobre rollback, reautenticação do ciphertext e prova
+que nenhum lookup ou vínculo duplicado é criado durante a janela.
 
 > ⚠️ Nunca use `ALTER COLUMN ... TYPE BYTEA USING NULL` para converter uma coluna existente: isso
 > descarta silenciosamente todo o conteúdo. Se algum dia for necessário cifrar uma coluna que já
@@ -4097,11 +4155,24 @@ coluna `key_version` continua existindo, mas para outro trabalho — é por ela 
 rotação filtra as linhas que ainda faltam reescrever. Divergência entre as duas é erro, não
 silêncio: indica rotação pela metade.
 
-**Gestão de chave.** Chave mestra em variável de ambiente (`FITTRACK_ENCRYPTION_KEY`, 32 bytes
-base64), carregada uma vez na inicialização e nunca logada. `key_version` na linha permite rotação
-progressiva: nova chave passa a cifrar escritas novas enquanto um job reescreve o histórico em
-background. Perder a chave significa perder os dados cifrados — o procedimento de custódia e
-recuperação é parte do runbook de operação, não deste documento.
+**Associated data é obrigatório.** AES-GCM autentica também um AAD canônico e imutável. Para campos
+de domínio, ele contém versão do contrato, tenant, tabela, coluna e ID estável da linha;
+repositórios reservam o `BIGSERIAL` antes de cifrar. A exceção pré-tenant é explicitamente
+`channel_identity.external_id`, cujo AAD é
+`fittrack:v1|channel_identity|external_id|channel:{channel}|hash:{external_id_hash}`: não contém
+tenant nem ID de banco e pode ser construído pelo caller antes de invocar
+`create_tenant_with_identity`. A decifra reconstrói o mesmo AAD a partir do contexto confiável,
+nunca do blob. Copiar um ciphertext íntegro para outra linha, tenant, coluna, canal ou hash deve
+falhar autenticação, assim como alterar um byte.
+
+**Gestão de chave.** As chaves mestras vivem num keyring versionado em
+`FITTRACK_ENCRYPTION_KEYS` (mapa JSON `versão → chave base64 de 32 bytes`), e
+`FITTRACK_ACTIVE_KEY_VERSION` seleciona a versão usada em novas escritas. A versão armazenada no
+blob seleciona a chave de leitura; portanto, todas as versões ainda presentes no banco permanecem
+no keyring durante o backfill. Uma chave antiga só pode ser removida depois que uma consulta
+comprovar que nenhuma linha ainda usa sua versão. O keyring é carregado uma vez na inicialização e
+nunca logado. Perder qualquer chave ativa significa perder os dados daquela versão — o procedimento
+de custódia e recuperação é parte do runbook de operação, não deste documento.
 
 > **Nota sobre exclusão LGPD.** Esta escolha **não** oferece crypto-shredding: como a chave é
 > global e não por tenant, apagar a chave inutilizaria os dados de todos. A exclusão da §19.5
@@ -4496,7 +4567,9 @@ MERCADOPAGO_ACCESS_TOKEN=
 MERCADOPAGO_WEBHOOK_SECRET=
 
 # Criptografia de coluna (§22.2)
-FITTRACK_DATA_KEY=             # base64, 32 bytes; rotação por key_version
+FITTRACK_ENCRYPTION_KEYS=      # JSON: {"1":"<base64-32-bytes>","2":"<base64-32-bytes>"}
+FITTRACK_ACTIVE_KEY_VERSION=1  # versão usada em novas escritas; antigas ficam até concluir backfill
+FITTRACK_IDENTITY_PEPPER=      # segredo separado usado no HMAC de external_id_hash
 
 # Configuração (§7.2, §19.3). Onde estão models.yaml e quota.yaml.
 # Recarregáveis sem redeploy: o gateway relê a cada 60s ou por SIGHUP.
