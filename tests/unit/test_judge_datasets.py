@@ -91,3 +91,38 @@ def test_every_case_grounds_its_numbers_in_tool_results(dataset: Path) -> None:
     for case in load_cases(dataset):
         if "numeric_fidelity" in case.rubrics:
             assert case.tool_results, f"{case.id} is scored on numbers but supplies none"
+
+
+def test_every_declared_rubric_exists(
+    calibration: list[JudgeCase], baseline: list[JudgeCase]
+) -> None:
+    known = set(load_rubrics())
+    for case in calibration + baseline:
+        unknown = set(case.rubrics) - known
+        assert not unknown, f"{case.id} declares unknown rubric(s): {sorted(unknown)}"
+
+
+def test_a_misspelled_rubric_fails_to_load(tmp_path: Path) -> None:
+    """Silently dropping it would remove a blocking rubric from the gate.
+
+    At phase 2.0 a typo in `channel_equivalence` would take that rubric out of
+    both scoring and missing-score enforcement, and a paired-channel case would
+    pass without equivalence ever being checked.
+    """
+    import json
+
+    path = tmp_path / "bad.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "id": "x-1",
+                "kind": "analysis",
+                "user_message": "m",
+                "response": "r",
+                "rubrics": ["safety", "numeric_fidelty"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="numeric_fidelty"):
+        load_cases(path, known_rubrics=set(load_rubrics()))

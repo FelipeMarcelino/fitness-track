@@ -27,7 +27,7 @@ from evals.judge.backends import (
     MissingCredentialsError,
     ReplayBackend,
 )
-from evals.judge.calibration import calibrate, human_labels
+from evals.judge.calibration import calibrate
 from evals.judge.datasets import BASELINE, CALIBRATION, load_cases
 from evals.judge.gates import DEFAULT_PHASE, CaseRubrics, evaluate_run, rubrics_for
 from evals.judge.models import CaseVerdict, JudgeCase
@@ -93,9 +93,12 @@ def main(argv: list[str] | None = None) -> int:
         print(message)
         return 0
 
-    rubrics = active_rubrics(args.phase, load_rubrics())
-    calibration_cases = load_cases(args.calibration)
-    baseline_cases = load_cases(args.baseline)
+    all_rubrics = load_rubrics()
+    rubrics = active_rubrics(args.phase, all_rubrics)
+    # Validated against the *full* set, not the active one: a case may legitimately
+    # declare a rubric that a later phase turns on.
+    calibration_cases = load_cases(args.calibration, known_rubrics=set(all_rubrics))
+    baseline_cases = load_cases(args.baseline, known_rubrics=set(all_rubrics))
 
     # A case may narrow the rubrics it is scored on: grading an analysis answer
     # on `grounding` when it retrieved nothing produces a number that means
@@ -109,10 +112,9 @@ def main(argv: list[str] | None = None) -> int:
 
     calibration = calibrate(
         calibration_verdicts,
-        human_labels=human_labels(calibration_cases),
-        rubrics=rubrics,
+        cases=calibration_cases,
+        rubrics=all_rubrics,
         phase=args.phase,
-        case_rubrics=case_rubrics,
     )
     report = evaluate_run(
         baseline_verdicts,
