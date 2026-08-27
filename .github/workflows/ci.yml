@@ -66,6 +66,44 @@ jobs:
       - name: Unit and architecture tests
         run: nix develop --command make test
 
+  integration:
+    name: Integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Section 21.4 orders the gates by cost: nothing starts a container until
+    # lint, mypy and the unit and architecture tests are green.
+    needs: quality
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # The stack is the same one a developer runs, brought up from the same two
+      # files. Service containers would be a second definition of the topology,
+      # and the one that is not TLS-verified.
+      - name: Generate development certificates
+        run: ./scripts/gen_dev_certs.sh
+
+      - name: Generate .env
+        run: python3 scripts/init_dev_env.py
+
+      - name: Validate the combined compose configuration
+        run: docker compose -f docker-compose.yml -f docker-compose.dev.yml config --quiet
+
+      - name: Start the stack
+        run: docker compose -f docker-compose.yml -f docker-compose.dev.yml up --wait
+
+      - name: Run the suite inside the worker
+        run: docker compose -f docker-compose.yml -f docker-compose.dev.yml run --rm worker pytest
+
+      - name: Service logs
+        if: failure()
+        run: docker compose -f docker-compose.yml -f docker-compose.dev.yml logs --no-color
+
+      - name: Stop the stack
+        if: always()
+        run: docker compose -f docker-compose.yml -f docker-compose.dev.yml down --volumes
+
   judge:
     name: LLM-as-judge
     runs-on: ubuntu-latest

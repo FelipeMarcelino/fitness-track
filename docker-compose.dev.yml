@@ -1,0 +1,74 @@
+# Local override. It adds ergonomics and nothing else: ports on the host, the
+# image target that carries the test toolchain, and the source tree mounted so
+# an edit does not need a rebuild.
+#
+# Never deploy with this file. Every port it opens is closed in the base file on
+# purpose (spec 3.1).
+
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:5432:5432"
+
+  redis:
+    ports:
+      - "127.0.0.1:6379:6379"
+
+  qdrant:
+    ports:
+      - "127.0.0.1:6333:6333"
+      - "127.0.0.1:6334:6334"
+
+  langfuse:
+    ports:
+      - "127.0.0.1:3000:3000"
+
+  ingress:
+    build:
+      context: .
+      target: dev
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - type: bind
+        source: ./certs/ca
+        target: /certs
+        read_only: true
+        bind: { create_host_path: false }
+      - ./src:/app/src:ro
+      - ./tests:/app/tests:ro
+      - ./evals:/app/evals:ro
+      - ./scripts:/app/scripts:ro
+      - ./config:/app/config:ro
+
+  worker:
+    build:
+      context: .
+      target: dev
+    volumes:
+      - type: bind
+        source: ./certs/ca
+        target: /certs
+        read_only: true
+        bind: { create_host_path: false }
+      - ./src:/app/src:ro
+      - ./tests:/app/tests:ro
+      - ./evals:/app/evals:ro
+      - ./scripts:/app/scripts:ro
+      - ./config:/app/config:ro
+
+  scheduler:
+    build:
+      context: .
+      target: dev
+    volumes:
+      - type: bind
+        source: ./certs/ca
+        target: /certs
+        read_only: true
+        bind: { create_host_path: false }
+      - ./src:/app/src:ro
+      - ./tests:/app/tests:ro
+      - ./evals:/app/evals:ro
+      - ./scripts:/app/scripts:ro
+      - ./config:/app/config:ro

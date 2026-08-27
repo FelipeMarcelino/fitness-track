@@ -1,0 +1,36 @@
+# Edge. Terminates TLS and forwards to the ingress replicas.
+#
+# FITTRACK_SITE_ADDRESS is the whole switch between local and production: set it
+# to `:80` for a local run, or to the public hostname to have Caddy obtain a
+# certificate automatically. Telegram will not register a webhook without a
+# valid one (spec 3.1).
+
+{
+	admin :2019
+	email {$FITTRACK_ACME_EMAIL:admin@example.com}
+}
+
+{$FITTRACK_SITE_ADDRESS::80} {
+	encode zstd gzip
+
+	# The webhook secret travels in a header, not in the path, so nothing here
+	# needs to know it. Verification belongs to the channel adapter (spec 18.2).
+	handle /webhook/* {
+		reverse_proxy ingress:8000
+	}
+
+	handle /health {
+		reverse_proxy ingress:8000
+	}
+
+	# Nothing else is public: no endpoint may reveal whether a tenant exists
+	# (spec 22, "enumeração de usuários").
+	handle {
+		respond "not found" 404
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}

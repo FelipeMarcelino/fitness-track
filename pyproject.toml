@@ -116,14 +116,19 @@ known-first-party = ["fittrack", "evals"]
 
 [tool.mypy]
 python_version = "3.13"
-files = ["src", "tests", "evals"]
+files = ["src", "tests", "evals", "scripts"]
 strict = true
 warn_unreachable = true
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
-module = ["tests.*", "evals.*"]
+module = ["tests.*", "evals.*", "scripts.*"]
 disallow_untyped_decorators = false
+
+# asyncpg ships neither stubs nor a py.typed marker.
+[[tool.mypy.overrides]]
+module = ["asyncpg.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 minversion = "8.0"

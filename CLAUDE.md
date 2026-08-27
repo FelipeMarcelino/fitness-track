@@ -39,8 +39,30 @@ Quando o devshell não estiver disponível, ou para rodar o que precisa de Postg
 de verdade — que é o caso dos testes de integração da §21.4:
 
 ```bash
-docker compose run --rm worker pytest
+make up               # certificados de dev + .env + sobe a stack e espera ficar saudável
+make test-in-worker   # a suíte inteira dentro do worker, contra os serviços reais
+make down
 ```
+
+Os alvos acima são atalhos para o par de arquivos Compose, que precisa ser sempre passado junto:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dev.yml run --rm worker pytest
+```
+
+**`docker-compose.yml` sozinho é a topologia de produção** — Postgres, Redis, Qdrant e Langfuse não
+publicam porta nenhuma, só o Caddy publica (§3.1). Quem abre porta no host é exclusivamente o
+`docker-compose.dev.yml`. Rodar sem o override não é "mais seguro", é *quebrado*: nada responde em
+`localhost`.
+
+Duas coisas que o `make up` faz por você e são fáceis de errar à mão:
+
+- **`make certs`** gera a CA de desenvolvimento e um certificado por serviço. Os três data stores
+  falam TLS e a aplicação conecta com `sslmode=verify-full` (§22.1). Certificado errado ou conexão
+  em texto claro **falha**, e `tests/integration/test_transit_encryption.py` prova isso nos três.
+- **`make env`** cria o `.env` a partir do `.env.example` **gerando as credenciais locais** e
+  reconstruindo as URLs que dependem delas. Copiar o template à mão deixa `change-me` no
+  `LANGFUSE_ENCRYPTION_KEY`, que o Langfuse rejeita por não ter 64 caracteres hex.
 
 > **Não acrescente o cliente docker ao `shell.nix`.** O comentário no `buildInputs` explica por quê:
 > no WSL o cliente vem da integração do Docker Desktop (`/usr/bin/docker`), e um segundo cliente
@@ -52,17 +74,6 @@ docker compose run --rm worker pytest
 O `shell.nix` inclui `gnumake` de propósito: **`make` dirige `fmt` / `lint` / `typecheck` / `test`**.
 Prefira os alvos dele ao comando solto — é o que o CI chama, e é o que
 garante que "passou local" e "passou no CI" signifiquem a mesma coisa.
-
-### Estado atual
-
-O caminho 1 está de pé: `.envrc`, `pyproject.toml`, `uv.lock`, `Makefile` e `tests/` existem, e
-`make fmt` / `lint` / `typecheck` / `test` rodam. O que ainda falta:
-
-| Falta | Necessário para |
-| --- | --- |
-| `docker-compose.yml` + `Dockerfile` | o caminho 2 (S01-T02) |
-
-Atualize esta tabela conforme cada peça entrar, e apague a seção quando ela esvaziar.
 
 ### `make eval-judge`
 

@@ -1,0 +1,257 @@
+# Production topology (spec 3.1).
+#
+# Only Caddy publishes a port. Postgres, Redis, Qdrant and Langfuse exist on the
+# internal network alone — the local ergonomics of reaching them from the host
+# live in docker-compose.dev.yml, which is the only file that opens them.
+#
+# Images are pinned tag@digest (spec 22, "atualização"): a tag can be moved
+# under the deployment, a digest cannot.
+
+name: fittrack
+
+x-app: &app
+  build:
+    context: .
+    target: runtime
+  image: fittrack-app:local
+  restart: unless-stopped
+  env_file: [.env]
+  environment:
+    DATABASE_URL: ${DATABASE_URL}
+    REDIS_URL: ${REDIS_URL}
+    QDRANT_URL: ${QDRANT_URL}
+    FITTRACK_TLS_CA_FILE: /certs/ca.crt
+  volumes:
+    - type: bind
+      source: ./certs/ca
+      target: /certs
+      read_only: true
+      bind: { create_host_path: false }
+  networks: [internal]
+  depends_on:
+    postgres: {condition: service_healthy}
+    redis: {condition: service_healthy}
+    qdrant: {condition: service_healthy}
+
+services:
+  # --- application ---------------------------------------------------------
+  ingress:
+    <<: *app
+    command: ["uvicorn", "fittrack.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    healthcheck:
+      test: ["CMD", "python", "-m", "fittrack.health", "--http", "http://127.0.0.1:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  worker:
+    <<: *app
+    command: ["python", "-m", "fittrack.worker"]
+    healthcheck:
+      test: ["CMD", "python", "-m", "fittrack.health", "--heartbeat", "/tmp/fittrack-worker.hb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  scheduler:
+    <<: *app
+    command: ["python", "-m", "fittrack.scheduler"]
+    healthcheck:
+      test: ["CMD", "python", "-m", "fittrack.health", "--heartbeat", "/tmp/fittrack-scheduler.hb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # --- data stores ---------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    # The image starts as root and drops to `postgres` itself, so the entrypoint
+    # is the one place where the mounted key can be given the ownership and the
+    # 0600 mode Postgres refuses to start without.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        mkdir -p /etc/pg-certs
+        install -o postgres -g postgres -m 600 /certs/server.key /etc/pg-certs/server.key
+        install -o postgres -g postgres -m 644 /certs/server.crt /etc/pg-certs/server.crt
+        install -o postgres -g postgres -m 644 /certs/ca.crt     /etc/pg-certs/ca.crt
+        exec docker-entrypoint.sh "$$@"
+      - --
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/etc/pg-certs/server.crt
+      - -c
+      - ssl_key_file=/etc/pg-certs/server.key
+      - -c
+      - ssl_ca_file=/etc/pg-certs/ca.crt
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - type: bind
+        source: ./certs/postgres
+        target: /certs
+        read_only: true
+        # Fail loudly if `make certs` has not run: Docker's default is
+        # to create the path, and an empty root-owned directory turns a
+        # missing certificate into an unrelated-looking TLS error.
+        bind: { create_host_path: false }
+      - ./docker/postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+      - ./docker/postgres/initdb:/docker-entrypoint-initdb.d:ro
+    networks: [internal]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  redis:
+    image: redis:7-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
+    restart: unless-stopped
+    # `--port 0` closes the plaintext listener outright: there is no cleartext
+    # hop to fall back to, even inside the compose network (spec 22.1).
+    command:
+      - redis-server
+      - --port
+      - "0"
+      - --tls-port
+      - "6379"
+      - --tls-cert-file
+      - /certs/server.crt
+      - --tls-key-file
+      - /certs/server.key
+      - --tls-ca-cert-file
+      - /certs/ca.crt
+      - --tls-auth-clients
+      - "no"
+      - --appendonly
+      - "yes"
+      - --requirepass
+      - ${REDIS_PASSWORD}
+    volumes:
+      - redis-data:/data
+      - type: bind
+        source: ./certs/redis
+        target: /certs
+        read_only: true
+        # Fail loudly if `make certs` has not run: Docker's default is
+        # to create the path, and an empty root-owned directory turns a
+        # missing certificate into an unrelated-looking TLS error.
+        bind: { create_host_path: false }
+    networks: [internal]
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          redis-cli --tls --cacert /certs/ca.crt -h redis -p 6379
+          -a "$$REDIS_PASSWORD" --no-auth-warning ping | grep -q PONG
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+
+  qdrant:
+    image: qdrant/qdrant:v1.16.1@sha256:db1c735496dfa982ef27576a17b624e48e6b46a140bcdc2ac34e39d186204ef5
+    restart: unless-stopped
+    environment:
+      QDRANT__SERVICE__ENABLE_TLS: "true"
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY}
+      QDRANT__TLS__CERT: /certs/server.crt
+      QDRANT__TLS__KEY: /certs/server.key
+      QDRANT__TLS__CA_CERT: /certs/ca.crt
+    volumes:
+      - qdrant-data:/qdrant/storage
+      - type: bind
+        source: ./certs/qdrant
+        target: /certs
+        read_only: true
+        # Fail loudly if `make certs` has not run: Docker's default is
+        # to create the path, and an empty root-owned directory turns a
+        # missing certificate into an unrelated-looking TLS error.
+        bind: { create_host_path: false }
+    networks: [internal]
+    # The image ships neither curl nor wget, so the probe confirms the listener
+    # rather than the HTTP layer. `--wait` plus the application's own startup
+    # check is what proves Qdrant actually answers.
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/6333"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # --- observability -------------------------------------------------------
+  langfuse:
+    image: langfuse/langfuse:2@sha256:85c278dcab96c15db94191a5c1664f85aba2d7fb6771a00e99681c902c4b7015
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: ${LANGFUSE_DATABASE_URL}
+      NEXTAUTH_URL: ${LANGFUSE_NEXTAUTH_URL}
+      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET}
+      SALT: ${LANGFUSE_SALT}
+      ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY}
+      TELEMETRY_ENABLED: "false"
+      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "false"
+    networks: [internal]
+    depends_on:
+      postgres: {condition: service_healthy}
+    healthcheck:
+      # Next.js binds to the container hostname, not to loopback, so probing
+      # 127.0.0.1 gets a connection refused from a perfectly healthy service.
+      test: ["CMD-SHELL", "wget -qO- \"http://$$(hostname):3000/api/public/health\" >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+
+  # --- edge ----------------------------------------------------------------
+  caddy:
+    image: caddy:2.10-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
+    restart: unless-stopped
+    # The only published service. Telegram requires HTTPS with a valid
+    # certificate on the webhook, which Caddy obtains on its own (spec 3.1).
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      FITTRACK_SITE_ADDRESS: ${FITTRACK_SITE_ADDRESS}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks: [internal]
+    depends_on:
+      ingress: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:2019/config/"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  redis-data:
+  qdrant-data:
+  caddy-data:
+  caddy-config:
