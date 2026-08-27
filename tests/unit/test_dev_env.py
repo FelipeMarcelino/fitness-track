@@ -39,10 +39,14 @@ def test_the_langfuse_encryption_key_is_64_hex_characters(rendered: dict[str, st
     assert re.fullmatch(r"[0-9a-f]{64}", rendered["LANGFUSE_ENCRYPTION_KEY"])
 
 
-def test_the_database_url_carries_the_generated_password(rendered: dict[str, str]) -> None:
+def test_the_owner_url_carries_the_generated_postgres_password(
+    rendered: dict[str, str],
+) -> None:
+    """Only the migration URL. The application connects as a different principal."""
     password = rendered["POSTGRES_PASSWORD"]
     assert password and PLACEHOLDER not in password
-    assert f":{password}@postgres:5432" in rendered["DATABASE_URL"]
+    assert f":{password}@postgres:5432" in rendered["MIGRATION_DATABASE_URL"]
+    assert password not in rendered["DATABASE_URL"]
 
 
 def test_langfuse_gets_its_own_credential(rendered: dict[str, str]) -> None:
@@ -51,6 +55,16 @@ def test_langfuse_gets_its_own_credential(rendered: dict[str, str]) -> None:
     assert password and PLACEHOLDER not in password
     assert rendered["LANGFUSE_DATABASE_URL"].startswith(f"postgresql://langfuse:{password}@")
     assert rendered["POSTGRES_PASSWORD"] not in rendered["LANGFUSE_DATABASE_URL"]
+
+
+def test_the_application_url_uses_the_unprivileged_principal(
+    rendered: dict[str, str],
+) -> None:
+    """Spec 19.1: connecting as the owner would leave RLS in place, unevaluated."""
+    password = rendered["FITTRACK_RUNTIME_PASSWORD"]
+    assert password and PLACEHOLDER not in password
+    assert rendered["DATABASE_URL"].startswith(f"postgresql+asyncpg://fittrack_runtime:{password}@")
+    assert rendered["POSTGRES_PASSWORD"] not in rendered["DATABASE_URL"]
 
 
 def test_the_database_url_keeps_verifying_the_certificate(rendered: dict[str, str]) -> None:
@@ -117,7 +131,7 @@ def test_a_volume_bound_credential_is_preserved_on_a_plain_regeneration() -> Non
     second = render_env(template, previous=parse(first))
 
     kept = parse(second)
-    for name in ("POSTGRES_PASSWORD", "LANGFUSE_DB_PASSWORD"):
+    for name in ("POSTGRES_PASSWORD", "FITTRACK_RUNTIME_PASSWORD", "LANGFUSE_DB_PASSWORD"):
         assert kept[name] == parse(first)[name], name
 
 
@@ -145,7 +159,8 @@ def test_the_derived_urls_follow_a_preserved_password() -> None:
     template = TEMPLATE.read_text(encoding="utf-8")
     first = parse(render_env(template))
     second = parse(render_env(template, previous=first))
-    assert f":{second['POSTGRES_PASSWORD']}@postgres:5432" in second["DATABASE_URL"]
+    assert f":{second['POSTGRES_PASSWORD']}@postgres:5432" in second["MIGRATION_DATABASE_URL"]
+    assert second["MIGRATION_DATABASE_URL"] == first["MIGRATION_DATABASE_URL"]
     assert second["DATABASE_URL"] == first["DATABASE_URL"]
     assert second["LANGFUSE_DATABASE_URL"] == first["LANGFUSE_DATABASE_URL"]
 
@@ -362,3 +377,46 @@ def test_an_empty_required_value_is_refused(tmp_path: Path) -> None:
     output.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     assert main(["--template", str(TEMPLATE), "--output", str(output)]) == 1
+
+
+def test_a_stale_derived_url_is_refused(tmp_path: Path) -> None:
+    """The upgrade case: a complete `.env` whose DATABASE_URL predates the split.
+
+    It names the schema owner, so every service would connect as a principal
+    that bypasses RLS — and nothing downstream would ever complain.
+    """
+    from scripts.init_dev_env import main
+
+    output = tmp_path / ".env"
+    assert main(["--template", str(TEMPLATE), "--output", str(output)]) == 0
+
+    values = parse(output.read_text(encoding="utf-8"))
+    owner_url = values["DATABASE_URL"].replace(
+        f"fittrack_runtime:{values['FITTRACK_RUNTIME_PASSWORD']}",
+        f"fittrack:{values['POSTGRES_PASSWORD']}",
+    )
+    lines = [
+        f"DATABASE_URL={owner_url}" if line.startswith("DATABASE_URL=") else line
+        for line in output.read_text(encoding="utf-8").splitlines()
+    ]
+    output.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    assert main(["--template", str(TEMPLATE), "--output", str(output)]) == 1
+
+
+def test_a_forced_regeneration_repairs_a_stale_url(tmp_path: Path) -> None:
+    from scripts.init_dev_env import main
+
+    output = tmp_path / ".env"
+    assert main(["--template", str(TEMPLATE), "--output", str(output)]) == 0
+    lines = [
+        "DATABASE_URL=postgresql+asyncpg://fittrack:old@postgres:5432/fittrack?sslmode=verify-full"
+        if line.startswith("DATABASE_URL=")
+        else line
+        for line in output.read_text(encoding="utf-8").splitlines()
+    ]
+    output.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    assert main(["--template", str(TEMPLATE), "--output", str(output), "--force"]) == 0
+    repaired = parse(output.read_text(encoding="utf-8"))
+    assert repaired["DATABASE_URL"].startswith("postgresql+asyncpg://fittrack_runtime:")

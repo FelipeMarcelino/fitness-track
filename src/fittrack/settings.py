@@ -21,7 +21,7 @@ import json
 import re
 from functools import lru_cache
 from typing import Annotated, Any, Literal, Self
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -43,6 +43,11 @@ WEBHOOK_SECRET_ALPHABET = re.compile(r"^[A-Za-z0-9_-]{1,256}$")
 # update the webhook receives (spec 18.2).
 MIN_WEBHOOK_SECRET_CHARS = 43  # 32 bytes, url-safe base64
 
+# The unprivileged principal the migration provisions (spec 19.1). Named here
+# so a DATABASE_URL that connects as anything else — the owner, most likely —
+# fails at boot rather than silently bypassing every policy.
+RUNTIME_ROLE = "fittrack_runtime"
+
 
 class Settings(BaseSettings):
     """The whole environment contract, validated once per process."""
@@ -56,7 +61,16 @@ class Settings(BaseSettings):
     )
 
     # --- infrastructure ----------------------------------------------------
+    # Two principals (spec 19.1). `database_url` is the runtime one, which is
+    # NOSUPERUSER NOBYPASSRLS and owns nothing — a superuser or a BYPASSRLS role
+    # ignores row level security even with FORCE, leaving the policies in place
+    # and never evaluated. `migration_database_url` is the owner, and runs
+    # migrations only.
     database_url: SecretStr
+    # Optional on purpose. The application must never hold the owner credential
+    # — handing it to the ingress would undo the separation it exists for — so
+    # only the migration runner sets it, and only it requires it.
+    migration_database_url: SecretStr | None = None
     redis_url: SecretStr
     qdrant_url: str
     qdrant_api_key: SecretStr | None = None
@@ -159,24 +173,29 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def _connection_urls_are_encrypted(self) -> Self:
         """Spec 22.1, checked without quoting the DSN — it carries the password."""
-        parsed = urlsplit(self.database_url.get_secret_value())
-        # Structure before parameters: `?sslmode=verify-full` on its own has a
-        # perfectly good sslmode, no scheme, no host and nothing to connect to —
-        # and startup would call that valid.
-        if not parsed.scheme.startswith("postgresql"):
-            raise ValueError("DATABASE_URL must be a postgresql:// URL")
-        if not parsed.hostname:
-            raise ValueError("DATABASE_URL must name a host")
-        if not parsed.path.strip("/"):
-            raise ValueError("DATABASE_URL must name a database")
-        # Parsed, not matched as a substring: `sslmode=verify-full` can appear in
-        # a password, a path or another parameter while the effective one says
-        # `disable`. verify-ca would not do either — it accepts any certificate
-        # this CA signed, which in the compose topology is every service.
-        if _sslmode(self.database_url) != "verify-full":
+        urls = [("DATABASE_URL", self.database_url)]
+        if self.migration_database_url is not None:
+            urls.append(("MIGRATION_DATABASE_URL", self.migration_database_url))
+        for name, dsn in urls:
+            require_verified_postgres(name, dsn)
+
+        # Spec 19.1, checked on DATABASE_URL alone — the application containers
+        # deliberately have no MIGRATION_DATABASE_URL, so a comparison between
+        # the two would never run where it matters most. The owner bypasses RLS
+        # unless FORCE is set, and a superuser or BYPASSRLS role bypasses it
+        # regardless, so a production URL that names the owner leaves every
+        # policy in place and never evaluated. Silent, and therefore checked.
+        if _principal(self.database_url) != RUNTIME_ROLE:
             raise ValueError(
-                "DATABASE_URL must set sslmode=verify-full as its effective query "
-                "parameter (spec 22.1)"
+                f"DATABASE_URL must connect as {RUNTIME_ROLE!r}, the unprivileged principal "
+                "the migration provisions — not as the schema owner (spec 19.1)"
+            )
+        if self.migration_database_url is not None and _principal(self.database_url) == _principal(
+            self.migration_database_url
+        ):
+            raise ValueError(
+                "DATABASE_URL and MIGRATION_DATABASE_URL must not use the same principal: "
+                "the application must never connect as the schema owner (spec 19.1)"
             )
         if not self.redis_url.get_secret_value().startswith("rediss://"):
             raise ValueError("REDIS_URL must use the rediss:// scheme (spec 22.1)")
@@ -328,7 +347,42 @@ def get_settings() -> Settings:
     return Settings()
 
 
+def _principal(dsn: SecretStr) -> str:
+    """The username of a DSN, decoded, without touching the password.
+
+    Decoded because `urlsplit` returns the percent-encoded spelling while the
+    driver decodes before authenticating: `%66ittrack` and `fittrack` are the
+    same role, and comparing the raw forms would let the application URL name
+    the owner and pass the check.
+    """
+    return unquote(urlsplit(dsn.get_secret_value()).username or "")
+
+
 def _sslmode(dsn: SecretStr) -> str | None:
     """The effective `sslmode` of a DSN, or None when it sets none."""
     values = parse_qs(urlsplit(dsn.get_secret_value()).query).get("sslmode")
     return values[-1] if values else None
+
+
+def require_verified_postgres(name: str, dsn: SecretStr) -> None:
+    """Raise unless the DSN verifies both the chain and the hostname.
+
+    Shared so the migration runner cannot take a different view from the
+    application: `verify-ca` accepts any certificate this CA signed, which in
+    the compose topology is every service, and anything weaker verifies nothing.
+    Parsed rather than matched as a substring — `sslmode=verify-full` can sit in
+    a password or another parameter while the effective one says `disable`.
+    """
+    parsed = urlsplit(dsn.get_secret_value())
+    # Structure before parameters: `?sslmode=verify-full` on its own has a
+    # perfectly good sslmode, no scheme, no host and nothing to connect to.
+    if not parsed.scheme.startswith("postgresql"):
+        raise ValueError(f"{name} must be a postgresql:// URL")
+    if not parsed.hostname:
+        raise ValueError(f"{name} must name a host")
+    if not parsed.path.strip("/"):
+        raise ValueError(f"{name} must name a database")
+    if _sslmode(dsn) != "verify-full":
+        raise ValueError(
+            f"{name} must set sslmode=verify-full as its effective query parameter (spec 22.1)"
+        )
