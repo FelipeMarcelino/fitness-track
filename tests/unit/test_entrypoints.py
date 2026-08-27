@@ -10,14 +10,28 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+import pytest
 from starlette.testclient import TestClient
 
 from fittrack.main import app
 from fittrack.scheduler import run as run_scheduler
 from fittrack.worker import run as run_worker
+from tests.unit.test_startup import environment
 
 
-def test_the_ingress_answers_its_health_probe() -> None:
+@pytest.fixture
+def valid_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The ingress validates its configuration before serving, so give it one."""
+    import os
+
+    for name in list(os.environ):
+        if name.startswith(("FITTRACK_", "DATABASE_", "REDIS_", "QDRANT_", "TELEGRAM_", "WABA_")):
+            monkeypatch.delenv(name, raising=False)
+    for name, value in environment().items():
+        monkeypatch.setenv(name, value)
+
+
+def test_the_ingress_answers_its_health_probe(valid_environment: None) -> None:
     with TestClient(app) as client:
         response = client.get("/health")
     assert response.status_code == 200

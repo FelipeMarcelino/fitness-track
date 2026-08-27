@@ -59,6 +59,8 @@ COMPOSE_DEV := $(COMPOSE) -f docker-compose.yml -f docker-compose.dev.yml
 certs: ## Generate the development CA and the per-service certificates
 	./scripts/gen_dev_certs.sh $(ARGS)
 
+# Regenerating .env changes POSTGRES_PASSWORD, and Postgres only reads it on
+# first boot — an existing volume keeps the old one. `make reset` is the way out.
 env: ## Create .env from the template, generating the local credentials
 	@$(PYTHON) -m scripts.init_dev_env $(ARGS)
 

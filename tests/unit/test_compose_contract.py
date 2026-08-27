@@ -236,6 +236,43 @@ APP_ENV_ALLOWLIST = {
     "QDRANT_API_KEY",
     "FITTRACK_TLS_CA_FILE",
     "FITTRACK_CONFIG_DIR",
+    # Required by `fittrack.startup`, which every service runs before serving.
+    "FITTRACK_CHANNELS",
+    "FITTRACK_ENCRYPTION_KEYS",
+    "FITTRACK_ACTIVE_KEY_VERSION",
+    "FITTRACK_IDENTITY_PEPPER",
+    # Listing a channel is a promise startup checks, so what backs the promise
+    # has to arrive with it.
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_MODE",
+    "TELEGRAM_WEBHOOK_SECRET",
+    "TELEGRAM_WEBHOOK_URL",
+    "WABA_PHONE_NUMBER_ID",
+    "WABA_TOKEN",
+    "WABA_APP_SECRET",
+    "WABA_VERIFY_TOKEN",
+    # Behaviour settings the services validate; unreachable means unenforced.
+    "SESSION_IDLE_TIMEOUT_MIN",
+    "SESSION_MAX_DURATION_MIN",
+    "DEBOUNCE_WINDOW_S",
+    "INTERRUPT_TTL_MIN",
+    "ACK_CONFIDENCE_THRESHOLD",
+    "CHANNEL_LINK_TTL_MIN",
+    "GRAPH_RECURSION_LIMIT",
+    "CHECKPOINT_RETENTION_DAYS",
+}
+
+# What must stay out: a compromise of the public ingress should not hand over
+# credentials that belong to other services.
+APP_ENV_FORBIDDEN = {
+    "ANTHROPIC_API_KEY",
+    "GROQ_API_KEY",
+    "OPENAI_API_KEY",
+    "POSTGRES_PASSWORD",
+    "LANGFUSE_ENCRYPTION_KEY",
+    "LANGFUSE_NEXTAUTH_SECRET",
+    "MERCADOPAGO_ACCESS_TOKEN",
+    "MERCADOPAGO_WEBHOOK_SECRET",
 }
 
 
@@ -260,6 +297,23 @@ def test_application_services_declare_only_what_they_read(
     declared = set(base["services"][service].get("environment", {}))
     extra = declared - APP_ENV_ALLOWLIST
     assert not extra, f"{service} receives {sorted(extra)}, which nothing in it reads yet"
+
+
+def test_an_enabled_channel_has_its_credentials_in_the_topology(
+    base: dict[str, Any],
+) -> None:
+    """Otherwise every service refuses to boot the moment a channel is enabled."""
+    declared = set(base["services"]["ingress"]["environment"])
+    assert {"FITTRACK_CHANNELS", "TELEGRAM_BOT_TOKEN", "TELEGRAM_MODE"} <= declared
+
+
+@pytest.mark.parametrize("service", sorted(APP_SERVICES))
+def test_no_application_service_receives_another_service_secret(
+    base: dict[str, Any], service: str
+) -> None:
+    declared = set(base["services"][service].get("environment", {}))
+    leaked = declared & APP_ENV_FORBIDDEN
+    assert not leaked, f"{service} receives {sorted(leaked)}"
 
 
 @pytest.mark.parametrize("service", sorted(ALL_SERVICES))

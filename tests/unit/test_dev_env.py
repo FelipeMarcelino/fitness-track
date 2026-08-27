@@ -74,7 +74,9 @@ def test_provider_credentials_stay_empty(rendered: dict[str, str]) -> None:
 
 
 def test_non_secret_settings_are_left_alone(rendered: dict[str, str]) -> None:
-    assert rendered["FITTRACK_CHANNELS"] == "telegram"
+    # Empty in the template: listing a channel is a promise its credentials
+    # exist, and this sprint ships no Telegram adapter to hold it.
+    assert rendered["FITTRACK_CHANNELS"] == ""
     assert rendered["DEBOUNCE_WINDOW_S"] == "10"
     assert rendered["FITTRACK_ACTIVE_KEY_VERSION"] == "1"
 
@@ -266,5 +268,97 @@ def test_a_url_still_carrying_a_placeholder_is_refused(tmp_path: Path) -> None:
     output = tmp_path / ".env"
     output.write_text(TEMPLATE.read_text(encoding="utf-8"), encoding="utf-8")
     output.chmod(0o600)
+
+    assert main(["--template", str(TEMPLATE), "--output", str(output)]) == 1
+
+
+# The cryptographic contract (spec 22.2) has to be satisfiable locally
+# --------------------------------------------------------------------------- #
+
+
+def test_the_generated_keyring_is_a_valid_json_map(rendered: dict[str, str]) -> None:
+    import base64
+    import json
+
+    keyring = json.loads(rendered["FITTRACK_ENCRYPTION_KEYS"])
+    assert set(keyring) == {"1"}
+    assert len(base64.b64decode(keyring["1"], validate=True)) == 32
+
+
+def test_the_active_version_points_into_the_generated_keyring(
+    rendered: dict[str, str],
+) -> None:
+    import json
+
+    assert rendered["FITTRACK_ACTIVE_KEY_VERSION"] in json.loads(
+        rendered["FITTRACK_ENCRYPTION_KEYS"]
+    )
+
+
+def test_the_pepper_is_independent_of_the_keyring(rendered: dict[str, str]) -> None:
+    """They rotate by separate procedures; shared material would couple them."""
+    pepper = rendered["FITTRACK_IDENTITY_PEPPER"]
+    assert pepper
+    assert pepper not in rendered["FITTRACK_ENCRYPTION_KEYS"]
+
+
+def test_the_rendered_env_satisfies_the_settings_contract(rendered: dict[str, str]) -> None:
+    """The end-to-end point of the generator: `make env` produces a bootable process."""
+    import os
+
+    from fittrack.settings import Settings
+
+    with pytest.MonkeyPatch.context() as patch:
+        for name in list(os.environ):
+            patch.delenv(name, raising=False)
+        for name, value in rendered.items():
+            patch.setenv(name, value)
+        settings = Settings(_env_file=None)
+
+    assert settings.active_key_version in settings.encryption_keys
+    assert settings.channels == ()
+
+
+def test_the_encryption_material_survives_a_plain_regeneration() -> None:
+    """A new keyring cannot read old ciphertext; a new pepper strands every lookup."""
+    template = TEMPLATE.read_text(encoding="utf-8")
+    first = parse(render_env(template))
+    second = parse(render_env(template, previous=first))
+    assert second["FITTRACK_ENCRYPTION_KEYS"] == first["FITTRACK_ENCRYPTION_KEYS"]
+    assert second["FITTRACK_IDENTITY_PEPPER"] == first["FITTRACK_IDENTITY_PEPPER"]
+
+
+def test_a_copied_placeholder_is_not_preserved_as_key_material(tmp_path: Path) -> None:
+    """The common starting state: `.env.example` copied verbatim.
+
+    Preserving `change-me` under a volume-bound name would look like careful key
+    handling and leave the keyring unparseable, so every service fails startup.
+    """
+    from scripts.init_dev_env import main
+
+    output = tmp_path / ".env"
+    output.write_text(TEMPLATE.read_text(encoding="utf-8"), encoding="utf-8")
+
+    assert main(["--template", str(TEMPLATE), "--output", str(output), "--force"]) == 0
+    kept = parse(output.read_text(encoding="utf-8"))
+    assert PLACEHOLDER not in kept["FITTRACK_ENCRYPTION_KEYS"]
+    assert PLACEHOLDER not in kept["POSTGRES_PASSWORD"]
+
+
+def test_an_empty_required_value_is_refused(tmp_path: Path) -> None:
+    """A `.env` from an older revision carries the name with no value.
+
+    Neither missing nor a placeholder — and it still fails startup.
+    """
+    from scripts.init_dev_env import main
+
+    output = tmp_path / ".env"
+    assert main(["--template", str(TEMPLATE), "--output", str(output)]) == 0
+
+    lines = [
+        "FITTRACK_ENCRYPTION_KEYS=" if line.startswith("FITTRACK_ENCRYPTION_KEYS=") else line
+        for line in output.read_text(encoding="utf-8").splitlines()
+    ]
+    output.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     assert main(["--template", str(TEMPLATE), "--output", str(output)]) == 1
