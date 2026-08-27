@@ -50,23 +50,43 @@ docker compose run --rm worker pytest
 ### `make` é quem dirige
 
 O `shell.nix` inclui `gnumake` de propósito: **`make` dirige `fmt` / `lint` / `typecheck` / `test`**.
-Quando o `Makefile` existir, prefira os alvos dele ao comando solto — é o que o CI chama, e é o que
+Prefira os alvos dele ao comando solto — é o que o CI chama, e é o que
 garante que "passou local" e "passou no CI" signifiquem a mesma coisa.
 
 ### Estado atual
 
-O esqueleto da Fase 1.0 ainda não existe na árvore. Os comandos acima são o contrato do ambiente;
-o que falta para eles rodarem de ponta a ponta:
+O caminho 1 está de pé: `.envrc`, `pyproject.toml`, `uv.lock`, `Makefile` e `tests/` existem, e
+`make fmt` / `lint` / `typecheck` / `test` rodam. O que ainda falta:
 
 | Falta | Necessário para |
 | --- | --- |
-| `.envrc` (conteúdo: `use flake`) | `direnv allow .` — sem ele o direnv não tem o que carregar |
-| `pyproject.toml` | `uv sync`, e o pytest ter o que instalar |
-| `tests/` | `pytest` ter o que rodar |
-| `Makefile` | os alvos `fmt` / `lint` / `typecheck` / `test` |
-| `docker-compose.yml` + `Dockerfile` | o caminho 2 |
+| `docker-compose.yml` + `Dockerfile` | o caminho 2 (S01-T02) |
 
 Atualize esta tabela conforme cada peça entrar, e apague a seção quando ela esvaziar.
+
+### `make eval-judge`
+
+O quinto alvo é o LLM-as-judge da §21.2, e ele tem dois modos, de propósito:
+
+| Modo | Onde | Credencial ausente |
+| --- | --- | --- |
+| Tolerante — `make eval-judge` | local | Relata "judge não executado" e sai com 0 |
+| Estrito — `--backend anthropic` | CI | Sai com 1 |
+
+A diferença não é conveniência: reprovar uma PR por falta de credencial *local* seria ruído, mas um
+*required check* verde diria que segurança e fidelidade numérica foram avaliadas quando ninguém
+avaliou. A política completa (o que bloqueia, o que vira tendência, o que descarta a rodada) está em
+`evals/rubrics/README.md`.
+
+> ⚠️ **O portão está suspenso** — [ADR-0002](doc/adr/0002-portao-do-judge-suspenso.md). A conta
+> Anthropic não tem saldo, então o job roda, falha e **não** reprova o merge. Ele continua vermelho
+> no PR; o que se perdeu foi o veto, não a visibilidade. A reversão é uma linha no `ci.yml`.
+
+Para reavaliar uma rodada gravada, sem rede e sem credencial:
+
+```bash
+python -m evals.run_judge --backend replay --verdicts <arquivo.jsonl>
+```
 
 ## O que é o FitTrack
 

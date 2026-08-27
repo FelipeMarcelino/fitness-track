@@ -1,0 +1,72 @@
+# Tiering de LLM por papel (spec §7.2). Recarregável sem redeploy: o gateway
+# relê este arquivo a cada 60s ou por SIGHUP.
+#
+# **Nomes de modelo vivem só aqui.** Nenhum agente instancia cliente de provider
+# diretamente, e nenhum nome de modelo aparece em código Python — é o invariante
+# 4 do CLAUDE.md, verificado por `tests/unit/test_judge_config.py`.
+#
+# Os dois tiers são o mesmo modelo primário com `reasoning_effort` diferente,
+# conforme o ADR-0001.
+
+roles:
+  # --- tier rápido: altíssimo volume, classificação e transformação barata ---
+  NORMALIZER:
+    primary: { provider: groq, model: openai/gpt-oss-120b, reasoning_effort: low, temperature: 0.0 }
+    fallback: { provider: anthropic, model: claude-haiku-4-5 }
+    timeout_s: 30
+
+  ROUTER:
+    primary: { provider: groq, model: openai/gpt-oss-120b, reasoning_effort: low, temperature: 0.0 }
+    fallback: { provider: anthropic, model: claude-haiku-4-5 }
+    timeout_s: 30
+
+  EXTRACTOR:
+    primary: { provider: groq, model: openai/gpt-oss-120b, reasoning_effort: low, temperature: 0.0 }
+    fallback: { provider: anthropic, model: claude-haiku-4-5 }
+    timeout_s: 30
+
+  RESOLVER:
+    primary: { provider: groq, model: openai/gpt-oss-120b, reasoning_effort: low, temperature: 0.0 }
+    fallback: { provider: anthropic, model: claude-haiku-4-5 }
+    timeout_s: 30
+
+  VOICE:
+    primary: { provider: groq, model: openai/gpt-oss-120b, reasoning_effort: low, temperature: 0.3 }
+    fallback: { provider: anthropic, model: claude-haiku-4-5 }
+    timeout_s: 30
+
+  GUARDRAIL:
+    primary: { provider: groq, model: openai/gpt-oss-120b, reasoning_effort: low, temperature: 0.0 }
+    fallback: { provider: anthropic, model: claude-haiku-4-5 }
+    timeout_s: 30
+
+  SUMMARY:
+    primary: { provider: groq, model: openai/gpt-oss-120b, reasoning_effort: low, temperature: 0.3 }
+    fallback: { provider: anthropic, model: claude-haiku-4-5 }
+    timeout_s: 60
+
+  # --- tier de raciocínio: volume baixo, custo alto por chamada --------------
+  ANALYST:
+    primary: { provider: groq, model: openai/gpt-oss-120b, reasoning_effort: high, temperature: 0.3 }
+    fallback: { provider: anthropic, model: claude-opus-5, effort: high }
+    timeout_s: 120
+
+  COACH:
+    primary: { provider: groq, model: openai/gpt-oss-120b, reasoning_effort: high, temperature: 0.3 }
+    fallback: { provider: anthropic, model: claude-opus-5, effort: high }
+    timeout_s: 120
+
+  # --- offline ---------------------------------------------------------------
+  # O JUDGE não tem primário de propósito: um juiz rodando no mesmo modelo que
+  # produziu a resposta não é juiz, e o AD-33 depende de o veredito ser
+  # independente (§7.2).
+  JUDGE:
+    primary: null
+    fallback: { provider: anthropic, model: claude-opus-5, effort: high }
+    timeout_s: 120
+
+# Override parcial por agente (§7.2.1). Recomendação para a fase 1.0: nenhum.
+# Dez papéis, zero exceções, e a medição de agent_cost_usd_total{agent} dizendo
+# onde a exceção se paga. Um agente com override sai do guarda-chuva do papel
+# também na avaliação e precisa da própria linha no golden set.
+agents: {}
