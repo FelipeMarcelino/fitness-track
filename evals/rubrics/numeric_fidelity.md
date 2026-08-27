@@ -11,32 +11,34 @@ since_phase: "1.0"
 
 ## Critério
 
-Todo número citado na resposta aparece em algum resultado de tool fornecido no caso?
+Todo número citado na resposta tem origem rastreável no caso?
 
 O invariante central do sistema (§1.1) é que o LLM não faz aritmética: ele escolhe a tool e narra o
 resultado. Um número no texto que não veio de um resultado de tool é bug, não estilo — mesmo que
 esteja *correto*, porque significa que o modelo calculou em vez de consultar.
 
-O que esta rubrica julga é **medida**, não prescrição. O invariante da §1.1 fala de métrica —
-volume, e1RM, tendência, frequência — e é sobre ela que o veto existe. Três origens são legítimas, e
-qualquer outra é invenção:
+Todo número citado precisa de **origem rastreável**. São exatamente três, e não há uma quarta:
 
 | Origem | Exemplo | Condição |
 | --- | --- | --- |
-| Resultado de tool | "seu e1RM está em 96.2 kg" | A única origem válida para **medida**. |
-| A mensagem do usuário | "os 80 kg que você fez agora" | A resposta apenas repete o que o usuário disse. |
-| A própria prescrição | "3 séries de 8", "bloco de 12 semanas em 3 fases" | Só quando o número é **prescrito**, e o texto o apresenta como tal — não como medida. |
+| Resultado de tool | "seu e1RM está em 96.2 kg"; "põe 105.0 kg em 6 a 8 reps" | A única origem válida para **medida**, e a origem esperada de uma prescrição: `estimate_next_load` devolve `suggested_load_kg` e `target_reps`. |
+| A mensagem do usuário | "os 80 kg que você fez agora"; "o bloco de 12 semanas que você pediu" | A resposta apenas repete o que o usuário disse. |
+| Um trecho recuperado | "a literatura costuma indicar de 10 a 20 séries" | Só com **atribuição** explícita. Sem ela, é invenção. |
 
-Um número recuperado do RAG **não** é uma dessas: se a resposta cita uma faixa da literatura, ela
-tem de atribuí-la ("a literatura costuma indicar…"), e ainda assim a rubrica a trata como
-prescrição, nunca como medida do usuário.
+**Não existe isenção por "isto é uma prescrição".** Um número prescrito sem nenhuma das três
+origens é invenção e recebe 1, exatamente como uma medida inventada — senão bastaria enquadrar
+qualquer carga arbitrária como sugestão para passar pelo portão.
+
+A única exceção é estreita e tem dono: a **decomposição de um plano que a própria resposta está
+produzindo** — quantas fases tem um bloco e quantas semanas cada uma — não é julgada aqui. Quem
+valida isso é o `program_validator` (§9.9), que confere de forma determinística que a soma das
+fases bate com o horizonte e que há deload quando é devido. Um crítico determinístico com gabarito
+faz esse trabalho melhor que um juiz. O **horizonte** em si continua precisando de origem: se o
+usuário não pediu um número de semanas e nenhuma tool o devolveu, ele é invenção.
 
 Contam como medida: cargas, repetições e séries **executadas**, volume, e1RM, percentuais de
 variação, contagens de sessão, intervalos de dias e semanas. Não contam: ordinais de enumeração
 ("1.", "2.") e datas repetidas de um resultado de tool.
-
-Esta rubrica é redundante com o `numeric_critic` (§9.9) **de propósito**: o crítico protege
-produção, o judge detecta a regressão de prompt que faria o crítico começar a vetar.
 
 ## Escala
 

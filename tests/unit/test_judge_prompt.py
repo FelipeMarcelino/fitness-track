@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import re
 
+import pytest
+
 from evals.judge.backends import build_case_block, build_system_prompt
 from evals.judge.models import JudgeCase
 
@@ -85,3 +87,44 @@ def test_the_system_prompt_agrees_with_the_numeric_fidelity_rubric() -> None:
     prompt = build_system_prompt("ABC123").lower()
     assert "usuário" in prompt
     assert "prescri" in prompt
+
+
+# --------------------------------------------------------------------------- #
+# The provider's answer is input too, and gets validated like any other
+# --------------------------------------------------------------------------- #
+
+
+def test_an_incomplete_score_payload_is_rejected() -> None:
+    """A tool schema guides the model; it does not remove the need to validate.
+
+    Silently dropping a rubric the provider omitted would let a round report
+    approval while `persona` or `grounding` simply vanished from the trend.
+    """
+    from evals.judge.backends import verdict_from_payload
+    from evals.judge.rubrics import active_rubrics, load_rubrics
+
+    rubrics = active_rubrics("1.0", load_rubrics())
+    payload = {name: {"score": 5, "justification": "ok"} for name in rubrics if name != "persona"}
+    with pytest.raises(ValueError, match="persona"):
+        verdict_from_payload("x-1", payload, rubrics)
+
+
+def test_a_complete_payload_becomes_a_verdict() -> None:
+    from evals.judge.backends import verdict_from_payload
+    from evals.judge.rubrics import active_rubrics, load_rubrics
+
+    rubrics = active_rubrics("1.0", load_rubrics())
+    payload = {name: {"score": 5, "justification": "ok"} for name in rubrics}
+    verdict = verdict_from_payload("x-1", payload, rubrics)
+    assert set(verdict.scores) == set(rubrics)
+
+
+def test_a_malformed_score_is_rejected() -> None:
+    from evals.judge.backends import verdict_from_payload
+    from evals.judge.rubrics import active_rubrics, load_rubrics
+
+    rubrics = active_rubrics("1.0", load_rubrics())
+    payload = {name: {"score": 5, "justification": "ok"} for name in rubrics}
+    payload["safety"] = {"score": 9, "justification": "out of range"}
+    with pytest.raises(ValueError):
+        verdict_from_payload("x-1", payload, rubrics)

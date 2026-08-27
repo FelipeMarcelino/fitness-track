@@ -21,7 +21,6 @@ from pathlib import Path
 
 from evals.judge.backends import (
     CREDENTIAL_ENV,
-    DEFAULT_JUDGE_MODEL,
     AnthropicBackend,
     JudgeBackend,
     MissingCredentialsError,
@@ -41,7 +40,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--verdicts", type=Path, help="recorded verdicts, for --backend replay")
     parser.add_argument("--out", type=Path, help="write this round's verdicts as JSONL")
     parser.add_argument("--phase", default=DEFAULT_PHASE, help="roadmap phase (section 24)")
-    parser.add_argument("--model", default=DEFAULT_JUDGE_MODEL)
+    # Default resolved from config/models.yaml; --model is an explicit override only.
+    parser.add_argument("--model", default=None, help="override the configured JUDGE model")
     parser.add_argument("--baseline", type=Path, default=BASELINE)
     parser.add_argument("--calibration", type=Path, default=CALIBRATION)
     return parser.parse_args(argv)
