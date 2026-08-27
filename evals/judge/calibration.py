@@ -65,9 +65,18 @@ def calibrate(
     applicable = active_rubrics(phase, rubrics)
     by_id = {case.id: case for case in cases}
 
+    if len(cases) != CALIBRATION_SIZE:
+        # Two agreeing cases are a coincidence, not calibration; an empty set
+        # would report 0/0 and hand the judge a clean bill of health.
+        raise ValueError(f"calibration needs exactly {CALIBRATION_SIZE} cases, got {len(cases)}")
+
     missing = [case.id for case in cases if not case.human_scores]
     if missing:
         raise ValueError(f"calibration cases without a human grade: {sorted(missing)}")
+
+    unscored = sorted({case.id for case in cases} - {verdict.case_id for verdict in verdicts})
+    if unscored:
+        raise ValueError(f"calibration cases with no verdict: {unscored}")
 
     declared = {case.id: case.rubrics for case in cases if case.rubrics}
     mismatches = [

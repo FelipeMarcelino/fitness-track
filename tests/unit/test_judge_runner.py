@@ -128,3 +128,51 @@ def test_the_runner_gates_each_case_on_its_declared_rubrics(tmp_path: Path) -> N
     narrow = next(c for c in baseline if "grounding" not in c.rubrics)
     path = write_verdicts(tmp_path / "v.jsonl", {narrow.id: {"grounding": 1}})
     assert run(path) == 0
+
+
+def test_a_replayed_verdict_missing_a_rubric_is_rejected(tmp_path: Path) -> None:
+    """The replay path validates like the live one, or the two disagree.
+
+    An older recording that predates a rubric would otherwise pass while that
+    rubric silently vanished from the trend — and, for a blocking rubric, while
+    the gate stopped gating.
+    """
+    path = write_verdicts(tmp_path / "v.jsonl")
+    lines = path.read_text(encoding="utf-8").splitlines()
+    first = json.loads(lines[0])
+    del first["scores"]["persona"]
+    lines[0] = json.dumps(first)
+    path.write_text("\n".join(lines), encoding="utf-8")
+    with pytest.raises(ValueError, match="persona"):
+        run(path)
+
+
+def test_an_undersized_calibration_set_is_refused(tmp_path: Path) -> None:
+    """Two of two agreeing is not calibration; it is a coincidence."""
+    import shutil
+
+    small = tmp_path / "calibration.jsonl"
+    lines = CALIBRATION.read_text(encoding="utf-8").splitlines()[:2]
+    small.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    shutil.copy(BASELINE, tmp_path / "baseline.jsonl")
+
+    verdicts = write_verdicts(tmp_path / "v.jsonl")
+    with pytest.raises(ValueError, match="20"):
+        main(
+            [
+                "--backend",
+                "replay",
+                "--verdicts",
+                str(verdicts),
+                "--calibration",
+                str(small),
+            ]
+        )
+
+
+def test_an_empty_calibration_set_is_refused(tmp_path: Path) -> None:
+    empty = tmp_path / "calibration.jsonl"
+    empty.write_text("", encoding="utf-8")
+    verdicts = write_verdicts(tmp_path / "v.jsonl")
+    with pytest.raises(ValueError, match="20"):
+        main(["--backend", "replay", "--verdicts", str(verdicts), "--calibration", str(empty)])

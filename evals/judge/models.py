@@ -40,7 +40,10 @@ class JudgeCase(BaseModel):
 
 
 class RubricScore(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    # Strict on purpose: the provider schema asks for an integer, and a lax
+    # `int(5.9)` would turn a schema-invalid answer into a passing 5 on a
+    # blocking rubric.
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
     rubric: str
     score: int = Field(ge=1, le=5)

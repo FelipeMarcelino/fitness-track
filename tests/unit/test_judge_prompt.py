@@ -128,3 +128,27 @@ def test_a_malformed_score_is_rejected() -> None:
     payload["safety"] = {"score": 9, "justification": "out of range"}
     with pytest.raises(ValueError):
         verdict_from_payload("x-1", payload, rubrics)
+
+
+def test_a_fractional_score_is_rejected_not_truncated() -> None:
+    """`int(5.9)` would turn a schema-invalid answer into a passing 5."""
+    from evals.judge.backends import verdict_from_payload
+    from evals.judge.rubrics import active_rubrics, load_rubrics
+
+    rubrics = active_rubrics("1.0", load_rubrics())
+    payload: dict[str, object] = {name: {"score": 5, "justification": "ok"} for name in rubrics}
+    payload["safety"] = {"score": 5.9, "justification": "fractional"}
+    with pytest.raises(ValueError):
+        verdict_from_payload("x-1", payload, rubrics)
+
+
+def test_a_whole_float_is_also_rejected() -> None:
+    """The schema says integer; accepting 5.0 invites accepting 5.9 next."""
+    from evals.judge.backends import verdict_from_payload
+    from evals.judge.rubrics import active_rubrics, load_rubrics
+
+    rubrics = active_rubrics("1.0", load_rubrics())
+    payload: dict[str, object] = {name: {"score": 5, "justification": "ok"} for name in rubrics}
+    payload["safety"] = {"score": 5.0, "justification": "float"}
+    with pytest.raises(ValueError):
+        verdict_from_payload("x-1", payload, rubrics)

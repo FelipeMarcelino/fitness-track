@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import yaml
+from pydantic import ValidationError as PydanticValidationError
 
 from evals.judge.models import CaseVerdict, JudgeCase, RubricScore
 from evals.judge.rubrics import Rubric
@@ -131,17 +132,33 @@ def verdict_from_payload(
     missing = sorted(set(rubrics) - set(payload))
     if missing:
         raise ValueError(f"case {case_id!r}: judge omitted rubric(s) {', '.join(missing)}")
-    return CaseVerdict(
-        case_id=case_id,
-        scores={
-            name: RubricScore(
-                rubric=name,
-                score=int(payload[name]["score"]),
-                justification=str(payload[name]["justification"]),
-            )
-            for name in rubrics
-        },
-    )
+    try:
+        return CaseVerdict(
+            case_id=case_id,
+            scores={
+                name: RubricScore.model_validate(
+                    {"rubric": name, **dict(payload[name])}  # raw score, strictly validated
+                )
+                for name in rubrics
+            },
+        )
+    except PydanticValidationError as error:
+        raise ValueError(f"case {case_id!r}: malformed judge scores: {error}") from error
+
+
+def require_complete(verdict: CaseVerdict, rubrics: Mapping[str, Rubric]) -> CaseVerdict:
+    """A verdict must carry every rubric it was asked for, whatever its source.
+
+    The replay path needs this as much as the live one: a recording made before
+    a rubric existed would otherwise pass while that rubric silently vanished
+    from the trend, and a blocking one would stop gating.
+    """
+    missing = sorted(set(rubrics) - set(verdict.scores))
+    if missing:
+        raise ValueError(
+            f"case {verdict.case_id!r}: recorded verdict omits rubric(s) {', '.join(missing)}"
+        )
+    return verdict
 
 
 # --------------------------------------------------------------------------- #
@@ -171,9 +188,10 @@ class ReplayBackend:
 
     def score(self, case: JudgeCase, rubrics: dict[str, Rubric]) -> CaseVerdict:
         try:
-            return self._by_case[case.id]
+            recorded = self._by_case[case.id]
         except KeyError as error:
             raise KeyError(f"no recorded verdict for case {case.id!r}") from error
+        return require_complete(recorded, rubrics)
 
 
 # --------------------------------------------------------------------------- #
