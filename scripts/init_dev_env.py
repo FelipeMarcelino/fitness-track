@@ -15,6 +15,8 @@ missing.
 from __future__ import annotations
 
 import argparse
+import base64
+import json
 import secrets
 import stat
 import sys
@@ -41,8 +43,21 @@ VOLUME_BOUND = frozenset(
         # validated or decrypted.
         "LANGFUSE_SALT",
         "LANGFUSE_ENCRYPTION_KEY",
+        # The column-encryption material (spec 22.2). A new keyring cannot read
+        # ciphertext written under the old one, and a new pepper makes every
+        # `external_id_hash` in the table unfindable — the rows survive and
+        # nothing can look them up again.
+        "FITTRACK_ENCRYPTION_KEYS",
+        "FITTRACK_IDENTITY_PEPPER",
     }
 )
+
+# The column-encryption keyring (spec 22.2) is a JSON map of version to a base64
+# key of exactly 32 bytes. Generating it here rather than leaving a placeholder
+# is what makes `make env` produce an environment the process can actually boot
+# with — settings validate the keyring, and `change-me` is not one.
+KEYRING_KEYS = frozenset({"FITTRACK_ENCRYPTION_KEYS"})
+KEY_BYTES = 32
 
 # URL-safe on purpose: these end up inside a connection URL, where a `@` or a
 # `:` would silently change what is being parsed.
@@ -52,6 +67,9 @@ SecretFactory = Callable[[str], str]
 def _default_factory(name: str) -> str:
     if name in HEX_KEYS:
         return secrets.token_hex(32)
+    if name in KEYRING_KEYS:
+        key = base64.b64encode(secrets.token_bytes(KEY_BYTES)).decode()
+        return json.dumps({"1": key}, separators=(",", ":"))
     return secrets.token_urlsafe(24)
 
 
@@ -86,7 +104,11 @@ def render_env(
             values[name] = value
             continue
         kept = previous.get(name)
-        values[name] = kept if kept and name in VOLUME_BOUND and not rotate else secret(name)
+        # `kept != PLACEHOLDER` matters: a copied `.env.example` carries
+        # `change-me` in these very names, and preserving it would leave the
+        # keyring unparseable while looking like careful key handling.
+        preserve = bool(kept) and kept != PLACEHOLDER and name in VOLUME_BOUND and not rotate
+        values[name] = kept if preserve and kept is not None else secret(name)
 
     # An operator's own edits are not the generator's to discard: a filled
     # provider key, an enabled channel, a tuned window. Anything that differs

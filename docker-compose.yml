@@ -27,6 +27,36 @@ x-app: &app
     QDRANT_API_KEY: ${QDRANT_API_KEY}
     FITTRACK_TLS_CA_FILE: /certs/ca.crt
     FITTRACK_CONFIG_DIR: /app/config
+    # Required: every service validates its whole configuration before serving
+    # or beating (fittrack.startup). Still an allowlist — it is what the service
+    # reads, and it grows with the code that reads it, not ahead of it.
+    FITTRACK_CHANNELS: ${FITTRACK_CHANNELS}
+    FITTRACK_ENCRYPTION_KEYS: ${FITTRACK_ENCRYPTION_KEYS}
+    FITTRACK_ACTIVE_KEY_VERSION: ${FITTRACK_ACTIVE_KEY_VERSION}
+    FITTRACK_IDENTITY_PEPPER: ${FITTRACK_IDENTITY_PEPPER}
+    # Channel credentials. Listing a channel in FITTRACK_CHANNELS is a promise
+    # its adapter can be built, and startup checks the promise — so a service
+    # that receives the selector has to receive what backs it, or it refuses to
+    # boot. Unset variables resolve to empty, which settings read as absent.
+    TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+    TELEGRAM_MODE: ${TELEGRAM_MODE}
+    TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET}
+    TELEGRAM_WEBHOOK_URL: ${TELEGRAM_WEBHOOK_URL}
+    WABA_PHONE_NUMBER_ID: ${WABA_PHONE_NUMBER_ID}
+    WABA_TOKEN: ${WABA_TOKEN}
+    WABA_APP_SECRET: ${WABA_APP_SECRET}
+    WABA_VERIFY_TOKEN: ${WABA_VERIFY_TOKEN}
+    # Behaviour (Apêndice A). Settings validate every one of these, so a value
+    # set in .env that never reached the container would be silently ignored —
+    # including an invalid one the validation exists to reject.
+    SESSION_IDLE_TIMEOUT_MIN: ${SESSION_IDLE_TIMEOUT_MIN}
+    SESSION_MAX_DURATION_MIN: ${SESSION_MAX_DURATION_MIN}
+    DEBOUNCE_WINDOW_S: ${DEBOUNCE_WINDOW_S}
+    INTERRUPT_TTL_MIN: ${INTERRUPT_TTL_MIN}
+    ACK_CONFIDENCE_THRESHOLD: ${ACK_CONFIDENCE_THRESHOLD}
+    CHANNEL_LINK_TTL_MIN: ${CHANNEL_LINK_TTL_MIN}
+    GRAPH_RECURSION_LIMIT: ${GRAPH_RECURSION_LIMIT}
+    CHECKPOINT_RETENTION_DAYS: ${CHECKPOINT_RETENTION_DAYS}
   volumes:
     # The certificate alone, never the directory: `certs/ca/` also holds
     # `ca.key`, and a container with that can mint a certificate Postgres,

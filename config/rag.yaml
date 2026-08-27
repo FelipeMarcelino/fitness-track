@@ -1,0 +1,22 @@
+# RAG (spec §15.3).
+
+embeddings:
+  provider: openai
+  model: text-embedding-3-large
+  # Matryoshka: 1024 dimensões em vez de 3072, sem perda relevante de qualidade
+  # e com um quarto do custo de armazenamento.
+  dimensions: 1024
+
+qdrant:
+  distance: Cosine
+  hnsw:
+    m: 16
+    ef_construct: 128
+  # Economiza ~4x de RAM.
+  quantization: scalar_int8
+
+retrieval:
+  top_k: 8
+  score_threshold: 0.62
+  # Cross-encoder entra na fase 1.3.
+  rerank: false

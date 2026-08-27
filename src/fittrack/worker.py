@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from fittrack.runtime import DEFAULT_INTERVAL_S, heartbeat_loop, run_until_signalled
+from fittrack.startup import startup
 
 HEARTBEAT = Path("/tmp/fittrack-worker.hb")
 
@@ -18,6 +19,9 @@ async def run(heartbeat: Path = HEARTBEAT, interval_s: float = DEFAULT_INTERVAL_
 
 
 def main() -> None:
+    # Before the first beat: a service that reports healthy on an invalid
+    # deployment is worse than one that never starts.
+    startup("worker")
     run_until_signalled(HEARTBEAT)
 
 
