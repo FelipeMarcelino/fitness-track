@@ -49,6 +49,7 @@ services:
       - ./Caddyfile:/app/Caddyfile:ro
       - ./Dockerfile:/app/Dockerfile:ro
       - ./.env.example:/app/.env.example:ro
+      - ./alembic.ini:/app/alembic.ini:ro
 
   worker:
     build:
@@ -57,15 +58,17 @@ services:
     deploy:
       replicas: 1
     # Test-only credentials. The integration suite proves the TLS boundary of
-    # every store, which needs the passwords the base file deliberately keeps
-    # out of an application container. This is the file that exists to be
-    # local-only, so it is the right place; the base file stays clean and the
-    # contract test only ever reads that.
+    # every store and runs migrations, so it needs both the store passwords and
+    # the owner principal — none of which production gives an application
+    # container. This is the file that exists to be local-only, so it is the
+    # right place; the base file stays clean and the contract test reads only
+    # that.
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       REDIS_PASSWORD: ${REDIS_PASSWORD}
+      FITTRACK_RUNTIME_PASSWORD: ${FITTRACK_RUNTIME_PASSWORD}
     volumes:
       - type: bind
         source: ./certs/ca/ca.crt
@@ -82,6 +85,7 @@ services:
       - ./Caddyfile:/app/Caddyfile:ro
       - ./Dockerfile:/app/Dockerfile:ro
       - ./.env.example:/app/.env.example:ro
+      - ./alembic.ini:/app/alembic.ini:ro
 
   scheduler:
     build:
@@ -103,3 +107,4 @@ services:
       - ./Caddyfile:/app/Caddyfile:ro
       - ./Dockerfile:/app/Dockerfile:ro
       - ./.env.example:/app/.env.example:ro
+      - ./alembic.ini:/app/alembic.ini:ro

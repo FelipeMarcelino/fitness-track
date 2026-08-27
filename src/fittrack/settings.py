@@ -21,7 +21,7 @@ import json
 import re
 from functools import lru_cache
 from typing import Annotated, Literal, Self
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -56,7 +56,16 @@ class Settings(BaseSettings):
     )
 
     # --- infrastructure ----------------------------------------------------
+    # Two principals (spec 19.1). `database_url` is the runtime one, which is
+    # NOSUPERUSER NOBYPASSRLS and owns nothing — a superuser or a BYPASSRLS role
+    # ignores row level security even with FORCE, leaving the policies in place
+    # and never evaluated. `migration_database_url` is the owner, and runs
+    # migrations only.
     database_url: SecretStr
+    # Optional on purpose. The application must never hold the owner credential
+    # — handing it to the ingress would undo the separation it exists for — so
+    # only the migration runner sets it, and only it requires it.
+    migration_database_url: SecretStr | None = None
     redis_url: SecretStr
     qdrant_url: str
     qdrant_api_key: SecretStr | None = None
@@ -121,6 +130,7 @@ class Settings(BaseSettings):
         "waba_token",
         "waba_app_secret",
         "waba_verify_token",
+        "migration_database_url",
         "groq_api_key",
         "anthropic_api_key",
         "openai_api_key",
@@ -174,14 +184,27 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def _connection_urls_are_encrypted(self) -> Self:
         """Spec 22.1, checked without quoting the DSN — it carries the password."""
-        # Parsed, not matched as a substring: `sslmode=verify-full` can appear in
-        # a password, a path or another parameter while the effective one says
-        # `disable`. verify-ca would not do either — it accepts any certificate
-        # this CA signed, which in the compose topology is every service.
-        if _sslmode(self.database_url) != "verify-full":
+        urls = [("DATABASE_URL", self.database_url)]
+        if self.migration_database_url is not None:
+            urls.append(("MIGRATION_DATABASE_URL", self.migration_database_url))
+        for name, dsn in urls:
+            # Parsed, not matched as a substring: `sslmode=verify-full` can
+            # appear in a password, a path or another parameter while the
+            # effective one says `disable`. verify-ca would not do either — it
+            # accepts any certificate this CA signed, which in the compose
+            # topology is every service.
+            require_verified_postgres(name, dsn)
+
+        # Spec 19.1. The owner bypasses RLS unless FORCE is set, and a superuser
+        # or BYPASSRLS role bypasses it regardless — so pointing both URLs at
+        # one principal leaves every policy in place and never evaluated. That
+        # failure is silent, which is exactly why it is checked here.
+        if self.migration_database_url is not None and _principal(self.database_url) == _principal(
+            self.migration_database_url
+        ):
             raise ValueError(
-                "DATABASE_URL must set sslmode=verify-full as its effective query "
-                "parameter (spec 22.1)"
+                "DATABASE_URL and MIGRATION_DATABASE_URL must not use the same principal: "
+                "the application must never connect as the schema owner (spec 19.1)"
             )
         if not self.redis_url.get_secret_value().startswith("rediss://"):
             raise ValueError("REDIS_URL must use the rediss:// scheme (spec 22.1)")
@@ -333,7 +356,33 @@ def get_settings() -> Settings:
     return Settings()
 
 
+def _principal(dsn: SecretStr) -> str:
+    """The username of a DSN, decoded, without touching the password.
+
+    Decoded because `urlsplit` returns the percent-encoded spelling while the
+    driver decodes before authenticating: `%66ittrack` and `fittrack` are the
+    same role, and comparing the raw forms would let the application URL name
+    the owner and pass the check.
+    """
+    return unquote(urlsplit(dsn.get_secret_value()).username or "")
+
+
 def _sslmode(dsn: SecretStr) -> str | None:
     """The effective `sslmode` of a DSN, or None when it sets none."""
     values = parse_qs(urlsplit(dsn.get_secret_value()).query).get("sslmode")
     return values[-1] if values else None
+
+
+def require_verified_postgres(name: str, dsn: SecretStr) -> None:
+    """Raise unless the DSN verifies both the chain and the hostname.
+
+    Shared so the migration runner cannot take a different view from the
+    application: `verify-ca` accepts any certificate this CA signed, which in
+    the compose topology is every service, and anything weaker verifies nothing.
+    Parsed rather than matched as a substring — `sslmode=verify-full` can sit in
+    a password or another parameter while the effective one says `disable`.
+    """
+    if _sslmode(dsn) != "verify-full":
+        raise ValueError(
+            f"{name} must set sslmode=verify-full as its effective query parameter (spec 22.1)"
+        )

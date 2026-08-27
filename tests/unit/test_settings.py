@@ -28,7 +28,7 @@ PEPPER = "an-independent-pepper"
 def env(**overrides: str) -> dict[str, str]:
     """A minimal valid environment; each test breaks exactly one thing."""
     base = {
-        "DATABASE_URL": "postgresql+asyncpg://u:p@postgres:5432/fittrack?sslmode=verify-full",
+        "DATABASE_URL": "postgresql+asyncpg://fittrack_runtime:p@postgres:5432/f?sslmode=verify-full",
         "REDIS_URL": "rediss://:p@redis:6379/0",
         "QDRANT_URL": "https://qdrant:6333",
         "QDRANT_API_KEY": "qdrant-key",
@@ -48,6 +48,7 @@ OWNED_PREFIXES = (
     "TELEGRAM_",
     "WABA_",
     "DATABASE_",
+    "MIGRATION_",
     "REDIS_",
     "QDRANT_",
     "GROQ_",
@@ -134,10 +135,35 @@ def test_an_out_of_range_threshold_fails() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_a_postgres_url_that_does_not_verify_is_rejected() -> None:
+@pytest.mark.parametrize("variable", ["DATABASE_URL", "MIGRATION_DATABASE_URL"])
+def test_a_postgres_url_that_does_not_verify_is_rejected(variable: str) -> None:
     """`verify-ca` would accept any certificate this CA signed — every service."""
     with pytest.raises(ValidationError, match="verify-full"):
-        build(DATABASE_URL="postgresql+asyncpg://u:p@postgres:5432/fittrack?sslmode=verify-ca")
+        build(**{variable: "postgresql+asyncpg://u:p@postgres:5432/f?sslmode=verify-ca"})
+
+
+def test_the_application_does_not_need_the_owner_credential() -> None:
+    """Handing the owner DSN to the ingress would undo the separation entirely."""
+    assert build().migration_database_url is None
+
+
+def test_the_application_must_not_connect_as_the_migration_principal() -> None:
+    """Spec 19.1, and the failure it prevents is silent rather than loud.
+
+    The owner bypasses row level security unless FORCE is set, and a superuser
+    or BYPASSRLS role bypasses it regardless. Pointing both URLs at the same
+    principal leaves every policy in place and never evaluated.
+    """
+    same = "postgresql+asyncpg://owner:p@postgres:5432/f?sslmode=verify-full"
+    with pytest.raises(ValidationError, match="same principal"):
+        build(DATABASE_URL=same, MIGRATION_DATABASE_URL=same)
+
+
+def test_two_distinct_principals_are_accepted() -> None:
+    settings = build(
+        MIGRATION_DATABASE_URL="postgresql+asyncpg://owner:p@postgres:5432/f?sslmode=verify-full"
+    )
+    assert settings.migration_database_url is not None
 
 
 def test_a_plaintext_redis_url_is_rejected() -> None:

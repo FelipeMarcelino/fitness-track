@@ -122,6 +122,9 @@ services:
       # Read by the initdb script that provisions the langfuse role. A migration
       # is committed, so a password never belongs in one.
       LANGFUSE_DB_PASSWORD: ${LANGFUSE_DB_PASSWORD}
+      # Read by the initdb script that provisions fittrack_runtime. A migration
+      # is committed, so a password never belongs in one.
+      FITTRACK_RUNTIME_PASSWORD: ${FITTRACK_RUNTIME_PASSWORD}
     # The image starts as root and drops to `postgres` itself, so the entrypoint
     # is the one place where the mounted key can be given the ownership and the
     # 0600 mode Postgres refuses to start without.

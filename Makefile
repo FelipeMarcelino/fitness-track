@@ -86,3 +86,30 @@ reset: ## Destroy the local volumes and rebuild the stack from scratch
 	@echo 'This deletes the local Postgres, Redis and Qdrant data.'
 	$(COMPOSE_DEV) down --volumes
 	$(MAKE) up
+
+.PHONY: migrate migrate-down revision
+
+# Through the worker, not on the host: the generated migration URL names
+# `postgres` and `/certs/ca.crt`, which resolve inside the compose network and
+# nowhere else. The owner DSN is passed to this one-off container only — the
+# long-running services must never hold it (spec 19.1).
+# Read from .env and passed to this one-off container only. `-e VAR` without a
+# value forwards the *host's* environment, which does not have it — and would
+# override the value with nothing.
+OWNER_DSN = $(shell sed -n 's/^MIGRATION_DATABASE_URL=//p' .env)
+
+migrate: ## Bring the database to head (runs as the owner principal)
+	@test -n "$(OWNER_DSN)" || { echo 'MIGRATION_DATABASE_URL missing from .env; run `make env`.'; exit 1; }
+	$(COMPOSE_DEV) run --rm -e MIGRATION_DATABASE_URL="$(OWNER_DSN)" worker \
+		python -m alembic upgrade head
+
+# No default target. `downgrade` drops every table of section 5.2, and the only
+# revision is the initial one, so pointing this at the application database
+# erases every local workout. It takes an explicit DSN, and says so.
+migrate-down: ## Roll back one revision. Requires DSN=<disposable database>
+	@test -n "$(DSN)" || { 		echo 'migrate-down needs an explicit disposable database:'; 		echo '  make migrate-down DSN=postgresql+asyncpg://.../scratch?sslmode=verify-full&sslrootcert=/certs/ca.crt'; 		echo 'It drops every table of spec 5.2 — never point it at the application database.'; 		exit 1; 	}
+	$(COMPOSE_DEV) run --rm -e MIGRATION_DATABASE_URL="$(DSN)" worker 		python -m alembic downgrade -1
+
+# On the host: Alembic writes the new file, and the worker mounts src/ read-only.
+revision: ## Create a new migration: make revision M="what it does"
+	$(PYTHON) -m alembic revision -m "$(M)"

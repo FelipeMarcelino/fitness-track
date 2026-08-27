@@ -36,8 +36,9 @@ HEX_KEYS = frozenset({"LANGFUSE_ENCRYPTION_KEY"})
 VOLUME_BOUND = frozenset(
     {
         "POSTGRES_PASSWORD",
+        "FITTRACK_RUNTIME_PASSWORD",
         "LANGFUSE_DB_PASSWORD",
-        # Not a database password, but bound to persisted data all the same:
+        # Not database passwords, but bound to persisted data all the same:
         # Langfuse hashes API keys with the salt and encrypts stored credentials
         # with the key. Regenerating either leaves rows that can no longer be
         # validated or decrypted.
@@ -141,21 +142,30 @@ def render_env(
 def derived_urls(values: dict[str, str]) -> dict[str, str]:
     """The connection URLs, rebuilt from the credentials beside them.
 
-    Used to write them *and* to check them. A URL that disagrees with the
+    Never edited by hand and never preserved. A URL that disagrees with the
     password the container booted with fails at the first connection and nowhere
-    earlier — and one still carrying `change-me` from a copied template fails the
-    same way, several minutes after `make up` reported success.
+    earlier — and a `DATABASE_URL` left pointing at the owner from an older
+    revision would connect as a principal that bypasses RLS, which fails nowhere
+    at all.
     """
     user = values.get("POSTGRES_USER", "fittrack")
     database = values.get("POSTGRES_DB", "fittrack")
     pg_password = values.get("POSTGRES_PASSWORD", "")
     redis_password = values.get("REDIS_PASSWORD", "")
+    runtime_password = values.get("FITTRACK_RUNTIME_PASSWORD", "")
     langfuse_password = values.get("LANGFUSE_DB_PASSWORD", "")
+    verified = "?sslmode=verify-full&sslrootcert=/certs/ca.crt"
 
     return {
+        # Two principals (spec 19.1): the application connects as the
+        # unprivileged `fittrack_runtime`, migrations as the owner. Pointing
+        # both at the owner leaves every RLS policy in place, never evaluated.
         "DATABASE_URL": (
-            f"postgresql+asyncpg://{user}:{pg_password}@postgres:5432/{database}"
-            "?sslmode=verify-full&sslrootcert=/certs/ca.crt"
+            f"postgresql+asyncpg://fittrack_runtime:{runtime_password}"
+            f"@postgres:5432/{database}{verified}"
+        ),
+        "MIGRATION_DATABASE_URL": (
+            f"postgresql+asyncpg://{user}:{pg_password}@postgres:5432/{database}{verified}"
         ),
         # Langfuse speaks Prisma, whose parameter names differ from libpq's:
         # `sslaccept=strict` plus a root certificate is its verify-full.
@@ -223,9 +233,10 @@ def main(argv: list[str] | None = None) -> int:
         # connection URLs, where an equality check never sees it.
         leftover = sorted(name for name, value in previous.items() if PLACEHOLDER in value)
         absent = sorted(expected - set(previous))
-        # And a URL can be free of placeholders and still wrong — an edited
-        # password without a rebuilt URL leaves clients authenticating with the
-        # old one. Recomputing from the credentials in the same file catches it.
+        # A file from an older revision can be complete and still wrong: its
+        # DATABASE_URL may name the schema owner, which connects as a principal
+        # that bypasses RLS and so fails nowhere at all. Recomputing the derived
+        # URLs from the credentials in the same file catches exactly that.
         stale = sorted(
             name
             for name, expected_value in derived_urls(previous).items()
