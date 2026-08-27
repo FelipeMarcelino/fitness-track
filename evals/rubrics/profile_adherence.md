@@ -3,6 +3,7 @@ id: profile_adherence
 title: Aderência ao perfil
 blocking: false
 min_score: 4
+universal: false
 since_phase: "1.0"
 ---
 

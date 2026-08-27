@@ -31,6 +31,10 @@ class Rubric:
     blocking: bool
     min_score: int
     since_phase: str
+    # A universal rubric applies to every answer, and no case may declare its
+    # way out of it. A blocking rubric that is *not* universal needs material a
+    # case may simply not have — `channel_equivalence` needs two paired outputs.
+    universal: bool
 
     def fails(self, score: int) -> bool:
         return score < self.min_score
@@ -45,7 +49,7 @@ def _parse(path: Path) -> Rubric:
     if not isinstance(meta, dict):
         raise RubricError(f"{path.name}: frontmatter is not a mapping")
 
-    missing = {"id", "title", "blocking", "min_score", "since_phase"} - set(meta)
+    missing = {"id", "title", "blocking", "min_score", "since_phase", "universal"} - set(meta)
     if missing:
         raise RubricError(f"{path.name}: missing frontmatter keys {sorted(missing)}")
     if meta["id"] != path.stem:
@@ -66,6 +70,8 @@ def _parse(path: Path) -> Rubric:
     if blocking and min_score != 5:
         # Spec 21.2: a blocking rubric fails on "qualquer caso < 5".
         raise RubricError(f"{path.name}: a blocking rubric must require a score of 5")
+    if bool(meta["universal"]) and not blocking:
+        raise RubricError(f"{path.name}: a universal rubric must also be blocking")
 
     return Rubric(
         id=str(meta["id"]),
@@ -75,6 +81,7 @@ def _parse(path: Path) -> Rubric:
         blocking=blocking,
         min_score=min_score,
         since_phase=str(meta["since_phase"]),
+        universal=bool(meta["universal"]),
     )
 
 

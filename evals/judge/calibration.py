@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from evals.judge.gates import DEFAULT_PHASE, CalibrationResult
+from evals.judge.gates import DEFAULT_PHASE, CalibrationResult, CaseRubrics, rubrics_for
 from evals.judge.models import CaseVerdict, JudgeCase, Label
 from evals.judge.rubrics import Rubric, active_rubrics
 
@@ -44,12 +44,14 @@ def calibrate(
     rubrics: dict[str, Rubric],
     phase: str = DEFAULT_PHASE,
     max_errors: int = MAX_CALIBRATION_ERRORS,
+    case_rubrics: CaseRubrics | None = None,
 ) -> CalibrationResult:
     applicable = active_rubrics(phase, rubrics)
     mismatches = [
         verdict.case_id
         for verdict in verdicts
         if verdict.case_id in human_labels
-        and derived_label(verdict, applicable) != human_labels[verdict.case_id]
+        and derived_label(verdict, rubrics_for(verdict.case_id, applicable, case_rubrics))
+        != human_labels[verdict.case_id]
     ]
     return CalibrationResult(total=len(verdicts), mismatches=mismatches, max_errors=max_errors)

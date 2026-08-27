@@ -99,3 +99,32 @@ def test_verdicts_can_be_written_back_for_replay(tmp_path: Path) -> None:
     assert run(source, "--out", str(out)) == 0
     written = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines() if line]
     assert len(written) == len(load_cases(BASELINE)) + len(load_cases(CALIBRATION))
+
+
+# --------------------------------------------------------------------------- #
+# Credentials: a check that did not run must not read as a check that passed
+# --------------------------------------------------------------------------- #
+
+
+def test_the_strict_backend_fails_when_the_credential_is_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """What CI uses. A green required check would claim the judge scored the diff."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    assert main(["--backend", "anthropic"]) == 1
+
+
+def test_the_strict_backend_says_which_variable_is_missing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    main(["--backend", "anthropic"])
+    assert "ANTHROPIC_API_KEY" in capsys.readouterr().err
+
+
+def test_the_runner_gates_each_case_on_its_declared_rubrics(tmp_path: Path) -> None:
+    """A baseline case that declares no `grounding` must not be gated or trended on it."""
+    baseline = load_cases(BASELINE)
+    narrow = next(c for c in baseline if "grounding" not in c.rubrics)
+    path = write_verdicts(tmp_path / "v.jsonl", {narrow.id: {"grounding": 1}})
+    assert run(path) == 0

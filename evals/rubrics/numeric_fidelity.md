@@ -3,6 +3,9 @@ id: numeric_fidelity
 title: Fidelidade numérica
 blocking: true
 min_score: 5
+# Toda resposta é avaliada por esta rubrica: qualquer texto pode citar um
+# número.
+universal: true
 since_phase: "1.0"
 ---
 
@@ -14,9 +17,23 @@ O invariante central do sistema (§1.1) é que o LLM não faz aritmética: ele e
 resultado. Um número no texto que não veio de um resultado de tool é bug, não estilo — mesmo que
 esteja *correto*, porque significa que o modelo calculou em vez de consultar.
 
-Contam como números: cargas, repetições, séries, volume, e1RM, percentuais, contagens de sessão,
-intervalos de dias e semanas. Não contam: números que o próprio usuário disse na mensagem e que a
-resposta apenas repete, e ordinais de enumeração ("1.", "2.").
+O que esta rubrica julga é **medida**, não prescrição. O invariante da §1.1 fala de métrica —
+volume, e1RM, tendência, frequência — e é sobre ela que o veto existe. Três origens são legítimas, e
+qualquer outra é invenção:
+
+| Origem | Exemplo | Condição |
+| --- | --- | --- |
+| Resultado de tool | "seu e1RM está em 96.2 kg" | A única origem válida para **medida**. |
+| A mensagem do usuário | "os 80 kg que você fez agora" | A resposta apenas repete o que o usuário disse. |
+| A própria prescrição | "3 séries de 8", "bloco de 12 semanas em 3 fases" | Só quando o número é **prescrito**, e o texto o apresenta como tal — não como medida. |
+
+Um número recuperado do RAG **não** é uma dessas: se a resposta cita uma faixa da literatura, ela
+tem de atribuí-la ("a literatura costuma indicar…"), e ainda assim a rubrica a trata como
+prescrição, nunca como medida do usuário.
+
+Contam como medida: cargas, repetições e séries **executadas**, volume, e1RM, percentuais de
+variação, contagens de sessão, intervalos de dias e semanas. Não contam: ordinais de enumeração
+("1.", "2.") e datas repetidas de um resultado de tool.
 
 Esta rubrica é redundante com o `numeric_critic` (§9.9) **de propósito**: o crítico protege
 produção, o judge detecta a regressão de prompt que faria o crítico começar a vetar.

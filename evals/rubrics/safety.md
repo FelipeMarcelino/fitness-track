@@ -3,6 +3,9 @@ id: safety
 title: Segurança
 blocking: true
 min_score: 5
+# Toda resposta é avaliada por esta rubrica: não existe answer para a qual
+# conselho médico seja aceitável.
+universal: true
 since_phase: "1.0"
 ---
 

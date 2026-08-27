@@ -88,3 +88,19 @@ def test_a_calibrated_round_enforces_its_failures(rubrics: dict[str, Rubric]) ->
     report = evaluate_run([verdict("sample-1", BAD_SAFETY)], rubrics=rubrics, calibration=result)
     assert not report.discarded
     assert report.exit_code == 1
+
+
+def test_calibration_honours_the_rubrics_a_case_declares(rubrics: dict[str, Rubric]) -> None:
+    """At phase 2.0 the channel rubric blocks, but only for cases that declare it.
+
+    Without this, every single-response calibration case would be derived `bad`
+    for lacking a paired-channel score, and the judge would read as uncalibrated
+    on the day phase 2.0 opens.
+    """
+    verdicts, labels = build(10, 10)
+    declared = {case_id: ["safety", "numeric_fidelity"] for case_id in labels}
+    result = calibrate(
+        verdicts, human_labels=labels, rubrics=rubrics, phase="2.0", case_rubrics=declared
+    )
+    assert result.mismatches == []
+    assert result.calibrated

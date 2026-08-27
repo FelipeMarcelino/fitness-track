@@ -3,6 +3,7 @@ id: persona
 title: Persona
 blocking: false
 min_score: 4
+universal: false
 since_phase: "1.0"
 ---
 

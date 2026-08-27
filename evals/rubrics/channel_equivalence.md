@@ -3,6 +3,9 @@ id: channel_equivalence
 title: Equivalência entre canais
 blocking: true
 min_score: 5
+# Exige duas saídas pareadas. Um caso de resposta única não tem o que comparar,
+# então esta rubrica é aplicada só a quem a declara.
+universal: false
 since_phase: "2.0"
 ---
 

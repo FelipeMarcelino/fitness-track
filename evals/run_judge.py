@@ -29,7 +29,7 @@ from evals.judge.backends import (
 )
 from evals.judge.calibration import calibrate, human_labels
 from evals.judge.datasets import BASELINE, CALIBRATION, load_cases
-from evals.judge.gates import DEFAULT_PHASE, evaluate_run
+from evals.judge.gates import DEFAULT_PHASE, CaseRubrics, evaluate_run, rubrics_for
 from evals.judge.models import CaseVerdict, JudgeCase
 from evals.judge.report import render
 from evals.judge.rubrics import Rubric, active_rubrics, load_rubrics
@@ -56,14 +56,20 @@ def _build_backend(args: argparse.Namespace) -> JudgeBackend | None:
         return AnthropicBackend(model=args.model)
     except MissingCredentialsError:
         if args.backend == "anthropic":
-            raise
+            # Strict mode is what CI asks for. Reporting and exiting 0 here would
+            # turn a required check green over a diff nothing scored.
+            return None
         return None
 
 
 def _score_all(
-    backend: JudgeBackend, cases: list[JudgeCase], rubrics: dict[str, Rubric]
+    backend: JudgeBackend,
+    cases: list[JudgeCase],
+    rubrics: dict[str, Rubric],
+    case_rubrics: CaseRubrics,
 ) -> list[CaseVerdict]:
-    return [backend.score(case, rubrics) for case in cases]
+    """Ask the backend only for the rubrics each case is actually gated on."""
+    return [backend.score(case, rubrics_for(case.id, rubrics, case_rubrics)) for case in cases]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -71,31 +77,49 @@ def main(argv: list[str] | None = None) -> int:
 
     backend = _build_backend(args)
     if backend is None:
-        # Reported, never a silent pass: a green check here would claim the judge
-        # ran when it did not.
-        print(
+        message = (
             f"LLM-as-judge nao executado: {CREDENTIAL_ENV} ausente.\n"
             f"Defina {CREDENTIAL_ENV} para rodar o judge ao vivo, ou use\n"
             f"  python -m evals.run_judge --backend replay --verdicts <arquivo>\n"
             f"para reavaliar uma rodada gravada."
         )
+        if args.backend == "anthropic":
+            # Strict mode: CI asked for a live judge and did not get one. The
+            # only honest outcome is a red check — a green one would say the
+            # diff was scored for safety and numeric fidelity when it was not.
+            print(message, file=sys.stderr)
+            return 1
+        # Tolerant mode, for a local run: reported, never a silent pass.
+        print(message)
         return 0
 
     rubrics = active_rubrics(args.phase, load_rubrics())
     calibration_cases = load_cases(args.calibration)
     baseline_cases = load_cases(args.baseline)
 
-    calibration_verdicts = _score_all(backend, calibration_cases, rubrics)
-    baseline_verdicts = _score_all(backend, baseline_cases, rubrics)
+    # A case may narrow the rubrics it is scored on: grading an analysis answer
+    # on `grounding` when it retrieved nothing produces a number that means
+    # nothing and still lands in the trend.
+    case_rubrics = {
+        case.id: case.rubrics for case in calibration_cases + baseline_cases if case.rubrics
+    }
+
+    calibration_verdicts = _score_all(backend, calibration_cases, rubrics, case_rubrics)
+    baseline_verdicts = _score_all(backend, baseline_cases, rubrics, case_rubrics)
 
     calibration = calibrate(
         calibration_verdicts,
         human_labels=human_labels(calibration_cases),
         rubrics=rubrics,
         phase=args.phase,
+        case_rubrics=case_rubrics,
     )
     report = evaluate_run(
-        baseline_verdicts, rubrics=rubrics, phase=args.phase, calibration=calibration
+        baseline_verdicts,
+        rubrics=rubrics,
+        phase=args.phase,
+        calibration=calibration,
+        case_rubrics=case_rubrics,
     )
 
     if args.out is not None:

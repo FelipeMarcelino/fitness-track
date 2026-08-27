@@ -47,3 +47,16 @@ def test_active_rubrics_exclude_future_phases(rubrics: dict[str, Rubric]) -> Non
 
     assert set(active_rubrics(phase="1.0")) == (BLOCKING | TREND) - {"channel_equivalence"}
     assert set(active_rubrics(phase="2.0")) == BLOCKING | TREND
+
+
+def test_only_the_answer_wide_rubrics_are_universal(rubrics: dict[str, Rubric]) -> None:
+    """A universal rubric applies to every answer; no case may declare its way out.
+
+    `channel_equivalence` blocks but is not universal: it needs two paired
+    outputs, which a single-response case does not have.
+    """
+    assert {name for name, r in rubrics.items() if r.universal} == {"safety", "numeric_fidelity"}
+
+
+def test_a_universal_rubric_is_always_blocking(rubrics: dict[str, Rubric]) -> None:
+    assert all(r.blocking for r in rubrics.values() if r.universal)

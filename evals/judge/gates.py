@@ -6,6 +6,7 @@ a live judge: the tests feed recorded verdicts in and assert the exit code.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from statistics import fmean
 
@@ -60,17 +61,39 @@ class RunReport:
         return 1 if self.blocking_failures else 0
 
 
-def _applicable(verdict: CaseVerdict, rubrics: dict[str, Rubric]) -> dict[str, Rubric]:
-    """Rubrics a case must be scored on: every active one it was or should be scored on."""
-    return rubrics
+CaseRubrics = Mapping[str, list[str]]
+
+
+def rubrics_for(
+    case_id: str, rubrics: dict[str, Rubric], declared: CaseRubrics | None
+) -> dict[str, Rubric]:
+    """The rubrics one case is judged on.
+
+    A case may narrow the set — an analysis answer has no retrieved material, so
+    grading it on `grounding` produces a number that means nothing and still
+    lands in the trend. What a case may **not** do is narrow away a *universal*
+    rubric: safety and numeric fidelity apply to every answer, and letting a
+    fixture opt out of them would turn the declaration into a way to skip the
+    gate.
+
+    `channel_equivalence` blocks but is not universal: it compares two paired
+    outputs, and a single-response case has nothing to compare. Forcing it on
+    every case would fail the whole suite the day phase 2.0 opens.
+    """
+    if declared is None or case_id not in declared:
+        return rubrics
+    chosen = set(declared[case_id])
+    return {name: rubric for name, rubric in rubrics.items() if name in chosen or rubric.universal}
 
 
 def blocking_failures(
-    verdicts: list[CaseVerdict], rubrics: dict[str, Rubric]
+    verdicts: list[CaseVerdict],
+    rubrics: dict[str, Rubric],
+    case_rubrics: CaseRubrics | None = None,
 ) -> list[BlockingFailure]:
     failures: list[BlockingFailure] = []
     for verdict in verdicts:
-        for name, rubric in _applicable(verdict, rubrics).items():
+        for name, rubric in rubrics_for(verdict.case_id, rubrics, case_rubrics).items():
             if not rubric.blocking:
                 continue
             scored = verdict.scores.get(name)
@@ -86,13 +109,26 @@ def blocking_failures(
     return failures
 
 
-def trend_averages(verdicts: list[CaseVerdict], rubrics: dict[str, Rubric]) -> dict[str, float]:
-    """Mean score per non-blocking rubric; the series plotted per prompt version."""
+def trend_averages(
+    verdicts: list[CaseVerdict],
+    rubrics: dict[str, Rubric],
+    case_rubrics: CaseRubrics | None = None,
+) -> dict[str, float]:
+    """Mean score per non-blocking rubric; the series plotted per prompt version.
+
+    Only cases that declare a rubric contribute to its average, so a case scored
+    on something it never had material for cannot drag the series.
+    """
     trends: dict[str, float] = {}
     for name, rubric in rubrics.items():
         if rubric.blocking:
             continue
-        scores = [s.score for v in verdicts if (s := v.scores.get(name)) is not None]
+        scores = [
+            s.score
+            for v in verdicts
+            if name in rubrics_for(v.case_id, rubrics, case_rubrics)
+            and (s := v.scores.get(name)) is not None
+        ]
         if scores:
             trends[name] = fmean(scores)
     return trends
@@ -104,13 +140,16 @@ def evaluate_run(
     rubrics: dict[str, Rubric],
     phase: str = DEFAULT_PHASE,
     calibration: CalibrationResult | None = None,
+    case_rubrics: CaseRubrics | None = None,
 ) -> RunReport:
     """Turn a round of verdicts into a CI decision."""
+    # The phase filter comes first and a case declaration cannot widen it:
+    # channel equivalence has nothing to compare against before phase 2.0.
     applicable = active_rubrics(phase, rubrics)
     return RunReport(
         scored_cases=len(verdicts),
         phase=phase,
-        blocking_failures=blocking_failures(verdicts, applicable),
-        trends=trend_averages(verdicts, applicable),
+        blocking_failures=blocking_failures(verdicts, applicable, case_rubrics),
+        trends=trend_averages(verdicts, applicable, case_rubrics),
         calibration=calibration,
     )

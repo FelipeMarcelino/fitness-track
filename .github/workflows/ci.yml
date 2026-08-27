@@ -118,10 +118,15 @@ jobs:
         run: nix develop --command make sync
 
       # Blocks on safety and numeric fidelity below 5. An uncalibrated judge
-      # discards its own round and reports without failing the PR, and a missing
-      # credential reports too — it never reads as a silent pass.
+      # discards its own round and reports without failing the PR.
+      #
+      # `--backend anthropic` is the strict mode, and it is deliberate: a diff
+      # that touches a prompt, an agent or an eval must not get a green required
+      # check from a judge that never ran. A missing ANTHROPIC_API_KEY fails
+      # here, which is the honest outcome — the tolerant local default lives in
+      # `make eval-judge`.
       - name: Run the judge
         if: steps.scope.outputs.run == 'true'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: nix develop --command make eval-judge
+        run: nix develop --command python -m evals.run_judge --backend anthropic
