@@ -70,6 +70,10 @@ jobs:
     name: LLM-as-judge
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # ADR-0002: the gate is suspended until the Anthropic account has credit.
+    # The job still runs in strict mode and still shows red when it fails — it
+    # just does not reprove the merge. Remove this line to reinstate the gate.
+    continue-on-error: true
 
     steps:
       - name: Check out repository

@@ -66,11 +66,21 @@ Atualize esta tabela conforme cada peça entrar, e apague a seção quando ela e
 
 ### `make eval-judge`
 
-O quinto alvo é o LLM-as-judge da §21.2, e ele tem uma regra própria: **`ANTHROPIC_API_KEY`
-ausente não é uma passada silenciosa.** O runner relata "judge não executado" e sai com 0, porque
-reprovar uma PR por falta de credencial local seria ruído — mas o relato existe justamente para
-que ninguém leia o verde como "o judge aprovou". A política completa (o que bloqueia, o que vira
-tendência, o que descarta a rodada) está em `evals/rubrics/README.md`.
+O quinto alvo é o LLM-as-judge da §21.2, e ele tem dois modos, de propósito:
+
+| Modo | Onde | Credencial ausente |
+| --- | --- | --- |
+| Tolerante — `make eval-judge` | local | Relata "judge não executado" e sai com 0 |
+| Estrito — `--backend anthropic` | CI | Sai com 1 |
+
+A diferença não é conveniência: reprovar uma PR por falta de credencial *local* seria ruído, mas um
+*required check* verde diria que segurança e fidelidade numérica foram avaliadas quando ninguém
+avaliou. A política completa (o que bloqueia, o que vira tendência, o que descarta a rodada) está em
+`evals/rubrics/README.md`.
+
+> ⚠️ **O portão está suspenso** — [ADR-0002](doc/adr/0002-portao-do-judge-suspenso.md). A conta
+> Anthropic não tem saldo, então o job roda, falha e **não** reprova o merge. Ele continua vermelho
+> no PR; o que se perdeu foi o veto, não a visibilidade. A reversão é uma linha no `ci.yml`.
 
 Para reavaliar uma rodada gravada, sem rede e sem credencial:
 
