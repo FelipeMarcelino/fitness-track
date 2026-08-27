@@ -45,3 +45,42 @@ check: lint typecheck test ## Everything CI blocks on, in CI order
 clean: ## Remove caches
 	rm -rf .pytest_cache .ruff_cache .mypy_cache htmlcov .coverage
 	find . -name __pycache__ -type d -prune -exec rm -rf {} +
+
+# --------------------------------------------------------------------------- #
+# Local infrastructure (spec 3.1). The base file is the production topology;
+# the dev override is the only thing that opens a port to the host.
+# --------------------------------------------------------------------------- #
+
+COMPOSE     ?= docker compose
+COMPOSE_DEV := $(COMPOSE) -f docker-compose.yml -f docker-compose.dev.yml
+
+.PHONY: certs env compose-config up down logs ps shell test-in-worker reset
+
+certs: ## Generate the development CA and the per-service certificates
+	./scripts/gen_dev_certs.sh $(ARGS)
+
+env: ## Create .env from the template, generating the local credentials
+	@$(PYTHON) -m scripts.init_dev_env $(ARGS)
+
+compose-config: ## Validate the combined compose configuration
+	$(COMPOSE_DEV) config --quiet
+
+up: certs env ## Bring the local stack up and wait for every service to be healthy
+	$(COMPOSE_DEV) up --wait
+
+down: ## Stop the stack, keeping the volumes
+	$(COMPOSE_DEV) down
+
+ps: ## Show the state of the local stack
+	$(COMPOSE_DEV) ps
+
+logs: ## Follow the logs of the local stack
+	$(COMPOSE_DEV) logs -f
+
+test-in-worker: ## Run the suite inside the worker, against the real services
+	$(COMPOSE_DEV) run --rm worker pytest
+
+reset: ## Destroy the local volumes and rebuild the stack from scratch
+	@echo 'This deletes the local Postgres, Redis and Qdrant data.'
+	$(COMPOSE_DEV) down --volumes
+	$(MAKE) up
