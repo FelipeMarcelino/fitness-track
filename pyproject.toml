@@ -47,8 +47,8 @@ dependencies = [
     # Security. Section 22.2 column encryption.
     "cryptography>=43,<48",
 
-    # LLM providers. ADR-0001: groq primary, anthropic fallback and judge,
-    # openai for embeddings only.
+    # LLM providers. ADR-0001: groq primary and anthropic product fallback.
+    # ADR-0004: openai for the judge as well as embeddings.
     "groq>=0.13,<1",
     "anthropic>=0.40,<1",
     "openai>=1.50,<3",

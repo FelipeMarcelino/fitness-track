@@ -86,11 +86,11 @@ def test_a_verdict_missing_from_the_replay_file_is_an_error(tmp_path: Path) -> N
 def test_missing_credentials_report_instead_of_passing_silently(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     assert main(["--backend", "auto"]) == 0
     out = capsys.readouterr().out
     assert "nao executado" in out.lower()
-    assert "ANTHROPIC_API_KEY" in out
+    assert "OPENAI_API_KEY" in out
 
 
 def test_verdicts_can_be_written_back_for_replay(tmp_path: Path) -> None:
@@ -110,16 +110,16 @@ def test_the_strict_backend_fails_when_the_credential_is_absent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """What CI uses. A green required check would claim the judge scored the diff."""
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    assert main(["--backend", "anthropic"]) == 1
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    assert main(["--backend", "openai"]) == 1
 
 
 def test_the_strict_backend_says_which_variable_is_missing(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    main(["--backend", "anthropic"])
-    assert "ANTHROPIC_API_KEY" in capsys.readouterr().err
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    main(["--backend", "openai"])
+    assert "OPENAI_API_KEY" in capsys.readouterr().err
 
 
 def test_the_runner_gates_each_case_on_its_declared_rubrics(tmp_path: Path) -> None:

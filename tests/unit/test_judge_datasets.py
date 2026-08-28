@@ -80,6 +80,19 @@ def test_baseline_carries_no_human_grade(baseline: list[JudgeCase]) -> None:
         assert case.label is None
 
 
+def test_baseline_examples_are_unambiguous_for_numeric_fidelity(
+    baseline: list[JudgeCase],
+) -> None:
+    """Keep known borderline examples at a blocking-score-five standard."""
+    responses = {case.id: case.response for case in baseline}
+
+    assert "vai desacelerar" not in responses["base-004"]
+    assert "uma ou duas sessões" not in responses["base-008"]
+    assert "meta de 4 dias por semana" in responses["base-015"]
+    assert "2.9 sessões por semana" in responses["base-016"]
+    assert "RPE médio de 7.0 para 7.1" in responses["base-022"]
+
+
 def test_ids_are_unique(calibration: list[JudgeCase], baseline: list[JudgeCase]) -> None:
     ids = [case.id for case in calibration + baseline]
     assert len(ids) == len(set(ids))

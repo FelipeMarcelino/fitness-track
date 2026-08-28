@@ -21,9 +21,9 @@ from pathlib import Path
 
 from evals.judge.backends import (
     CREDENTIAL_ENV,
-    AnthropicBackend,
     JudgeBackend,
     MissingCredentialsError,
+    OpenAIBackend,
     ReplayBackend,
 )
 from evals.judge.calibration import calibrate
@@ -36,7 +36,7 @@ from evals.judge.rubrics import Rubric, active_rubrics, load_rubrics
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--backend", choices=["auto", "anthropic", "replay"], default="auto")
+    parser.add_argument("--backend", choices=["auto", "openai", "replay"], default="auto")
     parser.add_argument("--verdicts", type=Path, help="recorded verdicts, for --backend replay")
     parser.add_argument("--out", type=Path, help="write this round's verdicts as JSONL")
     parser.add_argument("--phase", default=DEFAULT_PHASE, help="roadmap phase (section 24)")
@@ -53,9 +53,9 @@ def _build_backend(args: argparse.Namespace) -> JudgeBackend | None:
             raise SystemExit("--backend replay requires --verdicts")
         return ReplayBackend.from_file(args.verdicts)
     try:
-        return AnthropicBackend(model=args.model)
+        return OpenAIBackend(model=args.model)
     except MissingCredentialsError:
-        if args.backend == "anthropic":
+        if args.backend == "openai":
             # Strict mode is what CI asks for. Reporting and exiting 0 here would
             # turn a required check green over a diff nothing scored.
             return None
@@ -83,7 +83,7 @@ def main(argv: list[str] | None = None) -> int:
             f"  python -m evals.run_judge --backend replay --verdicts <arquivo>\n"
             f"para reavaliar uma rodada gravada."
         )
-        if args.backend == "anthropic":
+        if args.backend == "openai":
             # Strict mode: CI asked for a live judge and did not get one. The
             # only honest outcome is a red check — a green one would say the
             # diff was scored for safety and numeric fidelity when it was not.
