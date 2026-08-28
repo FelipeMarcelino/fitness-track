@@ -1,0 +1,19 @@
+# Teto de custo por tenant (spec §19.3). É uma trava de segurança acima do gate
+# por plano da §19.2, não o gate em si: ao chegar em 80% um alerta é emitido no
+# Langfuse, e em 100% o gateway levanta `QuotaExceeded` para os tiers ANALYST e
+# COACH — mantendo os tiers rápidos funcionando.
+#
+# O motivo de degradar assim, e não desligar tudo: o registro de treino é o
+# hábito e o valor de retenção, e nunca se bloqueia no meio de um treino.
+
+quota:
+  free:
+    llm_usd_month: 0.50
+    analysis_calls_month: 20
+  pro:
+    llm_usd_month: 6.00
+    analysis_calls_month: 400
+  # O trial é um `pro` por tempo limitado: o limite é a data, não a quota.
+  trial:
+    llm_usd_month: 6.00
+    analysis_calls_month: 400
