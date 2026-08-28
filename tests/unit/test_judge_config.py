@@ -46,6 +46,18 @@ def models() -> dict[str, Any]:
     return parsed
 
 
+def ci_workflow() -> str:
+    """Read the repository workflow when tests run from a source checkout.
+
+    The production image intentionally does not copy `.github`; the Quality job
+    proves this contract before Integration builds that image.
+    """
+    source_checkout = CI_WORKFLOW.is_file()
+    skip_reason = "CI workflow is not included in the production image"
+    pytest.skip(skip_reason) if not source_checkout else None
+    return CI_WORKFLOW.read_text(encoding="utf-8")
+
+
 def test_every_role_of_the_spec_is_configured(models: dict[str, Any]) -> None:
     assert set(models["roles"]) == ROLES
 
@@ -111,12 +123,12 @@ def test_the_backend_reads_the_prompt_from_the_configured_file() -> None:
 
 
 def test_ci_runs_the_openai_judge_as_a_real_gate() -> None:
-    workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+    workflow = ci_workflow()
     assert "OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}" in workflow
     assert "python -m evals.run_judge --backend openai" in workflow
     assert "continue-on-error: true" not in workflow
 
 
 def test_a_judge_model_change_triggers_the_ci_gate() -> None:
-    workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+    workflow = ci_workflow()
     assert "config/models.yaml" in workflow
