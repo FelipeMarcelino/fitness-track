@@ -17,7 +17,7 @@ import pytest
 import redis.asyncio as redis
 from redis.exceptions import ConnectionError as RedisConnectionError
 
-from tests.integration.conftest import HOST
+from tests.conftest import HOST
 
 QDRANT_HEALTH = f"https://{HOST['qdrant']}:6333/healthz"
 

@@ -136,7 +136,7 @@ async def test_downgrade_then_upgrade_rebuilds_the_schema(
     import sys
     from pathlib import Path
 
-    from tests.integration.conftest import verified_dsn
+    from tests.conftest import verified_dsn
 
     root = Path(__file__).resolve().parents[2]
     env = {**os.environ, "MIGRATION_DATABASE_URL": verified_dsn(disposable_database)}
