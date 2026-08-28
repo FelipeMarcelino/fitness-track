@@ -60,10 +60,13 @@ jobs:
       - name: Typecheck
         run: nix develop --command make typecheck
 
-      # Unit and architecture tests. Section 21.4 puts them before anything that
-      # needs a container: they are the cheapest and cover the costliest
-      # regressions.
-      - name: Unit and architecture tests
+      # Section 21.4 orders the gates by cost, and puts the architecture tests
+      # first among the cheap ones: an `import` of `channels` inside a subgraph
+      # takes seconds to detect and weeks to undo once three features sit on it.
+      - name: Architecture guardrails
+        run: nix develop --command make test-architecture
+
+      - name: Unit tests
         run: nix develop --command make test
 
   integration:
@@ -92,6 +95,14 @@ jobs:
 
       - name: Start the stack
         run: docker compose -f docker-compose.yml -f docker-compose.dev.yml up --wait
+
+      # Tenant isolation needs a database, so it runs here rather than with the
+      # cheap gates — and it runs first, because a leak between tenants is the
+      # one failure the rest of the suite cannot compensate for.
+      - name: Tenant isolation
+        run: >-
+          docker compose -f docker-compose.yml -f docker-compose.dev.yml
+          run --rm worker pytest tests/test_tenant_isolation.py
 
       - name: Run the suite inside the worker
         run: docker compose -f docker-compose.yml -f docker-compose.dev.yml run --rm worker pytest
