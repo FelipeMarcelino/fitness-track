@@ -43,6 +43,10 @@ WEBHOOK_SECRET_ALPHABET = re.compile(r"^[A-Za-z0-9_-]{1,256}$")
 # update the webhook receives (spec 18.2).
 MIN_WEBHOOK_SECRET_CHARS = 43  # 32 bytes, url-safe base64
 
+# The pepper is key material and is sized like it. Shorter adds no work for an
+# attacker who already knows the input space (spec 22.2).
+MIN_PEPPER_BYTES = 32
+
 # The unprivileged principal the migration provisions (spec 19.1). Named here
 # so a DATABASE_URL that connects as anything else — the owner, most likely —
 # fails at boot rather than silently bypassing every policy.
@@ -219,6 +223,12 @@ class Settings(BaseSettings):
         pepper = self.fittrack_identity_pepper.get_secret_value()
         if not pepper.strip():
             raise ValueError("FITTRACK_IDENTITY_PEPPER must not be empty")
+        # Length checked here, not at first use. `identity_hash` also enforces
+        # it, but by then the service has started and reported healthy — the
+        # incident `fittrack.startup` exists to prevent. The length, never the
+        # value.
+        if len(pepper.encode()) < MIN_PEPPER_BYTES:
+            raise ValueError(f"FITTRACK_IDENTITY_PEPPER must be at least {MIN_PEPPER_BYTES} bytes")
         # Compared as bytes, not as text. The pepper is used as raw bytes and a
         # key is base64; a pepper of 32 literal "A" characters and a keyring
         # holding the base64 of 32 "A" bytes are different strings feeding both

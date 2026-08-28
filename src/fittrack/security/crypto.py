@@ -29,14 +29,19 @@ from typing import Final
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from fittrack import settings as settings_module
 from fittrack.settings import Settings
 
 # Two bytes, matching the positive SMALLINT the schema uses for `key_version`.
 VERSION_BYTES: Final = 2
 NONCE_BYTES: Final = 12
-KEY_BYTES: Final = 32
-MIN_VERSION: Final = 1
-MAX_VERSION: Final = 32767
+
+# Imported rather than restated. `Settings` validates the same bounds at boot,
+# and two copies would let a widened one there pass startup and then throw here,
+# at first use — which is the failure mode the boot validation exists to remove.
+KEY_BYTES: Final = settings_module.KEY_BYTES
+MIN_VERSION: Final = settings_module.MIN_KEY_VERSION
+MAX_VERSION: Final = settings_module.MAX_KEY_VERSION
 
 # Pinned in the AAD so a future change of scheme cannot be read by this one.
 CONTRACT: Final = b"fittrack:v1"
@@ -120,6 +125,19 @@ class Keyring:
             raise KeyringError(f"key version {version} is still in use by rows in the database")
 
 
+def _canonical(*parts: bytes) -> bytes:
+    """Join fields unambiguously.
+
+    Length-prefixed, not separator-joined, for the same reason `identity_hash`
+    is: with a separator, `table="a|b", column="c"` and `table="a", column="b|c"`
+    produce the same bytes, and a blob would authenticate across both. Table and
+    column names are code constants today, so this is discipline rather than a
+    live hole — but the sibling module already applies it, and one of the two
+    being lax is how the pair drifts.
+    """
+    return b"|".join(len(part).to_bytes(4, "big") + part for part in parts)
+
+
 def column_aad(*, tenant_id: int, table: str, column: str, row_id: int) -> bytes:
     """Associated data for a domain column.
 
@@ -127,14 +145,12 @@ def column_aad(*, tenant_id: int, table: str, column: str, row_id: int) -> bytes
     before encrypting — the ordering the spec calls for. Without the id, a blob
     would move freely between rows of the same column.
     """
-    return b"|".join(
-        [
-            CONTRACT,
-            table.encode(),
-            column.encode(),
-            f"tenant:{tenant_id}".encode(),
-            f"row:{row_id}".encode(),
-        ]
+    return _canonical(
+        CONTRACT,
+        table.encode(),
+        column.encode(),
+        f"tenant:{tenant_id}".encode(),
+        f"row:{row_id}".encode(),
     )
 
 
@@ -146,15 +162,25 @@ def identity_aad(*, channel: str, external_id_hash: bytes) -> bytes:
     one transaction. The hash pins it to a single identity all the same, which
     is what the row id does everywhere else.
     """
-    return b"|".join(
-        [
-            CONTRACT,
-            b"channel_identity",
-            b"external_id",
-            f"channel:{channel}".encode(),
-            f"hash:{external_id_hash.hex()}".encode(),
-        ]
+    return _canonical(
+        CONTRACT,
+        b"channel_identity",
+        b"external_id",
+        f"channel:{channel}".encode(),
+        f"hash:{external_id_hash.hex()}".encode(),
     )
+
+
+def _require_aad(aad: bytes) -> None:
+    """The docstring says associated data is mandatory; this makes it so.
+
+    A repository that built one conditionally — `aad = column_aad(...) if row_id
+    else b""`, plausible given the pre-tenant case this module already carries —
+    would otherwise write a ciphertext bound to nothing, which decrypts in every
+    context and fails no test.
+    """
+    if not aad:
+        raise ValueError("associated data is mandatory (spec 22.2)")
 
 
 def version_of(blob: bytes) -> int:
@@ -176,6 +202,7 @@ class ColumnCipher:
         return self._keyring.active_version
 
     def encrypt(self, plaintext: bytes, aad: bytes) -> bytes:
+        _require_aad(aad)
         version = self._keyring.active_version
         nonce = os.urandom(NONCE_BYTES)
         sealed = AESGCM(self._keyring.keys[version]).encrypt(nonce, plaintext, aad)
@@ -188,6 +215,7 @@ class ColumnCipher:
         is the normal case; disagreeing means a rotation stopped halfway, and
         reading past it would hide that.
         """
+        _require_aad(aad)
         if len(blob) <= VERSION_BYTES + NONCE_BYTES:
             raise DecryptionError(_FAILED)
 

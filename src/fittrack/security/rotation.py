@@ -36,9 +36,14 @@ class RotationError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class PepperRotation:
-    """What one rotation did. `scanned` and `rewritten` differing is a bug."""
+    """What one rotation did.
 
-    scanned: int
+    One counter, because there is nothing to skip: every row is rewritten or the
+    transaction unwinds. A `scanned`/`rewritten` pair would have been the same
+    number by construction, and a test asserting they matched would have looked
+    like a check while proving nothing.
+    """
+
     rewritten: int
 
 
@@ -57,7 +62,6 @@ async def rotate_pepper(
     _require_pepper(old_pepper)
     _require_pepper(new_pepper)
 
-    scanned = 0
     rewritten = 0
 
     async with connection.transaction():
@@ -66,19 +70,27 @@ async def rotate_pepper(
         # about to change — then create a second tenant for the same account.
         await connection.execute("LOCK TABLE channel_identity IN ACCESS EXCLUSIVE MODE")
 
-        rows = await connection.fetch(
-            "SELECT id, channel, external_id, external_id_hash FROM channel_identity"
-        )
-        for row in rows:
-            scanned += 1
+        # A server-side cursor, not `fetch`: the whole table would otherwise be
+        # buffered in memory while ACCESS EXCLUSIVE blocks every ingress lookup,
+        # and the one path the spec wants short would scale with the row count.
+        updates: list[tuple[int, bytes, bytes, int]] = []
+        async for row in connection.cursor(
+            "SELECT id, channel, external_id, external_id_hash, key_version FROM channel_identity"
+        ):
             channel = row["channel"]
             old_hash = bytes(row["external_id_hash"])
 
             # Fails closed on the wrong pepper, an already-rotated row under a
             # different one, or a tampered blob — and the transaction unwinds.
+            #
+            # `declared_version` is passed here for the same reason it exists
+            # everywhere else: this is the one job that touches every row, so a
+            # key backfill that stopped halfway would otherwise be quietly
+            # papered over by the rewrite below.
             external_id = cipher.decrypt(
                 bytes(row["external_id"]),
                 identity_aad(channel=channel, external_id_hash=old_hash),
+                declared_version=row["key_version"],
             ).decode()
 
             # The old pepper is not needed to *decrypt* — the associated data
@@ -94,20 +106,28 @@ async def rotate_pepper(
                 )
 
             new_hash = identity_hash(channel, external_id, new_pepper)
-            await connection.execute(
-                """
-                UPDATE channel_identity
-                   SET external_id = $2, external_id_hash = $3, key_version = $4
-                 WHERE id = $1
-                """,
-                row["id"],
-                cipher.encrypt(
-                    external_id.encode(),
-                    identity_aad(channel=channel, external_id_hash=new_hash),
-                ),
-                new_hash,
-                cipher.active_version,
+            updates.append(
+                (
+                    row["id"],
+                    cipher.encrypt(
+                        external_id.encode(),
+                        identity_aad(channel=channel, external_id_hash=new_hash),
+                    ),
+                    new_hash,
+                    cipher.active_version,
+                )
             )
-            rewritten += 1
 
-    return PepperRotation(scanned=scanned, rewritten=rewritten)
+        # One round trip instead of one per row. The lock is held for the whole
+        # transaction either way, so what this bounds is how long that is.
+        await connection.executemany(
+            """
+            UPDATE channel_identity
+               SET external_id = $2, external_id_hash = $3, key_version = $4
+             WHERE id = $1
+            """,
+            updates,
+        )
+        rewritten = len(updates)
+
+    return PepperRotation(rewritten=rewritten)

@@ -14,6 +14,9 @@ from __future__ import annotations
 import pytest
 
 from fittrack.security.crypto import (
+    KEY_BYTES,
+    MAX_VERSION,
+    MIN_VERSION,
     NONCE_BYTES,
     VERSION_BYTES,
     ColumnCipher,
@@ -153,9 +156,20 @@ def test_moving_an_intact_ciphertext_fails(cipher: ColumnCipher, moved: dict[str
         cipher.decrypt(blob, column_aad(**{**original, **moved}))  # type: ignore[arg-type]
 
 
-def test_the_column_aad_is_canonical_and_pins_the_contract() -> None:
-    assert column_aad(tenant_id=7, table="body_metric", column="value", row_id=3) == (
-        b"fittrack:v1|body_metric|value|tenant:7|row:3"
+def test_the_column_aad_pins_the_contract_and_every_field() -> None:
+    aad = column_aad(tenant_id=7, table="body_metric", column="value", row_id=3)
+    for part in (b"fittrack:v1", b"body_metric", b"value", b"tenant:7", b"row:3"):
+        assert part in aad
+
+
+def test_a_separator_cannot_be_smuggled_between_aad_fields() -> None:
+    """The same discipline `identity_hash` applies, for the same reason.
+
+    Separator-joined, `table="a|b", column="c"` and `table="a", column="b|c"`
+    are one string — and a blob would authenticate across both contexts.
+    """
+    assert column_aad(tenant_id=1, table="a|b", column="c", row_id=2) != column_aad(
+        tenant_id=1, table="a", column="b|c", row_id=2
     )
 
 
@@ -166,9 +180,17 @@ def test_the_identity_aad_needs_no_tenant() -> None:
     identity are created in one transaction — so the AAD cannot name a row id
     that does not exist yet.
     """
-    assert identity_aad(channel="telegram", external_id_hash=b"\xab\xcd") == (
-        b"fittrack:v1|channel_identity|external_id|channel:telegram|hash:abcd"
-    )
+    aad = identity_aad(channel="telegram", external_id_hash=b"\xab\xcd")
+    for part in (
+        b"fittrack:v1",
+        b"channel_identity",
+        b"external_id",
+        b"channel:telegram",
+        b"hash:abcd",
+    ):
+        assert part in aad
+    assert b"tenant:" not in aad
+    assert b"row:" not in aad
 
 
 def test_an_identity_blob_does_not_move_between_channels(cipher: ColumnCipher) -> None:
@@ -315,3 +337,29 @@ def test_the_keyring_is_built_from_validated_settings() -> None:
     keyring = Keyring.from_settings(settings)
     assert keyring.versions == {1, 2}
     assert keyring.active_version == 2
+
+
+# --------------------------------------------------------------------------- #
+# Associated data is mandatory, not merely documented
+# --------------------------------------------------------------------------- #
+
+
+def test_encrypting_without_associated_data_is_refused(cipher: ColumnCipher) -> None:
+    """A blob bound to nothing decrypts in every context and fails no test."""
+    with pytest.raises(ValueError, match="mandatory"):
+        cipher.encrypt(b"x", b"")
+
+
+def test_decrypting_without_associated_data_is_refused(cipher: ColumnCipher, aad: bytes) -> None:
+    blob = cipher.encrypt(b"x", aad)
+    with pytest.raises(ValueError, match="mandatory"):
+        cipher.decrypt(blob, b"")
+
+
+def test_the_bounds_come_from_one_place() -> None:
+    """Two copies let a widened bound pass boot and throw at first use."""
+    from fittrack import settings
+
+    assert KEY_BYTES == settings.KEY_BYTES
+    assert MIN_VERSION == settings.MIN_KEY_VERSION
+    assert MAX_VERSION == settings.MAX_KEY_VERSION

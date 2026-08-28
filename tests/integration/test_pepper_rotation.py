@@ -11,6 +11,8 @@ swapped only after the commit, and a failure rolls back before it.
 from __future__ import annotations
 
 import secrets
+import ssl
+from collections.abc import AsyncIterator
 
 import asyncpg
 import pytest
@@ -29,15 +31,22 @@ def cipher() -> ColumnCipher:
 
 
 @pytest.fixture
-async def empty_identities(owner: asyncpg.Connection) -> None:
-    """Rotation is table-wide, so the table has to start as this test's alone.
+async def owner(
+    disposable_migrated_database: str, trusting_ssl_context: ssl.SSLContext
+) -> AsyncIterator[asyncpg.Connection]:
+    """A connection to a database created for this test and dropped after it.
 
-    The database persists between tests and other modules leave identities
-    behind, encrypted under their own keys — which `rotate_pepper` would
-    correctly refuse to decrypt. That refusal is the behaviour under test
-    elsewhere; here it is just noise.
+    Rotation is table-wide, so it cannot run against the shared database: other
+    modules leave identities encrypted under their own keys, which it would
+    correctly refuse. Emptying the shared table instead would take their data
+    with it — `raw_message`, `outbound_queue` and `conversation_window` all
+    cascade from `channel_identity`.
     """
-    await owner.execute("TRUNCATE channel_identity CASCADE")
+    connection = await asyncpg.connect(disposable_migrated_database, ssl=trusting_ssl_context)
+    try:
+        yield connection
+    finally:
+        await connection.close()
 
 
 async def seed_identity(
@@ -64,7 +73,7 @@ async def seed_identity(
 
 
 async def test_every_lookup_still_resolves_after_rotation(
-    owner: asyncpg.Connection, cipher: ColumnCipher, empty_identities: None
+    owner: asyncpg.Connection, cipher: ColumnCipher
 ) -> None:
     external_id = f"chat-{secrets.token_hex(6)}"
     tenant, _ = await seed_identity(owner, cipher, "telegram", external_id)
@@ -87,7 +96,7 @@ async def test_every_lookup_still_resolves_after_rotation(
 
 
 async def test_the_identifier_is_still_readable_after_rotation(
-    owner: asyncpg.Connection, cipher: ColumnCipher, empty_identities: None
+    owner: asyncpg.Connection, cipher: ColumnCipher
 ) -> None:
     """Re-encrypted under the new AAD, because the hash is part of it."""
     external_id = f"chat-{secrets.token_hex(6)}"
@@ -106,7 +115,7 @@ async def test_the_identifier_is_still_readable_after_rotation(
 
 
 async def test_rotation_creates_no_duplicate_identity(
-    owner: asyncpg.Connection, cipher: ColumnCipher, empty_identities: None
+    owner: asyncpg.Connection, cipher: ColumnCipher
 ) -> None:
     """`ux_channel_identity_active` must hold throughout, not just at the end."""
     external_id = f"chat-{secrets.token_hex(6)}"
@@ -119,7 +128,7 @@ async def test_rotation_creates_no_duplicate_identity(
 
 
 async def test_rotation_is_idempotent_under_the_new_pepper(
-    owner: asyncpg.Connection, cipher: ColumnCipher, empty_identities: None
+    owner: asyncpg.Connection, cipher: ColumnCipher
 ) -> None:
     """Re-running with the same pair must not corrupt rows already rotated."""
     external_id = f"chat-{secrets.token_hex(6)}"
@@ -138,7 +147,7 @@ async def test_rotation_is_idempotent_under_the_new_pepper(
 
 
 async def test_a_failure_rolls_back_before_the_secret_is_swapped(
-    owner: asyncpg.Connection, cipher: ColumnCipher, empty_identities: None
+    owner: asyncpg.Connection, cipher: ColumnCipher
 ) -> None:
     """The ordering the spec insists on: commit, then swap; never the reverse.
 
@@ -167,7 +176,7 @@ async def test_a_failure_rolls_back_before_the_secret_is_swapped(
 
 
 async def test_a_revoked_identity_is_rotated_too(
-    owner: asyncpg.Connection, cipher: ColumnCipher, empty_identities: None
+    owner: asyncpg.Connection, cipher: ColumnCipher
 ) -> None:
     """Revoked rows keep their history and stay decryptable (LGPD, spec 19.5)."""
     external_id = f"chat-{secrets.token_hex(6)}"
@@ -186,16 +195,16 @@ async def test_a_revoked_identity_is_rotated_too(
 
 
 async def test_the_result_reports_what_it_did(
-    owner: asyncpg.Connection, cipher: ColumnCipher, empty_identities: None
+    owner: asyncpg.Connection, cipher: ColumnCipher
 ) -> None:
     await seed_identity(owner, cipher, "telegram", f"chat-{secrets.token_hex(6)}")
     result = await rotate_pepper(owner, cipher=cipher, old_pepper=OLD_PEPPER, new_pepper=NEW_PEPPER)
     assert isinstance(result, PepperRotation)
-    assert result.rewritten == result.scanned
+    assert result.rewritten == 1
 
 
 async def test_the_rotation_refuses_a_short_new_pepper(
-    owner: asyncpg.Connection, cipher: ColumnCipher, empty_identities: None
+    owner: asyncpg.Connection, cipher: ColumnCipher
 ) -> None:
     """Checked before the table is locked, not after."""
     from fittrack.security.identity_hash import PepperError
@@ -205,7 +214,7 @@ async def test_the_rotation_refuses_a_short_new_pepper(
 
 
 async def test_a_row_encrypted_under_another_key_stops_the_rotation(
-    owner: asyncpg.Connection, cipher: ColumnCipher, empty_identities: None
+    owner: asyncpg.Connection, cipher: ColumnCipher
 ) -> None:
     """Fails closed and rolls back, rather than rewriting what it cannot read."""
     from fittrack.security.crypto import DecryptionError
