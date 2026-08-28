@@ -33,7 +33,7 @@ WORKDIR /app
 # ---------------------------------------------------------------------------
 FROM base AS runtime
 
-COPY pyproject.toml uv.lock README.md ./
+COPY pyproject.toml uv.lock README.md alembic.ini ./
 COPY src/ ./src/
 # Versioned configuration travels with the image: model tiering by role and the
 # prompts, neither of which may live in Python (CLAUDE.md, invariant 4).
@@ -50,7 +50,7 @@ CMD ["python", "-m", "fittrack.worker"]
 # ---------------------------------------------------------------------------
 FROM base AS dev
 
-COPY pyproject.toml uv.lock README.md ./
+COPY pyproject.toml uv.lock README.md alembic.ini ./
 COPY src/ ./src/
 COPY config/ ./config/
 RUN --mount=type=cache,target=/root/.cache/uv \

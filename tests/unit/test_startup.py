@@ -22,7 +22,7 @@ def environment(**overrides: str) -> dict[str, str]:
     import json
 
     base = {
-        "DATABASE_URL": "postgresql+asyncpg://runtime:p@postgres:5432/f?sslmode=verify-full",
+        "DATABASE_URL": "postgresql+asyncpg://fittrack_runtime:p@postgres:5432/f?sslmode=verify-full",
         "REDIS_URL": "rediss://:p@redis:6379/0",
         "QDRANT_URL": "https://qdrant:6333",
         "FITTRACK_CHANNELS": "",
@@ -108,7 +108,7 @@ def test_no_startup_error_carries_the_input_that_failed(
     """
     secret = "hunter2-do-not-print-me-ever"
     values = environment(
-        DATABASE_URL=f"postgresql+asyncpg://u:{secret}@postgres:5432/f?sslmode=verify-full",
+        DATABASE_URL=f"postgresql+asyncpg://fittrack_runtime:{secret}@postgres:5432/f?sslmode=verify-full",
         FITTRACK_ENCRYPTION_KEYS="{}",
     )
     for name, value in values.items():
@@ -140,7 +140,7 @@ def test_an_uncaught_startup_failure_prints_no_secret(tmp_path: Path) -> None:
         if not k.startswith(("FITTRACK_", "DATABASE_", "REDIS_", "QDRANT_"))
     }
     child |= environment(
-        DATABASE_URL=f"postgresql+asyncpg://u:{secret}@postgres:5432/f?sslmode=verify-full",
+        DATABASE_URL=f"postgresql+asyncpg://fittrack_runtime:{secret}@postgres:5432/f?sslmode=verify-full",
         FITTRACK_ENCRYPTION_KEYS="{}",
     )
     child["PYTHONPATH"] = str(Path(__file__).resolve().parents[2] / "src")

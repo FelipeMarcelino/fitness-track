@@ -15,9 +15,12 @@ from __future__ import annotations
 import os
 import ssl
 import subprocess
+import sys
+from collections.abc import AsyncIterator
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+import asyncpg
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -154,3 +157,132 @@ def postgres_dsn(env: dict[str, str], ca_file: Path) -> str:
 @pytest.fixture(scope="session")
 def redis_password(env: dict[str, str], ca_file: Path) -> str:
     return _required(env, name="REDIS_PASSWORD", url_variable="REDIS_URL")
+
+
+# --------------------------------------------------------------------------- #
+# Database principals (spec 19.1)
+# --------------------------------------------------------------------------- #
+
+
+def _dsn(user: str, password: str, database: str) -> str:
+    return f"postgresql://{user}:{password}@{HOST['postgres']}:5432/{database}"
+
+
+@pytest.fixture(scope="session")
+def owner_dsn(env: dict[str, str], ca_file: Path) -> str:
+    """The migration principal. Owns the schema; never what the app connects as.
+
+    Everything is taken from `MIGRATION_DATABASE_URL` when it is set, user and
+    database included — a CI environment whose owner or database is not the
+    default would otherwise fail to authenticate before running a single test.
+
+    Raises rather than skips, for the same reason as the store credentials: a
+    green run that quietly did not migrate proves nothing.
+    """
+    configured = env.get("MIGRATION_DATABASE_URL", "")
+    user, password = _credentials_from(configured)
+    database = urlsplit(configured).path.strip("/") if configured else ""
+    return _dsn(
+        user or env.get("POSTGRES_USER", "fittrack"),
+        password or _required(env, name="POSTGRES_PASSWORD", url_variable="MIGRATION_DATABASE_URL"),
+        database or env.get("POSTGRES_DB", "fittrack"),
+    )
+
+
+def verified_dsn(dsn: str) -> str:
+    """The same DSN with the TLS parameters the migration runner needs.
+
+    The fixtures above pass an `SSLContext` straight to asyncpg; a subprocess
+    cannot, so it gets the libpq spelling and `fittrack.db.engine` turns it back
+    into a context.
+    """
+    separator = "&" if "?" in dsn else "?"
+    return (
+        dsn.replace("postgresql://", "postgresql+asyncpg://")
+        + f"{separator}sslmode=verify-full&sslrootcert={CA_FILE}"
+    )
+
+
+@pytest.fixture(scope="session")
+def app_dsn(env: dict[str, str], ca_file: Path) -> str:
+    """The runtime principal: NOSUPERUSER NOBYPASSRLS, owning nothing."""
+    password = _required(env, name="FITTRACK_RUNTIME_PASSWORD", url_variable="DATABASE_URL")
+    return _dsn("fittrack_runtime", password, env.get("POSTGRES_DB", "fittrack"))
+
+
+async def _connect(dsn: str, context: ssl.SSLContext) -> asyncpg.Connection:
+    return await asyncpg.connect(dsn, ssl=context)
+
+
+@pytest.fixture
+async def owner(
+    owner_dsn: str, trusting_ssl_context: ssl.SSLContext, migrated: None
+) -> AsyncIterator[asyncpg.Connection]:
+    connection = await _connect(owner_dsn, trusting_ssl_context)
+    try:
+        yield connection
+    finally:
+        await connection.close()
+
+
+@pytest.fixture
+async def app(
+    app_dsn: str, trusting_ssl_context: ssl.SSLContext, migrated: None
+) -> AsyncIterator[asyncpg.Connection]:
+    connection = await _connect(app_dsn, trusting_ssl_context)
+    try:
+        yield connection
+    finally:
+        await connection.close()
+
+
+@pytest.fixture(scope="session")
+def migrated(owner_dsn: str) -> None:
+    """Bring the database to head once per session.
+
+    Idempotent: `alembic upgrade head` on an already-migrated database is a
+    no-op, so the suite does not care whether the stack was freshly created.
+    """
+    result = subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "MIGRATION_DATABASE_URL": verified_dsn(owner_dsn),
+        },
+    )
+    if result.returncode != 0:
+        pytest.fail(
+            f"alembic upgrade head failed (exit {result.returncode}):\n"
+            f"--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
+        )
+
+
+@pytest.fixture
+async def disposable_database(
+    owner_dsn: str, trusting_ssl_context: ssl.SSLContext
+) -> AsyncIterator[str]:
+    """A database created for one test and dropped after it.
+
+    The migration cycle test drops every table of section 5.2. Run against the
+    application database, it would take a developer's local workouts with it.
+    """
+    import secrets
+
+    name = f"fittrack_cycle_{secrets.token_hex(6)}"
+    admin = await asyncpg.connect(owner_dsn, ssl=trusting_ssl_context)
+    try:
+        await admin.execute(f'CREATE DATABASE "{name}"')
+    finally:
+        await admin.close()
+
+    try:
+        yield urlsplit(owner_dsn)._replace(path=f"/{name}").geturl()
+    finally:
+        admin = await asyncpg.connect(owner_dsn, ssl=trusting_ssl_context)
+        try:
+            await admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+        finally:
+            await admin.close()
