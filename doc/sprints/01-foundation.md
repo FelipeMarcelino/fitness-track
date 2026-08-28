@@ -4,7 +4,7 @@
 | --- | --- |
 | Fase | 1.0 — Registro confiável |
 | Duração | 2 semanas |
-| Estado | `planned` |
+| Estado | `done` |
 | Objetivo | Tornar o repositório executável, testável e seguro para receber os fluxos de Telegram e LLM nas sprints seguintes |
 | Referências principais | spec §§3.1, 5.2, 19.1, 21.4, 22.2, 23 e 24 |
 
@@ -435,16 +435,16 @@ escopo. A divisão deve preservar testes e deixar cada commit/PR em estado execu
 
 A sprint termina somente quando todos os itens abaixo forem demonstrados:
 
-- [ ] novo clone entra no devshell e instala dependências;
-- [ ] `make fmt`, `make lint`, `make typecheck` e `make test` passam;
-- [ ] compose de produção não publica bancos e o override local é funcional;
-- [ ] ambiente sobe saudável e testes rodam dentro do worker;
-- [ ] migração completa chega a uma única `head` em Postgres vazio;
-- [ ] campos sensíveis nascem cifrados e a identidade é pesquisada por HMAC;
-- [ ] teste parametrizado comprova RLS em `tenant` e todas as tabelas tenant-scoped;
-- [ ] bootstrap é idempotente;
-- [ ] CI obrigatório está verde;
-- [ ] documentação e tabela de estado do `CLAUDE.md` refletem o repositório real.
+- [x] novo clone entra no devshell e instala dependências;
+- [x] `make fmt`, `make lint`, `make typecheck` e `make test` passam;
+- [x] compose de produção não publica bancos e o override local é funcional;
+- [x] ambiente sobe saudável e testes rodam dentro do worker;
+- [x] migração completa chega a uma única `head` em Postgres vazio;
+- [x] campos sensíveis nascem cifrados e a identidade é pesquisada por HMAC;
+- [x] teste parametrizado comprova RLS em `tenant` e todas as tabelas tenant-scoped;
+- [x] bootstrap é idempotente;
+- [x] CI obrigatório está verde;
+- [x] documentação e tabela de estado do `CLAUDE.md` refletem o repositório real.
 
 ## Riscos e mitigação
 

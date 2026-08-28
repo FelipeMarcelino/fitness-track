@@ -63,5 +63,6 @@ Uma tarefa está concluída quando:
 
 | Sprint | Fase | Objetivo | Estado |
 | --- | --- | --- | --- |
-| [Sprint 01 — Executable Foundation](01-foundation.md) | 1.0 | Fundação local, dados e segurança multi-tenant | `planned` |
+| [Sprint 01 — Executable Foundation](01-foundation.md) | 1.0 | Fundação local, dados e segurança multi-tenant | `done` |
+| [Sprint 02 — Telegram Inbound Pipeline](02-telegram-pipeline.md) | 1.0 | Webhook verificado, buffer/debounce e batch persistido | `planned` |
 
