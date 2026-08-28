@@ -9,13 +9,17 @@ import textwrap
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 import yaml
 from pydantic import ValidationError as PydanticValidationError
 
 from evals.judge.models import CaseVerdict, JudgeCase, RubricScore
 from evals.judge.rubrics import Rubric
+
+if TYPE_CHECKING:
+    from openai.types.responses import ResponseTextConfigParam
+    from openai.types.shared_params import Reasoning
 
 CREDENTIAL_ENV = "OPENAI_API_KEY"
 
@@ -24,6 +28,7 @@ MODELS_FILE = CONFIG_DIR / "models.yaml"
 PROMPT_FILE = CONFIG_DIR / "prompts" / "judge.md"
 
 NONCE_BYTES = 8
+ReasoningEffort = Literal["low", "medium", "high"]
 
 
 class MissingCredentialsError(RuntimeError):
@@ -36,7 +41,7 @@ class JudgeModelConfig:
 
     provider: str
     model: str
-    reasoning_effort: str
+    reasoning_effort: ReasoningEffort
 
 
 def judge_config(models_file: Path | None = None) -> JudgeModelConfig:
@@ -45,10 +50,13 @@ def judge_config(models_file: Path | None = None) -> JudgeModelConfig:
     config = yaml.safe_load(path.read_text(encoding="utf-8"))
     try:
         fallback = config["roles"]["JUDGE"]["fallback"]
+        reasoning_effort = fallback["reasoning_effort"]
+        if reasoning_effort not in ("low", "medium", "high"):
+            raise ValueError(f"invalid JUDGE reasoning_effort in {path}: {reasoning_effort!r}")
         return JudgeModelConfig(
             provider=str(fallback["provider"]),
             model=str(fallback["model"]),
-            reasoning_effort=str(fallback["reasoning_effort"]),
+            reasoning_effort=cast("ReasoningEffort", reasoning_effort),
         )
     except (KeyError, TypeError) as error:
         raise KeyError(f"no complete JUDGE role configured in {path}") from error
@@ -225,7 +233,7 @@ class OpenAIBackend:
         self,
         model: str | None = None,
         api_key: str | None = None,
-        reasoning_effort: str | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
     ) -> None:
         key = api_key or os.environ.get(CREDENTIAL_ENV)
         if not key:
@@ -273,8 +281,11 @@ class OpenAIBackend:
             instructions=build_system_prompt(nonce),
             input=f"Rubricas:\n\n{_render_rubrics(rubrics)}\n\n{block}",
             max_output_tokens=2048,
-            reasoning={"effort": self.reasoning_effort},
-            text={"format": self._response_format(rubrics)},
+            reasoning=cast("Reasoning", {"effort": self.reasoning_effort}),
+            text=cast(
+                "ResponseTextConfigParam",
+                {"format": self._response_format(rubrics)},
+            ),
             store=False,
         )
         try:
