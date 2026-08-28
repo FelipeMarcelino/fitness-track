@@ -9,13 +9,14 @@ were not created by Alembic, and the bootstrap can run twice.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 import asyncpg
 import pytest
-from scripts.bootstrap import LANGGRAPH_TABLES
+from scripts.bootstrap import LANGGRAPH_TABLES, BootstrapError
 
 from tests.conftest import ROOT, verified_dsn
 
@@ -119,11 +120,23 @@ async def test_alembic_did_not_create_the_langgraph_tables(
 
     A migration owning them would fork their schema from the library's.
     """
-    migration_source = Path(ROOT / "src/fittrack/db/migrations/versions").rglob("*.py")
-    for path in migration_source:
+    # `CREATE TABLE <name>` alone matches neither spelling a migration would
+    # realistically use: LangGraph itself writes `CREATE TABLE IF NOT EXISTS`,
+    # which is what a copy-paste would carry, and Alembic's own idiom is
+    # `op.create_table("checkpoints", ...)`. The test could not fail.
+    patterns = [
+        "CREATE TABLE {table}",
+        "CREATE TABLE IF NOT EXISTS {table}",
+        'op.create_table("{table}"',
+        "op.create_table('{table}'",
+    ]
+    for path in Path(ROOT / "src/fittrack/db/migrations/versions").rglob("*.py"):
         text = path.read_text(encoding="utf-8")
-        for table in GRAPH_STATE_TABLES:
-            assert f"CREATE TABLE {table}" not in text, f"{path.name} creates {table}"
+        collapsed = " ".join(text.split())
+        for table in LANGGRAPH_TABLES:
+            for pattern in patterns:
+                needle = pattern.format(table=table)
+                assert needle not in collapsed, f"{path.name} creates {table}: {needle}"
 
 
 async def test_every_service_of_the_topology_is_reachable(
@@ -218,12 +231,67 @@ async def test_bootstrap_knows_every_table_langgraph_creates(
     finally:
         await connection.close()
 
-    created = after - before
-    # Everything Alembic makes is in the migration and already has a policy;
-    # what is left is what `setup()` made.
-    unknown = {
-        table
-        for table in created
-        if table.startswith(("checkpoint", "store")) and table not in LANGGRAPH_TABLES
-    }
-    assert not unknown, f"LangGraph now creates tables bootstrap does not revoke on: {unknown}"
+    # Everything the migrations create, taken from the migrations themselves
+    # rather than guessed at — so what is left over really is what `setup()`
+    # made. Filtering on a `checkpoint`/`store` prefix instead was narrower than
+    # the docstring claimed: this version of langgraph-checkpoint-postgres
+    # already creates `vector_migrations` when an index config is passed, and a
+    # prefix filter would wave it through.
+    from_migrations = tables_named_in_migrations()
+    unknown = (after - before) - set(LANGGRAPH_TABLES) - from_migrations - {"alembic_version"}
+    assert not unknown, f"bootstrap created tables the revoke does not know about: {unknown}"
+
+
+def tables_named_in_migrations() -> set[str]:
+    """Every table name a migration creates, read out of the migration source."""
+    names: set[str] = set()
+    pattern = re.compile(
+        r"""CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?"?(\w+)"?"""
+        r"""|op\.create_table\(\s*["'](\w+)["']""",
+        re.IGNORECASE,
+    )
+    for path in Path(ROOT / "src/fittrack/db/migrations/versions").rglob("*.py"):
+        collapsed = " ".join(path.read_text(encoding="utf-8").split())
+        for match in pattern.finditer(collapsed):
+            names.add(match.group(1) or match.group(2))
+    return names
+
+
+async def test_check_does_not_call_an_unmigrated_database_ready(
+    disposable_database: str,
+) -> None:
+    """`--check` answers "is this environment ready?", so it must not lie.
+
+    `alembic current` exits 0 and prints nothing when there is no
+    `alembic_version` table at all, and reading that as "ok" reported a
+    database with no schema on it as healthy.
+    """
+    result = run_bootstrap(disposable_database, "--check")
+
+    assert result.returncode == 1, result.stdout
+    assert "no migrations have been applied" in result.stderr
+
+    assert run_bootstrap(disposable_database).returncode == 0
+    migrated = run_bootstrap(disposable_database, "--check")
+    assert migrated.returncode == 0
+    assert "0003" in migrated.stdout
+
+
+async def test_the_revoke_refuses_to_report_success_after_finding_nothing(
+    disposable_migrated_database: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Its only failure mode must not be silence.
+
+    `setup()` runs moments before, so finding no tables does not mean there was
+    nothing to revoke — it means the lookup went somewhere else, and the
+    application kept full DML on every tenant's graph state. The old version
+    would have printed "revoked on 0 table(s)" and exited 0.
+    """
+    from scripts.bootstrap import revoke_application_grants
+
+    monkeypatch.setattr("scripts.bootstrap.LANGGRAPH_TABLES", ("no_such_table",))
+
+    with pytest.raises(BootstrapError, match="has NOT been revoked"):
+        await revoke_application_grants(
+            verified_dsn(disposable_migrated_database).replace("+asyncpg", "")
+        )

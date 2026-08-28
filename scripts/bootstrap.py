@@ -50,7 +50,17 @@ def migrate(check_only: bool = False) -> str:
         # stderr, not stdout: alembic puts the DSN nowhere, but a driver error
         # can, and this is the one place that would print it.
         raise BootstrapError(f"alembic {' '.join(command)} failed:\n{result.stderr}")
-    return result.stdout.strip() or "ok"
+
+    reported = result.stdout.strip()
+    if check_only and not reported:
+        # `alembic current` exits 0 and prints nothing when there is no
+        # `alembic_version` table at all. Reading that as "ok" answered "is this
+        # environment ready?" with yes, on a database with no schema on it.
+        raise BootstrapError(
+            "no migrations have been applied to this database. "
+            "Run `make bootstrap` (without --check) to create the schema."
+        )
+    return reported or "ok"
 
 
 async def setup_langgraph_tables(dsn: str) -> str:
@@ -101,6 +111,11 @@ LANGGRAPH_TABLES = (
     "store_migrations",
 )
 
+# The two that hold the state itself, as opposed to the library's bookkeeping.
+# Their absence after `setup()` means the revoke looked in the wrong place, not
+# that there was nothing to revoke.
+REQUIRED_TABLES = frozenset({"checkpoints", "store"})
+
 
 async def revoke_application_grants(dsn: str) -> str:
     """Take back the DML that `ALTER DEFAULT PRIVILEGES` handed out silently.
@@ -123,10 +138,29 @@ async def revoke_application_grants(dsn: str) -> str:
             (list(LANGGRAPH_TABLES),),
         )
         present = sorted(row[0] for row in await cursor.fetchall())
+
+        # `setup()` ran moments ago, so finding nothing does not mean "nothing
+        # to do" — it means the tables are not where this looked, and the only
+        # visible result would be a cheerful "revoked on 0 table(s)" while the
+        # application kept full DML on every tenant's graph state. The one
+        # failure mode of a function like this must not be silence.
+        missing = sorted(REQUIRED_TABLES - set(present))
+        if missing:
+            raise BootstrapError(
+                f"LangGraph setup() ran but {', '.join(missing)} is not in the public schema. "
+                "The application's inherited DML on the graph-state tables has NOT been "
+                "revoked. Check search_path and the LangGraph version before using this "
+                "database."
+            )
+
         for table in present:
-            # An identifier cannot be a bind parameter. These are literals from
-            # the tuple above, filtered through pg_class — not input.
-            await cursor.execute(f'REVOKE ALL ON TABLE "{table}" FROM fittrack_app')
+            # Schema-qualified: the lookup above is scoped to `public`, and an
+            # unqualified REVOKE resolves through `search_path` instead — which
+            # could revoke on a different table of the same name, and report
+            # success either way. An identifier cannot be a bind parameter, and
+            # these are literals from the tuple above filtered through pg_class,
+            # not input.
+            await cursor.execute(f'REVOKE ALL ON TABLE public."{table}" FROM fittrack_app')
 
     return f"application grants revoked on {len(present)} table(s)"
 

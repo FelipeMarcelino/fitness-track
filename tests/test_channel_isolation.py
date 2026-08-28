@@ -64,11 +64,16 @@ def imports_channels(source: str) -> bool:
                 return True
         elif isinstance(node, ast.ImportFrom):
             module = node.module or ""
-            # `from . import x` names the package in the aliases rather than in
-            # the module, so an empty relative module is only a hit when one of
-            # them is `channels`; otherwise it is an ordinary sibling import.
-            named_in_aliases = bool(module) or any(a.name == "channels" for a in node.names)
-            if named_in_aliases and names_channels(module, relative=bool(node.level)):
+            relative = bool(node.level)
+            # `from fittrack import channels` and `from . import channels` both
+            # put the package in the alias list rather than in the module, so
+            # the module alone never names it. Joining the two is what catches
+            # the most idiomatic absolute spelling of the one import this whole
+            # file exists to ban — which the first two versions both missed.
+            paths = [f"{module}.{alias.name}" if module else alias.name for alias in node.names]
+            if any(names_channels(path, relative=relative) for path in paths):
+                return True
+            if module and names_channels(module, relative=relative):
                 return True
         elif isinstance(node, ast.Call) and imports_channels_dynamically(node):
             return True
@@ -95,11 +100,14 @@ def imports_channels_dynamically(node: ast.Call) -> bool:
     )
     if name not in {"import_module", "__import__"}:
         return False
+    # Keywords as well as positionals: `import_module(name="fittrack.channels")`
+    # is the same import wearing a different hat.
+    arguments = [*node.args, *(keyword.value for keyword in node.keywords)]
     return any(
         isinstance(argument, ast.Constant)
         and isinstance(argument.value, str)
         and names_channels(argument.value, relative=False)
-        for argument in node.args
+        for argument in arguments
     )
 
 
@@ -256,6 +264,12 @@ def test_the_exceptions_are_named_and_few() -> None:
             id="importlib",
         ),
         pytest.param('m = __import__("fittrack.channels")', id="dunder import"),
+        pytest.param("from fittrack import channels", id="package as the alias"),
+        pytest.param("from fittrack import channels as ch", id="package aliased"),
+        pytest.param(
+            'm = importlib.import_module(name="fittrack.channels")', id="importlib by keyword"
+        ),
+        pytest.param('m = __import__(name="fittrack.channels")', id="dunder by keyword"),
     ],
 )
 def test_the_checker_catches_every_import_spelling(source: str) -> None:
@@ -270,6 +284,8 @@ def test_the_checker_catches_every_import_spelling(source: str) -> None:
         pytest.param("from . import nodes", id="relative sibling that is not channels"),
         pytest.param('NOTE = "channel_caps is read in voice.py"', id="a mention in a string"),
         pytest.param('m = importlib.import_module("fittrack.agents.voice")', id="another module"),
+        pytest.param("from fittrack import agents", id="a sibling package as the alias"),
+        pytest.param("from fittrack.graph import channels_helper", id="a name that merely starts"),
     ],
 )
 def test_the_checker_does_not_fire_on_innocent_code(source: str) -> None:
