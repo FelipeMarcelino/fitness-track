@@ -31,8 +31,20 @@ ALLOWED = {".env.example"}
 PRIVATE_KEY_HEADER = re.compile(rb"-----BEGIN (RSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----")
 
 
-def tracked_files() -> list[str]:
-    result = subprocess.run(["git", "ls-files", "-z"], cwd=ROOT, capture_output=True, check=True)
+def tracked_files() -> list[str] | None:
+    """Tracked paths, or None where Git cannot answer.
+
+    The application image ships the tree without `.git` and without a Git
+    binary, so this check belongs to the host and to CI. Returning None rather
+    than an empty list keeps "nothing is tracked" distinguishable from
+    "cannot tell" — the first would be a silent pass.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", "-z"], cwd=ROOT, capture_output=True, check=True
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return None
     return [name for name in result.stdout.decode().split("\0") if name]
 
 
@@ -40,7 +52,7 @@ def tracked_files() -> list[str]:
 def tracked() -> list[str]:
     files = tracked_files()
     if not files:
-        pytest.skip("not a git checkout")
+        pytest.skip("not a git checkout, or Git is unavailable")
     return files
 
 

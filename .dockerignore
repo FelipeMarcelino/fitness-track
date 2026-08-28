@@ -1,0 +1,17 @@
+.git
+.github
+.venv
+.direnv
+.envrc
+.env
+certs/
+doc/
+*.md
+!README.md
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+result

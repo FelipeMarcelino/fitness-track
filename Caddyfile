@@ -1,0 +1,64 @@
+# Edge. Terminates TLS and forwards to the ingress replicas.
+#
+# FITTRACK_SITE_ADDRESS is the whole switch between local and production: set it
+# to `:80` for a local run, or to the public hostname to have Caddy obtain a
+# certificate automatically. Telegram will not register a webhook without a
+# valid one (spec 3.1).
+
+{
+	# Loopback only. The admin API is unauthenticated and can rewrite the live
+	# edge configuration, so on `:2019` one compromised container — or an SSRF
+	# capable enough — could point the public edge at anything private. The
+	# healthcheck probes 127.0.0.1, so nothing needs it on the network.
+	admin 127.0.0.1:2019
+	email {$FITTRACK_ACME_EMAIL:admin@example.com}
+}
+
+# Caddy refuses a TLS policy on a listener that terminates no TLS, so this is a
+# choice of block rather than a flag that could be left on everywhere.
+#
+#   FITTRACK_EDGE_PROFILE=secure     the default, and what production wants
+#   FITTRACK_EDGE_PROFILE=plaintext  local run on :80, which terminates no TLS
+#
+# `secure` is the default deliberately: changing only FITTRACK_SITE_ADDRESS to a
+# public hostname — which the header above invites — would otherwise leave Caddy
+# on its own policy, still accepting TLS 1.2. The local override is the one that
+# has to be asked for, and `.env.example` asks for it.
+#
+# Spec 22.1 names TLS 1.3 at the edge, and Caddy's default still permits 1.2 —
+# so `secure` pins it rather than inheriting.
+(plaintext) {
+}
+
+(secure) {
+	tls {
+		protocols tls1.3
+	}
+}
+
+{$FITTRACK_SITE_ADDRESS::80} {
+	import {$FITTRACK_EDGE_PROFILE:secure}
+
+	encode zstd gzip
+
+	# The webhook secret travels in a header, not in the path, so nothing here
+	# needs to know it. Verification belongs to the channel adapter (spec 18.2).
+	handle /webhook/* {
+		reverse_proxy ingress:8000
+	}
+
+	handle /health {
+		reverse_proxy ingress:8000
+	}
+
+	# Nothing else is public: no endpoint may reveal whether a tenant exists
+	# (spec 22, "enumeração de usuários").
+	handle {
+		respond "not found" 404
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}
