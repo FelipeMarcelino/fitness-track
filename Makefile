@@ -9,7 +9,7 @@ PYTEST  ?= $(PYTHON) -m pytest
 RUFF    ?= $(PYTHON) -m ruff
 MYPY    ?= $(PYTHON) -m mypy
 
-.PHONY: help sync fmt fmt-check lint typecheck test test-integration eval-judge check clean
+.PHONY: help sync fmt fmt-check lint typecheck test test-architecture test-integration eval-judge check clean
 
 help: ## List the available targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -33,6 +33,12 @@ typecheck: ## mypy in strict mode
 
 test: ## Unit and architecture tests; no containers required
 	$(PYTEST) -m "not integration"
+
+# Section 21.4 runs these before everything: cheapest to run, costliest to
+# regress. `test_graph_reducers` and `test_graph_topology` join them in the PR
+# that introduces the graph — a topology test over no topology proves nothing.
+test-architecture: ## The architecture guardrails alone (spec 21.4)
+	$(PYTEST) tests/test_channel_isolation.py
 
 test-integration: ## Tests that need Postgres, Redis or Qdrant (spec 21.4)
 	$(PYTEST) -m integration
@@ -87,7 +93,7 @@ reset: ## Destroy the local volumes and rebuild the stack from scratch
 	$(COMPOSE_DEV) down --volumes
 	$(MAKE) up
 
-.PHONY: migrate migrate-down revision
+.PHONY: migrate migrate-down revision bootstrap
 
 # Through the worker, not on the host: the generated migration URL names
 # `postgres` and `/certs/ca.crt`, which resolve inside the compose network and
@@ -113,3 +119,7 @@ migrate-down: ## Roll back one revision. Requires DSN=<disposable database>
 # On the host: Alembic writes the new file, and the worker mounts src/ read-only.
 revision: ## Create a new migration: make revision M="what it does"
 	$(PYTHON) -m alembic revision -m "$(M)"
+
+bootstrap: ## Migrate and set up the LangGraph tables. Idempotent.
+	$(COMPOSE_DEV) run --rm -e MIGRATION_DATABASE_URL="$(OWNER_DSN)" worker \
+		python -m scripts.bootstrap

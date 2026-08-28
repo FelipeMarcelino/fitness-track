@@ -20,6 +20,9 @@ dependencies = [
     # AsyncPostgresStore are stable from the 0.6 line onwards.
     "langgraph>=0.6,<0.8",
     "langgraph-checkpoint-postgres>=2.0,<3",
+    # The checkpointer speaks psycopg, not asyncpg, and psycopg without a
+    # libpq binding imports and then fails at connect time.
+    "psycopg[binary]>=3.2,<4",
     "langchain-core>=0.3,<0.4",
 
     # Contracts and configuration.

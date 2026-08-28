@@ -40,9 +40,15 @@ de verdade — que é o caso dos testes de integração da §21.4:
 
 ```bash
 make up               # certificados de dev + .env + sobe a stack e espera ficar saudável
+make bootstrap        # migra o banco e cria as tabelas do LangGraph. Idempotente.
 make test-in-worker   # a suíte inteira dentro do worker, contra os serviços reais
 make down
 ```
+
+`make bootstrap` é o caminho de clone limpo até ambiente utilizável, e roda duas vezes sem
+duplicar nem destruir nada — `tests/integration/test_environment_smoke.py` prova as duas coisas.
+As tabelas do checkpointer e do store **não** estão no Alembic: são criadas pelo `setup()` da
+própria biblioteca, porque uma migração as bifurcaria do schema que a biblioteca evolui (§5.3).
 
 Os alvos acima são atalhos para o par de arquivos Compose, que precisa ser sempre passado junto:
 
@@ -68,6 +74,22 @@ Duas coisas que o `make up` faz por você e são fáceis de errar à mão:
 > no WSL o cliente vem da integração do Docker Desktop (`/usr/bin/docker`), e um segundo cliente
 > dentro do devshell o sombreia com um que não conhece o contexto do Desktop. O docker é usado de
 > dentro do devshell normalmente — ele só não é *provido* por ele.
+
+### Os três testes de arquitetura
+
+`make test-architecture` roda antes de tudo no CI, e é deliberado: são os mais baratos e cobrem as
+regressões mais caras. Um `import` de `channels` dentro de um subgrafo custa segundos para detectar
+e semanas para desfazer depois que três funcionalidades foram construídas em cima dele (§21.4).
+
+| Teste | Sustenta | Estado |
+| --- | --- | --- |
+| `test_channel_isolation` | `graph/` e `agents/` não importam de `channels/` nem leem `channel_caps` (AD-39) | existe |
+| `test_graph_reducers` | toda chave concorrente do estado tem reducer (§8.8) | entra com o `GraphState` |
+| `test_graph_topology` | nós alcançáveis, destinos declarados existem (§8.3) | entra com o grafo raiz |
+
+Os dois últimos **não** existem ainda, e isso é intencional: um teste de topologia sobre topologia
+nenhuma passa sem provar nada, que é pior do que teste nenhum. Eles entram na mesma PR que
+introduzir o que eles verificam.
 
 ### `make` é quem dirige
 
