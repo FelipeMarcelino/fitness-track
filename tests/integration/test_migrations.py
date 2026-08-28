@@ -19,17 +19,25 @@ async def test_the_migration_reaches_a_single_head(owner: asyncpg.Connection) ->
 
 
 async def test_the_langgraph_tables_are_not_owned_by_alembic(
-    owner: asyncpg.Connection,
+    disposable_migrated_database: str, trusting_ssl_context: ssl.SSLContext
 ) -> None:
     """Checkpointer and store tables are created by LangGraph's own bootstrap.
 
     Putting them in a migration would fork their schema from the library's, and
     the library upgrades them itself (spec 5.3).
+
+    On a database that has only ever been migrated — the shared one has also had
+    `make bootstrap` run against it, which creates these tables on purpose, so
+    asserting their absence there stopped saying anything about Alembic.
     """
-    for table in ("checkpoints", "checkpoint_blobs", "checkpoint_writes", "store"):
-        assert not await owner.fetchval("SELECT to_regclass($1) IS NOT NULL", f"public.{table}"), (
-            f"{table} should not be created by Alembic"
-        )
+    connection = await asyncpg.connect(disposable_migrated_database, ssl=trusting_ssl_context)
+    try:
+        for table in ("checkpoints", "checkpoint_blobs", "checkpoint_writes", "store"):
+            assert not await connection.fetchval(
+                "SELECT to_regclass($1) IS NOT NULL", f"public.{table}"
+            ), f"{table} should not be created by Alembic"
+    finally:
+        await connection.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -136,7 +144,7 @@ async def test_downgrade_then_upgrade_rebuilds_the_schema(
     import sys
     from pathlib import Path
 
-    from tests.integration.conftest import verified_dsn
+    from tests.conftest import verified_dsn
 
     root = Path(__file__).resolve().parents[2]
     env = {**os.environ, "MIGRATION_DATABASE_URL": verified_dsn(disposable_database)}
