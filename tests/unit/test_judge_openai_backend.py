@@ -88,6 +88,7 @@ def test_openai_backend_uses_responses_structured_outputs(
     assert client.api_key == "secret-from-test"
     request = client.responses.calls[-1]
     assert request["model"] == "model-from-test"
+    assert request["max_output_tokens"] == 16_384
     assert request["reasoning"] == {"effort": "high"}
     assert request["store"] is False
     response_format = request["text"]["format"]

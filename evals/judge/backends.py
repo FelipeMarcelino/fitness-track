@@ -28,6 +28,10 @@ MODELS_FILE = CONFIG_DIR / "models.yaml"
 PROMPT_FILE = CONFIG_DIR / "prompts" / "judge.md"
 
 NONCE_BYTES = 8
+# Responses counts hidden reasoning and visible JSON against the same ceiling.
+# The judge uses high effort, so the old 2,048 visible-token budget could end
+# before a complete structured verdict was emitted.
+MAX_OUTPUT_TOKENS = 16_384
 ReasoningEffort = Literal["low", "medium", "high"]
 
 
@@ -280,7 +284,7 @@ class OpenAIBackend:
             model=self.model,
             instructions=build_system_prompt(nonce),
             input=f"Rubricas:\n\n{_render_rubrics(rubrics)}\n\n{block}",
-            max_output_tokens=2048,
+            max_output_tokens=MAX_OUTPUT_TOKENS,
             reasoning=cast("Reasoning", {"effort": self.reasoning_effort}),
             text=cast(
                 "ResponseTextConfigParam",
