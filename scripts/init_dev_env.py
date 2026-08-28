@@ -65,9 +65,16 @@ KEY_BYTES = 32
 SecretFactory = Callable[[str], str]
 
 
+# `token_urlsafe(24)` is exactly 32 characters, which is the pepper minimum with
+# zero margin — one hand-edit below it and nothing boots. 48 bytes leaves room.
+PEPPER_KEYS = frozenset({"FITTRACK_IDENTITY_PEPPER"})
+
+
 def _default_factory(name: str) -> str:
     if name in HEX_KEYS:
         return secrets.token_hex(32)
+    if name in PEPPER_KEYS:
+        return secrets.token_urlsafe(48)
     if name in KEYRING_KEYS:
         key = base64.b64encode(secrets.token_bytes(KEY_BYTES)).decode()
         return json.dumps({"1": key}, separators=(",", ":"))

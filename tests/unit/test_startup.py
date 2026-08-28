@@ -28,7 +28,7 @@ def environment(**overrides: str) -> dict[str, str]:
         "FITTRACK_CHANNELS": "",
         "FITTRACK_ENCRYPTION_KEYS": json.dumps({"1": base64.b64encode(b"A" * 32).decode()}),
         "FITTRACK_ACTIVE_KEY_VERSION": "1",
-        "FITTRACK_IDENTITY_PEPPER": "pepper",
+        "FITTRACK_IDENTITY_PEPPER": "a-startup-pepper-of-sufficient-length",
         "FITTRACK_CONFIG_DIR": str(CONFIG_DIR),
     }
     base.update(overrides)

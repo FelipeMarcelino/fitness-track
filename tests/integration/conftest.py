@@ -286,3 +286,26 @@ async def disposable_database(
             await admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
         finally:
             await admin.close()
+
+
+@pytest.fixture
+async def disposable_migrated_database(disposable_database: str) -> str:
+    """A disposable database with the schema on it.
+
+    For tests of operations that are *table-wide*. Those cannot run against the
+    shared database: other modules leave rows encrypted under their own keys,
+    and the operation would correctly refuse them — noise rather than the
+    behaviour under test. Emptying the shared table instead would take other
+    modules' data with it, through the three foreign keys that cascade from
+    `channel_identity`.
+    """
+    result = subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "MIGRATION_DATABASE_URL": verified_dsn(disposable_database)},
+    )
+    if result.returncode != 0:
+        pytest.fail(f"could not migrate the disposable database:\n{result.stderr}")
+    return disposable_database

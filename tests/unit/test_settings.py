@@ -22,7 +22,8 @@ from fittrack.settings import Settings
 
 KEY_A = base64.b64encode(b"A" * 32).decode()
 KEY_B = base64.b64encode(b"B" * 32).decode()
-PEPPER = "an-independent-pepper"
+# At least 32 bytes: the pepper is key material and settings check it at boot.
+PEPPER = "an-independent-pepper-of-sufficient-length"
 
 
 def env(**overrides: str) -> dict[str, str]:
@@ -509,3 +510,13 @@ def test_a_malformed_dsn_is_rejected(dsn: str) -> None:
     """A URL with a good sslmode and nothing to connect to is not a valid DSN."""
     with pytest.raises(ValidationError):
         build(DATABASE_URL=dsn)
+
+
+def test_a_short_pepper_is_rejected_at_boot() -> None:
+    """Not at first use: by then the service has started and reported healthy.
+
+    `identity_hash` enforces it too, but that is the second line — and the
+    first webhook is a bad moment to discover a malformed deployment.
+    """
+    with pytest.raises(ValidationError, match="32 bytes"):
+        build(FITTRACK_IDENTITY_PEPPER="too-short-to-be-a-pepper")
