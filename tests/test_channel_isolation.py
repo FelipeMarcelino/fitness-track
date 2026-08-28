@@ -32,7 +32,27 @@ GUARDED = ("fittrack/graph", "fittrack/agents")
 EXCEPTIONS = frozenset({"fittrack/graph/nodes/voice.py", "fittrack/graph/nodes/deliver.py"})
 
 FORBIDDEN_MODULE = "fittrack.channels"
+FORBIDDEN_SEGMENTS = FORBIDDEN_MODULE.split(".")
 FORBIDDEN_ATTRIBUTE = "channel_caps"
+
+
+def names_channels(module: str, *, relative: bool) -> bool:
+    """Whether a dotted module path refers to the channels package.
+
+    Segment-wise rather than by prefix or suffix. `endswith("channels")` was
+    both too loose — a hypothetical `subchannels` would match — and too tight:
+    it missed `from ..channels.telegram import X`, where the path ends in the
+    submodule, not in `channels`. That spelling is the natural one to reach for
+    from inside `graph/`, and it was the one getting through.
+    """
+    segments = module.split(".") if module else []
+    if segments[: len(FORBIDDEN_SEGMENTS)] == FORBIDDEN_SEGMENTS:
+        return True
+    if relative:
+        # `from . import channels` arrives as an empty module with the name in
+        # the alias list, which the caller checks separately.
+        return not segments or segments[0] == "channels"
+    return False
 
 
 def imports_channels(source: str) -> bool:
@@ -40,17 +60,47 @@ def imports_channels(source: str) -> bool:
     tree = ast.parse(source)
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            if any(alias.name.startswith(FORBIDDEN_MODULE) for alias in node.names):
+            if any(names_channels(alias.name, relative=False) for alias in node.names):
                 return True
         elif isinstance(node, ast.ImportFrom):
-            # `from fittrack.channels import x`, and the relative spellings that
-            # resolve to it — `from ..channels import x` inside `graph/`.
             module = node.module or ""
-            if module.startswith(FORBIDDEN_MODULE) or module.endswith("channels"):
+            # `from . import x` names the package in the aliases rather than in
+            # the module, so an empty relative module is only a hit when one of
+            # them is `channels`; otherwise it is an ordinary sibling import.
+            named_in_aliases = bool(module) or any(a.name == "channels" for a in node.names)
+            if named_in_aliases and names_channels(module, relative=bool(node.level)):
                 return True
-            if node.level and module in {"", "channels"}:
-                return True
+        elif isinstance(node, ast.Call) and imports_channels_dynamically(node):
+            return True
     return False
+
+
+def imports_channels_dynamically(node: ast.Call) -> bool:
+    """`importlib.import_module("fittrack.channels...")` and `__import__`.
+
+    An AST check that only looks at `import` statements is evaded by spelling
+    the module as a string. Nothing in the codebase imports dynamically, so the
+    rule here is absolute: a literal naming the channels package, passed to
+    something that imports, is a violation regardless of which import function
+    it is — matching on the argument rather than on the callee keeps a future
+    wrapper from slipping past.
+    """
+    callee = node.func
+    name = (
+        callee.attr
+        if isinstance(callee, ast.Attribute)
+        else callee.id
+        if isinstance(callee, ast.Name)
+        else ""
+    )
+    if name not in {"import_module", "__import__"}:
+        return False
+    return any(
+        isinstance(argument, ast.Constant)
+        and isinstance(argument.value, str)
+        and names_channels(argument.value, relative=False)
+        for argument in node.args
+    )
 
 
 def reads_channel_caps(source: str) -> bool:
@@ -180,3 +230,48 @@ def test_the_exceptions_are_named_and_few() -> None:
         "fittrack/graph/nodes/voice.py",
         "fittrack/graph/nodes/deliver.py",
     } == EXCEPTIONS
+
+
+# --------------------------------------------------------------------------- #
+# Spellings that got past the first version
+# --------------------------------------------------------------------------- #
+#
+# Found by attacking the checker rather than by reading it. Each of these is a
+# way a domain module could reach `channels/` while the guardrail stayed green,
+# which makes them the only tests here that matter — a rule nobody tried to
+# break is a rule nobody knows the shape of.
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param("from ..channels.telegram import Adapter", id="relative submodule"),
+        pytest.param("from ...channels.telegram.api import send", id="relative deeper"),
+        pytest.param("from ..channels import Adapter", id="relative package"),
+        pytest.param("from . import channels", id="relative sibling"),
+        pytest.param("from fittrack.channels.telegram import Adapter", id="absolute submodule"),
+        pytest.param("import fittrack.channels.telegram.api", id="absolute deep"),
+        pytest.param(
+            'import importlib\nm = importlib.import_module("fittrack.channels.telegram")',
+            id="importlib",
+        ),
+        pytest.param('m = __import__("fittrack.channels")', id="dunder import"),
+    ],
+)
+def test_the_checker_catches_every_import_spelling(source: str) -> None:
+    assert imports_channels(source), f"this reaches channels/ unnoticed:\n{source}"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param("from fittrack.subchannels import X", id="different package"),
+        pytest.param("from ..graph import build", id="a sibling that is not channels"),
+        pytest.param("from . import nodes", id="relative sibling that is not channels"),
+        pytest.param('NOTE = "channel_caps is read in voice.py"', id="a mention in a string"),
+        pytest.param('m = importlib.import_module("fittrack.agents.voice")', id="another module"),
+    ],
+)
+def test_the_checker_does_not_fire_on_innocent_code(source: str) -> None:
+    """A guardrail that cries wolf gets an exception added to it, then another."""
+    assert not imports_channels(source), f"false positive on:\n{source}"
