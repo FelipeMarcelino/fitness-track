@@ -8,8 +8,14 @@ to set the setting to yet.
 So it goes through two `SECURITY DEFINER` functions instead (migration 0002),
 owned by a role that can do nothing else and callable only by `fittrack_app`.
 That is the entire pre-tenant surface, and it is deliberately two functions
-rather than a general escape hatch: the application still cannot `SELECT` from
-`channel_identity` on its own.
+rather than a general escape hatch: the application cannot *write* to
+`channel_identity` at all, so linking an account or revoking one has to go
+through the boundary.
+
+It can read its own rows — RLS scopes that to the bound tenant, which is the
+same protection every other table gets, and a `deliver` that has to address a
+message will need it. What it cannot do is find a tenant it is not already
+bound to, which is the whole reason the resolve function is `SECURITY DEFINER`.
 """
 
 from __future__ import annotations
@@ -22,6 +28,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from fittrack.security.crypto import ColumnCipher, identity_aad
 from fittrack.security.identity_hash import identity_hash
+
+# The only SQLSTATE that means "someone else created this identity first".
+UNIQUE_VIOLATION = "23505"
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,11 +99,15 @@ class IdentityService:
                         "key_version": self._cipher.active_version,
                     },
                 )
-        except IntegrityError:
-            # Narrow on purpose: only a uniqueness conflict means "someone else
-            # got here first". A dropped connection or a bad key version is a
-            # real failure, and treating it as a lost race would answer with a
-            # tenant nobody verified — or hide the fault behind a `None`.
+        except IntegrityError as error:
+            # `IntegrityError` is all of SQLSTATE class 23 — foreign key, check,
+            # not-null, exclusion. Only `23505` means "someone else got here
+            # first". The others are real failures, and the difference matters
+            # precisely when they coincide with a concurrent create: the
+            # follow-up resolve would find that tenant and report success,
+            # burying a constraint violation under a plausible answer.
+            if getattr(error.orig, "sqlstate", None) != UNIQUE_VIOLATION:
+                raise
             concurrent = await self.resolve(channel, external_id)
             if concurrent is None:
                 raise

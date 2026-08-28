@@ -108,6 +108,13 @@ async def set_tenant(connection: asyncpg.Connection, tenant_id: int | None) -> N
 
 ALL_SEEDABLE = tuple(sorted(set(SEEDS) | set(PARENTED)))
 
+# Tables the application cannot write at all, policy or no policy. Linking and
+# revoking an account goes through the two boundary functions, so migration
+# 0002 revokes INSERT/UPDATE/DELETE on `channel_identity` outright. The walks
+# below expect a privilege error there rather than the usual "matched no rows":
+# not a weaker result, a stronger one -- the statement never runs.
+WRITE_DENIED = frozenset({"channel_identity"})
+
 
 async def seeded_tenant(owner: asyncpg.Connection, table: str) -> int:
     """A tenant owning one row in `table`, written as the owner.
@@ -351,10 +358,13 @@ async def test_a_tenant_cannot_update_another_tenants_rows(
     theirs = await seeded_tenant(owner, table)
 
     await set_tenant(app_session, mine)
-    result = await app_session.execute(
-        f"UPDATE {table} SET tenant_id = tenant_id WHERE tenant_id = $1",
-        theirs,
-    )
+    statement = f"UPDATE {table} SET tenant_id = tenant_id WHERE tenant_id = $1"
+    if table in WRITE_DENIED:
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            await app_session.execute(statement, theirs)
+        return
+
+    result = await app_session.execute(statement, theirs)
     assert result.endswith(" 0"), f"{table} allowed a cross-tenant update: {result}"
 
 
@@ -366,10 +376,13 @@ async def test_a_tenant_cannot_delete_another_tenants_rows(
     theirs = await seeded_tenant(owner, table)
 
     await set_tenant(app_session, mine)
-    result = await app_session.execute(
-        f"DELETE FROM {table} WHERE tenant_id = $1",
-        theirs,
-    )
+    statement = f"DELETE FROM {table} WHERE tenant_id = $1"
+    if table in WRITE_DENIED:
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            await app_session.execute(statement, theirs)
+        return
+
+    result = await app_session.execute(statement, theirs)
     assert result.endswith(" 0"), f"{table} allowed a cross-tenant delete: {result}"
 
     # And the row is still there, seen from the owner.
@@ -626,3 +639,145 @@ def test_the_suite_seeds_every_tenant_scoped_table() -> None:
     """
     unseeded = sorted(set(TENANT_SCOPED) - set(ALL_SEEDABLE))
     assert not unseeded, f"tenant-scoped tables the isolation walk would skip: {unseeded}"
+
+
+# --------------------------------------------------------------------------- #
+# What a tenant may point at
+# --------------------------------------------------------------------------- #
+#
+# RLS governs which rows a tenant can see, not which rows it can reference:
+# foreign key checks run with row security bypassed by design. Migration 0003
+# puts the tenant inside the key itself so the reference cannot skip it.
+
+
+async def exercise_owned_by(owner: asyncpg.Connection, tenant: int | None) -> int:
+    slug = f"scoped-{secrets.token_hex(6)}"
+    exercise: int = await owner.fetchval(
+        "INSERT INTO exercise (tenant_id, slug, name, modality)"
+        " VALUES ($1, $2, 'x', 'forca') RETURNING id",
+        tenant,
+        slug,
+    )
+    return exercise
+
+
+async def reference_exercise(
+    connection: asyncpg.Connection,
+    table: str,
+    tenant: int,
+    exercise: int,
+    exercise_tenant: int | None,
+    owner: asyncpg.Connection,
+) -> None:
+    """Write a row in `table` that points at `exercise`."""
+    if table == "exercise_set":
+        session = await owner.fetchval(
+            "INSERT INTO workout_session (tenant_id, local_date)"
+            " VALUES ($1, CURRENT_DATE) RETURNING id",
+            tenant,
+        )
+        await connection.execute(
+            "INSERT INTO exercise_set (tenant_id, session_id, exercise_id,"
+            " exercise_tenant_id, set_index, reps, load_kg)"
+            " VALUES ($1, $2, $3, $4, 1, 8, 80.0)",
+            tenant,
+            session,
+            exercise,
+            exercise_tenant,
+        )
+    elif table == "plan_item":
+        plan = await owner.fetchval(
+            "INSERT INTO workout_plan (tenant_id, name) VALUES ($1, 'plano') RETURNING id",
+            tenant,
+        )
+        await connection.execute(
+            "INSERT INTO plan_item (tenant_id, plan_id, day_label, day_order, item_order,"
+            " exercise_id, exercise_tenant_id)"
+            " VALUES ($1, $2, 'A', 1, 1, $3, $4)",
+            tenant,
+            plan,
+            exercise,
+            exercise_tenant,
+        )
+    else:
+        program = await owner.fetchval(
+            "INSERT INTO training_program (tenant_id, name, goal, horizon_weeks, rationale)"
+            " VALUES ($1, 'p', 'forca', 8, 'r') RETURNING id",
+            tenant,
+        )
+        await connection.execute(
+            "INSERT INTO program_milestone (tenant_id, program_id, description, metric,"
+            " target_value, exercise_id, exercise_tenant_id)"
+            " VALUES ($1, $2, 'd', 'e1rm', 100, $3, $4)",
+            tenant,
+            program,
+            exercise,
+            exercise_tenant,
+        )
+
+
+REFERRING = ("exercise_set", "plan_item", "program_milestone")
+
+
+@pytest.mark.parametrize("table", REFERRING)
+async def test_a_tenant_cannot_point_at_another_tenants_exercise(
+    owner: asyncpg.Connection, app_session: asyncpg.Connection, table: str
+) -> None:
+    """Claiming the exercise is global, when it is someone's private one.
+
+    This was the open door: `MATCH SIMPLE` skips a composite key containing a
+    NULL, so leaving the tenant column empty meant only the unscoped
+    `exercise_id` key applied — and that one accepted any id in the table. The
+    result was an existence oracle (violation means free, success means taken)
+    and a way to block the owner from ever deleting the row.
+    """
+    mine = await seeded_tenant(owner, "tenant")
+    theirs = await seeded_tenant(owner, "tenant")
+    private = await exercise_owned_by(owner, theirs)
+
+    await set_tenant(app_session, mine)
+    with pytest.raises(asyncpg.ForeignKeyViolationError):
+        await reference_exercise(app_session, table, mine, private, None, owner)
+
+
+@pytest.mark.parametrize("table", REFERRING)
+async def test_a_tenant_cannot_name_another_tenant_as_the_scope(
+    owner: asyncpg.Connection, app_session: asyncpg.Connection, table: str
+) -> None:
+    """The other way round: naming the scope honestly. The CHECK refuses it."""
+    mine = await seeded_tenant(owner, "tenant")
+    theirs = await seeded_tenant(owner, "tenant")
+    private = await exercise_owned_by(owner, theirs)
+
+    await set_tenant(app_session, mine)
+    with pytest.raises(asyncpg.CheckViolationError):
+        await reference_exercise(app_session, table, mine, private, theirs, owner)
+
+
+@pytest.mark.parametrize("table", REFERRING)
+async def test_a_tenant_can_still_point_at_the_shared_catalogue(
+    owner: asyncpg.Connection, app_session: asyncpg.Connection, table: str
+) -> None:
+    """The fix has to leave the legitimate case alone.
+
+    A scoped key that also rejected global exercises would make the catalogue
+    unusable, which is a worse bug than the one being fixed and would not show
+    up in a test that only checks that the leak is closed.
+    """
+    mine = await seeded_tenant(owner, "tenant")
+    catalogue = await exercise_owned_by(owner, None)
+
+    await set_tenant(app_session, mine)
+    await reference_exercise(app_session, table, mine, catalogue, None, owner)
+
+
+@pytest.mark.parametrize("table", REFERRING)
+async def test_a_tenant_can_point_at_its_own_exercise(
+    owner: asyncpg.Connection, app_session: asyncpg.Connection, table: str
+) -> None:
+    """And the other legitimate case: a private exercise, referenced by its owner."""
+    mine = await seeded_tenant(owner, "tenant")
+    private = await exercise_owned_by(owner, mine)
+
+    await set_tenant(app_session, mine)
+    await reference_exercise(app_session, table, mine, private, mine, owner)

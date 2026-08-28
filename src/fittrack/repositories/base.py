@@ -99,7 +99,26 @@ class TenantRepository:
         Without this the policies would simply return nothing, and an empty
         result reads like "no data" rather than "wrong context" — a bug that
         looks like an absence.
+
+        The `in_transaction` check comes first because `current_tenant` issues a
+        query, and a query on an unbound session autobegins a transaction that
+        this method then refuses to use — leaving the connection idle in
+        transaction, held until the pool recycles it. The caller only ever saw
+        an exception, so nothing closed it.
+
+        The remaining round trip is deliberate. Caching the binding on
+        `session.info` would remove it, at the cost of a cache that can outlive
+        the `SET LOCAL` it describes — a rollback to a savepoint reverts the
+        setting and not the cache, and a stale "bound to tenant 7" makes this
+        guard pass while RLS returns nothing, which is the exact failure it
+        exists to prevent. Worth revisiting when there is a hot path to measure;
+        not worth trading correctness for beforehand.
         """
+        if not self._session.in_transaction():
+            raise TenantContextError(
+                f"no transaction is open, so no {TENANT_SETTING} can be set: "
+                "open one with tenant_transaction()"
+            )
         bound = await current_tenant(self._session)
         if bound is None:
             raise TenantContextError(

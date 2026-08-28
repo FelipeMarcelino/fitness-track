@@ -142,6 +142,29 @@ BEGIN
   END IF;
 END $$;
 
+-- Attributes are only half of it. NOLOGIN stops anyone connecting *as* this
+-- role; it does nothing about reaching it from a role they can connect as.
+-- A leftover `GRANT fittrack_identity TO fittrack_app` -- and `fittrack_runtime`
+-- inherits `fittrack_app` -- means the application can `SET ROLE` into
+-- BYPASSRLS and every policy this migration just created stops being
+-- evaluated. Silently: nothing errors, the queries simply return more.
+DO $$
+DECLARE
+  v_member text;
+BEGIN
+  FOR v_member IN
+    SELECT m.rolname
+      FROM pg_auth_members am
+      JOIN pg_roles m ON m.oid = am.member
+      JOIN pg_roles g ON g.oid = am.roleid
+     WHERE g.rolname = 'fittrack_identity'
+  LOOP
+    RAISE WARNING 'revoking fittrack_identity from %: the boundary role must have '
+                  'no members, or its BYPASSRLS is reachable by SET ROLE', v_member;
+    EXECUTE format('REVOKE fittrack_identity FROM %I', v_member);
+  END LOOP;
+END $$;
+
 GRANT USAGE ON SCHEMA public TO fittrack_identity;
 -- Exactly what the two functions need and nothing more. No UPDATE, no DELETE,
 -- no other table: the blast radius of this role is the reason it exists.
@@ -194,23 +217,45 @@ BEGIN
 END;
 $$;
 
-ALTER FUNCTION resolve_tenant_for_identity(channel_kind, bytea) OWNER TO fittrack_identity;
-ALTER FUNCTION create_tenant_with_identity(channel_kind, bytea, bytea, smallint)
-    OWNER TO fittrack_identity;
-
 -- PUBLIC gets EXECUTE on a new function by default, which would hand the
 -- boundary to anyone who can connect.
+--
+-- Before the ownership transfer, not after: once a function belongs to
+-- `fittrack_identity`, revoking on it requires being that role or an
+-- inheriting member of it. A non-superuser migration role with CREATEROLE gets
+-- ADMIN on roles it creates but not INHERIT, so the REVOKE would fail here --
+-- and it would fail *after* the functions exist, leaving them created and
+-- still EXECUTE-able by PUBLIC. Doing it while we are still the owner costs
+-- nothing and removes the superuser requirement.
 REVOKE ALL ON FUNCTION resolve_tenant_for_identity(channel_kind, bytea) FROM PUBLIC;
 REVOKE ALL ON FUNCTION create_tenant_with_identity(channel_kind, bytea, bytea, smallint)
     FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION resolve_tenant_for_identity(channel_kind, bytea) TO fittrack_app;
 GRANT EXECUTE ON FUNCTION create_tenant_with_identity(channel_kind, bytea, bytea, smallint)
     TO fittrack_app;
+
+ALTER FUNCTION resolve_tenant_for_identity(channel_kind, bytea) OWNER TO fittrack_identity;
+ALTER FUNCTION create_tenant_with_identity(channel_kind, bytea, bytea, smallint)
+    OWNER TO fittrack_identity;
+
+-- Linking an account or revoking one goes through the boundary or not at all.
+-- `ALTER DEFAULT PRIVILEGES` (migration 0001) gave the application DML on every
+-- table, `channel_identity` included, so it could insert a second identity for
+-- itself or set `revoked_at` without ever calling a function -- which made the
+-- "two functions are the entire pre-tenant surface" claim untrue for writes.
+-- SELECT stays: RLS scopes it to the bound tenant, and `deliver` will need to
+-- address a message.
+REVOKE INSERT, UPDATE, DELETE ON channel_identity FROM fittrack_app;
 """
 
 DROP = f"""
 DROP FUNCTION IF EXISTS create_tenant_with_identity(channel_kind, bytea, bytea, smallint);
 DROP FUNCTION IF EXISTS resolve_tenant_for_identity(channel_kind, bytea);
+
+-- Put back what the upgrade took away. Without this a downgrade leaves the
+-- application unable to write `channel_identity` and the boundary functions
+-- gone, which is neither the old state nor the new one.
+GRANT INSERT, UPDATE, DELETE ON channel_identity TO fittrack_app;
 
 DO $$
 DECLARE t text;

@@ -292,3 +292,22 @@ async def test_the_binding_does_not_outlive_its_transaction(
 
     assert await current_tenant(session) is None
     await session.rollback()
+
+
+async def test_an_unbound_repository_does_not_strand_a_transaction(
+    session: AsyncSession, owner: asyncpg.Connection
+) -> None:
+    """Refusing to run must not leave a connection idle in transaction.
+
+    `current_tenant` issues a query, and a query on an unbound session
+    autobegins the transaction that `_assert_bound` then refuses to use. The
+    caller sees only the exception, so nothing ever closes it and the
+    connection sits held until the pool recycles it.
+    """
+    tenant_id = await make_tenant(owner)
+    repository = TenantRepository(session, tenant_id)
+
+    with pytest.raises(TenantContextError, match="no transaction is open"):
+        await repository.fetch_all("SELECT 1")
+
+    assert not session.in_transaction()

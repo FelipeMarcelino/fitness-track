@@ -11,15 +11,18 @@ from __future__ import annotations
 
 import secrets
 from collections.abc import AsyncIterator
+from typing import Any
 
 import asyncpg
 import pytest
-from sqlalchemy.exc import OperationalError
+from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from fittrack.db.engine import split_ssl_arguments
 from fittrack.db.migrations.versions._0002_row_level_security import IDENTITY_BOUNDARY
 from fittrack.db.sql import split_statements
+from fittrack.repositories.base import tenant_transaction
 from fittrack.security.crypto import ColumnCipher, Keyring, identity_aad
 from fittrack.security.identity_hash import identity_hash
 from fittrack.services.identity import IdentityService, ResolvedIdentity
@@ -272,7 +275,109 @@ async def test_the_definer_role_has_only_the_grants_it_needs(
         ("channel_identity", "SELECT"),
         ("channel_identity", "INSERT"),
         ("tenant", "INSERT"),
-    }, f"unexpected grants: {sorted(grants)}"
+    }, f"unexpected table grants: {sorted(grants)}"
+
+    # `role_table_grants` only reports relations, so on its own the assertion
+    # above is blind to sequences, schemas and functions — which is most of the
+    # ways a role's reach can grow. Asserting the blast radius means asserting
+    # all of it.
+    usage = {
+        (row["object_type"], row["object_name"], row["privilege_type"])
+        for row in await owner.fetch(
+            """
+            SELECT object_type, object_name, privilege_type
+              FROM information_schema.role_usage_grants
+             WHERE grantee = 'fittrack_identity'
+            """
+        )
+    }
+    assert usage == {
+        ("SEQUENCE", "tenant_id_seq", "USAGE"),
+        ("SEQUENCE", "channel_identity_id_seq", "USAGE"),
+    }, f"unexpected usage grants: {sorted(usage)}"
+
+    routines = {
+        row["routine_name"]
+        for row in await owner.fetch(
+            """
+            SELECT routine_name FROM information_schema.role_routine_grants
+             WHERE grantee = 'fittrack_identity'
+            """
+        )
+    }
+    # The two it owns, and nothing else. Ownership reports as a grant here, so
+    # this is the boundary itself rather than an extra privilege — a third name
+    # appearing would mean the role had been handed something new.
+    assert routines == {
+        "resolve_tenant_for_identity",
+        "create_tenant_with_identity",
+    }, f"unexpected routine grants: {sorted(routines)}"
+
+    schemas = {
+        row["nspname"]
+        for row in await owner.fetch(
+            "SELECT nspname FROM pg_namespace"
+            " WHERE has_schema_privilege('fittrack_identity', nspname, 'USAGE')"
+            "   AND nspname NOT LIKE 'pg_%'"
+        )
+    }
+    assert schemas == {"public", "information_schema"}, f"unexpected schemas: {sorted(schemas)}"
+
+
+async def _commit_identity_elsewhere(app_dsn: str, cipher: ColumnCipher, external_id: str) -> int:
+    """Another connection wins the race and commits, as a real racer would."""
+    url, ssl_args = split_ssl_arguments(
+        app_dsn.replace("postgresql://", "postgresql+asyncpg://")
+        + f"?sslmode=verify-full&sslrootcert={CA_FILE}"
+    )
+    engine = create_async_engine(url, connect_args=ssl_args)
+    try:
+        async with async_sessionmaker(engine, expire_on_commit=False)() as other:
+            winner = await IdentityService(other, cipher, PEPPER).resolve_or_create(
+                "telegram", external_id
+            )
+            await other.commit()
+            return winner.tenant_id
+    finally:
+        await engine.dispose()
+
+
+def _force_stale_resolve(service: IdentityService, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the first lookup miss, which is what a real racer sees.
+
+    The winner commits between the lookup and the insert, so the racer's
+    `resolve` answered `None` a moment before the row existed.
+    """
+    real_resolve = service.resolve
+    calls = {"n": 0}
+
+    async def stale(channel: str, external_id: str) -> int | None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None
+        return await real_resolve(channel, external_id)
+
+    monkeypatch.setattr(service, "resolve", stale)
+
+
+def _fail_the_create(
+    service: IdentityService, monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    """Break only `create_tenant_with_identity`.
+
+    Patching `scalar` outright breaks the `resolve` at the top of
+    `resolve_or_create` too, so the exception never reaches the `except` clause
+    under test — which is how the first version of this test passed against the
+    very code it was written to reject.
+    """
+    real_scalar = service._session.scalar
+
+    async def selective(statement: Any, *args: Any, **kwargs: Any) -> Any:
+        if "create_tenant_with_identity" in str(statement):
+            raise error
+        return await real_scalar(statement, *args, **kwargs)
+
+    monkeypatch.setattr(service._session, "scalar", selective)
 
 
 async def test_a_lost_race_does_not_roll_back_the_caller(
@@ -341,23 +446,55 @@ async def test_a_lost_race_does_not_roll_back_the_caller(
 
 
 async def test_a_real_failure_is_not_mistaken_for_a_lost_race(
-    service: IdentityService, monkeypatch: pytest.MonkeyPatch
+    app_dsn: str,
+    service: IdentityService,
+    cipher: ColumnCipher,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Only a uniqueness conflict means "someone got here first".
 
-    A bare `except Exception` answered a dropped connection or a bad key
-    version with whatever `resolve` happened to return next — or swallowed the
-    fault and re-raised something unrelated to the actual cause.
+    The failure has to coincide with a concurrent create, or the test proves
+    nothing: with no winner to find, the follow-up `resolve` returns `None` and
+    even a bare `except Exception` re-raises. It is when a winner *does* exist
+    that the two differ — the broad catch answers with that tenant and buries
+    the fault, the narrow one lets it through.
     """
-    boom = OperationalError("SELECT create_tenant_with_identity(...)", {}, Exception("gone"))
+    contested = f"real-{secrets.token_hex(6)}"
+    await _commit_identity_elsewhere(app_dsn, cipher, contested)
 
-    async def fail(*_: object, **__: object) -> None:
-        raise boom
-
-    monkeypatch.setattr(service._session, "scalar", fail)
+    _force_stale_resolve(service, monkeypatch)
+    boom = OperationalError("create_tenant_with_identity", {}, Exception("connection lost"))
+    _fail_the_create(service, monkeypatch, boom)
 
     with pytest.raises(OperationalError):
-        await service.resolve_or_create("telegram", f"boom-{secrets.token_hex(6)}")
+        await service.resolve_or_create("telegram", contested)
+
+
+async def test_a_constraint_that_is_not_a_race_is_not_swallowed(
+    app_dsn: str,
+    service: IdentityService,
+    cipher: ColumnCipher,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`IntegrityError` spans all of SQLSTATE 23, and only `23505` is a race.
+
+    A foreign-key or check violation arriving while another worker legitimately
+    created the same identity would otherwise be reported as a clean
+    `created=False`.
+    """
+    contested = f"fk-{secrets.token_hex(6)}"
+    await _commit_identity_elsewhere(app_dsn, cipher, contested)
+
+    _force_stale_resolve(service, monkeypatch)
+
+    class ForeignKeyViolationError(Exception):
+        sqlstate = "23503"
+
+    violation = IntegrityError("create_tenant_with_identity", {}, ForeignKeyViolationError())
+    _fail_the_create(service, monkeypatch, violation)
+
+    with pytest.raises(IntegrityError):
+        await service.resolve_or_create("telegram", contested)
 
 
 async def test_the_migration_normalises_a_role_that_already_exists(
@@ -395,3 +532,100 @@ async def test_the_migration_normalises_a_role_that_already_exists(
     assert not role["rolsuper"]
     assert role["rolbypassrls"]
     assert not role["has_password"], "NOLOGIN alone leaves the password in place"
+
+
+async def test_the_boundary_role_has_no_members(owner: asyncpg.Connection) -> None:
+    """NOLOGIN stops connecting *as* it, not reaching it from somewhere else.
+
+    A `GRANT fittrack_identity TO fittrack_app` would let the runtime — which
+    inherits `fittrack_app` — `SET ROLE` into BYPASSRLS, and every policy in
+    this migration would stop being evaluated. Nothing errors when that
+    happens; the queries just return more rows.
+    """
+    members = await owner.fetch(
+        "SELECT m.rolname FROM pg_auth_members am"
+        "  JOIN pg_roles m ON m.oid = am.member"
+        "  JOIN pg_roles g ON g.oid = am.roleid"
+        " WHERE g.rolname = 'fittrack_identity'"
+    )
+    assert not [row["rolname"] for row in members]
+
+    for role in ("fittrack_app", "fittrack_runtime"):
+        assert not await owner.fetchval(
+            "SELECT pg_has_role($1, 'fittrack_identity', 'USAGE')", role
+        ), f"{role} can SET ROLE into the boundary"
+
+
+async def test_the_migration_revokes_a_leftover_membership(owner: asyncpg.Connection) -> None:
+    """The guard has to fix what it finds, not just what it creates.
+
+    A cluster migrated by an older revision — or an operator being helpful —
+    can arrive with the membership already granted, and the role-attribute
+    branch above would leave it in place.
+    """
+    guard = split_statements(IDENTITY_BOUNDARY)[1]
+    assert "pg_auth_members" in guard, "the membership guard moved"
+
+    await owner.execute("GRANT fittrack_identity TO fittrack_app")
+    try:
+        assert await owner.fetchval(
+            "SELECT pg_has_role('fittrack_app', 'fittrack_identity', 'USAGE')"
+        )
+        await owner.execute(guard)
+    finally:
+        await owner.execute("REVOKE fittrack_identity FROM fittrack_app")
+
+    assert not await owner.fetchval(
+        "SELECT pg_has_role('fittrack_app', 'fittrack_identity', 'USAGE')"
+    )
+
+
+async def test_the_application_cannot_write_to_the_identity_table(
+    app_session: AsyncSession, owner: asyncpg.Connection
+) -> None:
+    """Linking or revoking an account goes through the boundary or not at all.
+
+    `ALTER DEFAULT PRIVILEGES` handed the application DML on every table, so it
+    could add a second identity for itself, or set `revoked_at`, without ever
+    calling a function — which made "two functions are the entire pre-tenant
+    surface" untrue for writes.
+    """
+    tenant: int = await owner.fetchval(
+        "INSERT INTO tenant (display_name) VALUES ('writes') RETURNING id"
+    )
+    marker = secrets.token_bytes(16)
+    await owner.execute(
+        "INSERT INTO channel_identity (tenant_id, channel, external_id, external_id_hash)"
+        " VALUES ($1, 'telegram', $2, $2)",
+        tenant,
+        marker,
+    )
+
+    async with tenant_transaction(app_session, tenant):
+        # Readable: RLS scopes it to this tenant, same as every other table.
+        assert (
+            await app_session.scalar(
+                text("SELECT count(*) FROM channel_identity WHERE external_id_hash = :h"),
+                {"h": marker},
+            )
+        ) == 1
+
+        for statement in (
+            "INSERT INTO channel_identity (tenant_id, channel, external_id, external_id_hash)"
+            " VALUES (:t, 'telegram', :h, :h)",
+            "UPDATE channel_identity SET revoked_at = now() WHERE external_id_hash = :h",
+            "DELETE FROM channel_identity WHERE external_id_hash = :h",
+        ):
+            # The error has to leave the savepoint, or SQLAlchemy tries to
+            # RELEASE one that Postgres has already put into a failed state.
+            try:
+                async with app_session.begin_nested():
+                    await app_session.execute(
+                        text(statement), {"t": tenant, "h": secrets.token_bytes(16)}
+                    )
+            except DBAPIError as error:
+                # 42501, not "matched no rows": the privilege is gone, so the
+                # statement never reaches the policy.
+                assert getattr(error.orig, "sqlstate", None) == "42501", statement
+            else:
+                pytest.fail(f"the application was allowed to run: {statement}")
