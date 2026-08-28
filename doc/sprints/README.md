@@ -63,5 +63,4 @@ Uma tarefa está concluída quando:
 
 | Sprint | Fase | Objetivo | Estado |
 | --- | --- | --- | --- |
-| [Sprint 01 — Executable Foundation](01-foundation.md) | 1.0 | Fundação local, dados e segurança multi-tenant | `planned` |
-
+| [Sprint 01 — Executable Foundation](01-foundation.md) | 1.0 | Fundação local, dados e segurança multi-tenant | `done` |

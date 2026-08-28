@@ -1072,7 +1072,7 @@ Responsabilidades:
 Os dois tiers são o **mesmo modelo** com `reasoning_effort` diferente — ver
 [ADR-0001](adr/0001-groq-como-provider-primario.md).
 
-| Role | Uso | Volume | Tier | Primário (Groq) | `reasoning_effort` | Fallback (Anthropic) |
+| Role | Uso | Volume | Tier | Primário (Groq) | `reasoning_effort` | Fallback / judge |
 | --- | --- | --- | --- | --- | --- | --- |
 | `NORMALIZER` | normalizador de **entrada** (§9.3) | Altíssimo | rápido | `openai/gpt-oss-120b` | `low` | `claude-haiku-4-5` |
 | `ROUTER` | router, clarificação, onboarding | Altíssimo | rápido | `openai/gpt-oss-120b` | `low` | `claude-haiku-4-5` |
@@ -1083,15 +1083,18 @@ Os dois tiers são o **mesmo modelo** com `reasoning_effort` diferente — ver
 | `SUMMARY` | narrativa de sessão, poda de `messages` | Médio | rápido | `openai/gpt-oss-120b` | `low` | `claude-haiku-4-5` |
 | `ANALYST` | análise de evolução, auditoria de volume | Baixo | raciocínio | `openai/gpt-oss-120b` | `high` | `claude-opus-5` |
 | `COACH` | recomendação de ficha, programa, progressão, proativo | Baixo | raciocínio | `openai/gpt-oss-120b` | `high` | `claude-opus-5` |
-| `JUDGE` | LLM-as-judge na suíte de avaliação | Offline | raciocínio | — | — | `claude-opus-5` |
+| `JUDGE` | LLM-as-judge na suíte de avaliação | Offline | raciocínio | — | `high` | `gpt-5.6-terra` (OpenAI) |
 
 `NORMALIZER` e `VOICE` são papéis distintos com o mesmo tiering, e é deliberado que sejam dois: eles
 são as duas fronteiras do sistema (§1.4, princípio 2), evoluem por pressões opostas — um por
 qualidade de *entendimento*, o outro por qualidade de *forma* — e precisam de linhas separadas em
 `agent_cost_usd_total` para que a otimização de um não esconda a regressão do outro.
 
-O `JUDGE` não tem primário de propósito: um juiz rodando no mesmo modelo que produziu a resposta não
-é juiz, e o AD-33 depende de o veredito ser independente.
+O `JUDGE` não tem primário de propósito: um juiz rodando no mesmo modelo e provider que produziu a
+resposta não é juiz, e o AD-33 depende de o veredito ser independente. O provider OpenAI e o
+modelo `gpt-5.6-terra` foram adotados pelo
+[ADR-0004](adr/0004-openai-como-provider-do-judge.md); os fallbacks dos papéis de produto continuam
+na Anthropic.
 
 **Preços de referência** (USD por milhão de tokens):
 
@@ -1100,6 +1103,7 @@ O `JUDGE` não tem primário de propósito: um juiz rodando no mesmo modelo que 
 | `openai/gpt-oss-120b` (Groq) | $0.15 | $0.60 | $0.075 |
 | `claude-haiku-4-5` (Anthropic) | $1.00 | $5.00 | — |
 | `claude-opus-5` (Anthropic) | $5.00 | $25.00 | — |
+| `gpt-5.6-terra` (OpenAI, judge) | $2.00 | $12.00 | — |
 
 **Janela de contexto:** `gpt-oss-120b` tem 131.072 tokens, contra 1M dos modelos Anthropic. O
 fallback aguenta prompt que o primário não aguenta — e essa assimetria é invisível até o dia em que
@@ -1120,6 +1124,11 @@ roles:
     primary:  { provider: groq, model: openai/gpt-oss-120b,
                 reasoning_effort: high, temperature: 0.3 }
     fallback: { provider: anthropic, model: claude-opus-5, effort: high }
+    timeout_s: 120
+  JUDGE:
+    primary: null
+    fallback: { provider: openai, model: gpt-5.6-terra,
+                reasoning_effort: high }
     timeout_s: 120
 ```
 
@@ -3923,8 +3932,8 @@ comum do sistema.
 
 ### 21.2 LLM-as-judge (respostas abertas)
 
-Para análise, recomendação e persona — que não têm gabarito — um juiz (`claude-opus-5`) pontua
-de 1 a 5 em rubricas explícitas:
+Para análise, recomendação e persona — que não têm gabarito — um juiz
+(`gpt-5.6-terra`, OpenAI, ADR-0004) pontua de 1 a 5 em rubricas explícitas:
 
 | Rubrica | Critério |
 | --- | --- |
@@ -4045,8 +4054,10 @@ e semanas para desfazer depois que três funcionalidades foram construídas em c
 
 **Custo do judge em CI.** Amostra de 40 mais 20 de calibração, no tier de raciocínio, a cada PR.
 Para não pagar isso em PR que não toca prompt nem agente, o job só roda quando o diff inclui
-`config/prompts/**`, `src/fittrack/agents/**`, `src/fittrack/graph/**` ou `evals/**`. PR de
-infraestrutura pula o judge — e o golden set determinístico, que é barato, roda sempre.
+`config/models.yaml`, `config/prompts/**`, `src/fittrack/agents/**`, `src/fittrack/graph/**` ou
+`evals/**`. PR de infraestrutura pula o judge — e o golden set determinístico, que é barato, roda
+sempre. Incluir `config/models.yaml` é obrigatório porque uma troca do próprio juiz precisa passar
+novamente pela calibração.
 
 ### 21.5 Loop de melhoria contínua
 
@@ -4544,10 +4555,10 @@ WABA_VERIFY_TOKEN=
 # e falha no boot se faltar credencial de um canal listado.
 FITTRACK_CHANNELS=telegram     # telegram | whatsapp | telegram,whatsapp
 
-# LLM (ADR-0001)
+# LLM (ADR-0001 e ADR-0004)
 GROQ_API_KEY=            # primário: todo papel do tier rápido, e STT (§11)
-ANTHROPIC_API_KEY=       # fallback de todo papel, e único provider do JUDGE
-OPENAI_API_KEY=          # apenas embeddings
+ANTHROPIC_API_KEY=       # fallback dos papéis de produto
+OPENAI_API_KEY=          # embeddings e provider do JUDGE
 XAI_API_KEY=             # OPCIONAL: só se models.yaml citar `provider: xai`
 
 # Infra

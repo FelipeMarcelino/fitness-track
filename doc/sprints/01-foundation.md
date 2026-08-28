@@ -4,7 +4,7 @@
 | --- | --- |
 | Fase | 1.0 — Registro confiável |
 | Duração | 2 semanas |
-| Estado | `planned` |
+| Estado | `done` |
 | Objetivo | Tornar o repositório executável, testável e seguro para receber os fluxos de Telegram e LLM nas sprints seguintes |
 | Referências principais | spec §§3.1, 5.2, 19.1, 21.4, 22.2, 23 e 24 |
 
@@ -435,16 +435,16 @@ escopo. A divisão deve preservar testes e deixar cada commit/PR em estado execu
 
 A sprint termina somente quando todos os itens abaixo forem demonstrados:
 
-- [ ] novo clone entra no devshell e instala dependências;
-- [ ] `make fmt`, `make lint`, `make typecheck` e `make test` passam;
-- [ ] compose de produção não publica bancos e o override local é funcional;
-- [ ] ambiente sobe saudável e testes rodam dentro do worker;
-- [ ] migração completa chega a uma única `head` em Postgres vazio;
-- [ ] campos sensíveis nascem cifrados e a identidade é pesquisada por HMAC;
-- [ ] teste parametrizado comprova RLS em `tenant` e todas as tabelas tenant-scoped;
-- [ ] bootstrap é idempotente;
-- [ ] CI obrigatório está verde;
-- [ ] documentação e tabela de estado do `CLAUDE.md` refletem o repositório real.
+- [x] novo clone entra no devshell e instala dependências;
+- [x] `make fmt`, `make lint`, `make typecheck` e `make test` passam;
+- [x] compose de produção não publica bancos e o override local é funcional;
+- [x] ambiente sobe saudável e testes rodam dentro do worker;
+- [x] migração completa chega a uma única `head` em Postgres vazio;
+- [x] campos sensíveis nascem cifrados e a identidade é pesquisada por HMAC;
+- [x] teste parametrizado comprova RLS em `tenant` e todas as tabelas tenant-scoped;
+- [x] bootstrap é idempotente;
+- [x] CI obrigatório está verde;
+- [x] documentação e tabela de estado do `CLAUDE.md` refletem o repositório real.
 
 ## Riscos e mitigação
 
@@ -469,11 +469,23 @@ A sprint termina somente quando todos os itens abaixo forem demonstrados:
 
 ## Relatório de encerramento
 
-Ao concluir a sprint, registrar neste documento:
+Sprint encerrada em 2026-08-28. As sete tarefas foram entregues e mergeadas:
 
-- PRs mergeados por tarefa;
-- comandos e checks executados;
-- suposições efetivamente usadas;
-- itens adiados e motivo;
-- estado de cada item do critério de saída;
-- riscos novos que precisam entrar na Sprint 02 ou em ADR.
+| Tarefa | Pull request | Resultado |
+| --- | --- | --- |
+| S01-T01 | #4 | Toolchain, quality gates e runner do judge |
+| S01-T02 | #6 | Infraestrutura local com TLS verificado |
+| S01-T03 | #9 | Configuração tipada e fronteira de secrets |
+| S01-T04 | #10 | Schema inicial e principals do banco |
+| S01-T05 | #11 | Criptografia de coluna e hash pesquisável |
+| S01-T06 | #12 | Row Level Security e isolamento por tenant |
+| S01-T07 | #14 | Guardrails de arquitetura e bootstrap integrado |
+
+Os checks de quality, integração e isolamento foram executados nos respectivos PRs. O bootstrap
+idempotente, a migração até uma única `head`, o TLS interno e os limites criptográficos e de tenant
+também permanecem cobertos pela suíte versionada.
+
+O único débito operacional da fundação era o portão ao vivo do LLM-as-judge, suspenso pelo
+ADR-0002 por falta de saldo Anthropic. Ele foi resolvido fora do escopo da sprint pelo ADR-0004,
+com a migração do judge para OpenAI. Isso não altera o encerramento da Sprint 01 nem conclui a Fase
+1.0: Telegram, extração e os critérios com usuários reais continuam para as próximas sprints.
