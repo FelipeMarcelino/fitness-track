@@ -6,7 +6,7 @@
 | Duração | 2 semanas |
 | Estado | `planned` |
 | Objetivo | Receber, verificar e enfileirar mensagens do Telegram como rajadas persistentes, prontas para o grafo LangGraph da sprint seguinte |
-| Referências principais | spec §§4, 8.7, 8.8, 17, 18.1, 18.2, 20.6, 22.3, 23 |
+| Referências principais | spec §§4, 8.7, 8.8, 11, 17, 18.1, 18.2, 18.4, 20.6, 22.3, 23 |
 
 ## Resultado esperado
 
@@ -153,9 +153,10 @@ T07 e T08 dependem de T05. T08 fecha a sprint integrando tudo.
 1. Escrever testes com `httpx.MockTransport` ou um `Transport` fake injetado no cliente.
 2. `verify`: comparar `X-Telegram-Bot-Api-Secret-Token` com o valor configurado usando
    `hmac.compare_digest`; falha levanta exceção de autenticação antes do parsing.
-3. `parse`: mapear `message.text`, `message.voice`, `message.audio`, `callback_query`,
-   `message.photo`, `message.document`, `message_reaction`, `my_chat_member`. `callback_query`
-   vira `kind="button_reply"` com `button_payload`. Vozes mapeiam `media_ref=file_id`.
+3. `parse`: mapear `message.text`, `message.voice`, `message.audio`, `message.video_note`,
+   `callback_query`, `message.photo`, `message.document`, `message_reaction`, `my_chat_member`.
+   `callback_query` vira `kind="button_reply"` com `button_payload`. Vozes mapeiam
+   `media_ref=file_id`. `video_note` é tratado como voz quando a duração couber no limite da §11.
 4. `download_media`: `getFile` → baixa em tmpfs (`/tmp`), respeitando 20 MB e timeout; nunca loga
    `file_path` (§20.6).
 5. `send`: texto com `parse_mode=HTML` e `link_preview_options.is_disabled`; reação com
@@ -164,7 +165,7 @@ T07 e T08 dependem de T05. T08 fecha a sprint integrando tudo.
 6. `classify_error`: tabela da §18.4 para Telegram — `429`→`RETRY_AFTER` (lê
    `parameters.retry_after`), `403 blocked/deactivated`, `400 chat not found`→`UNDELIVERABLE`,
    `401`→`ACCOUNT`, `5xx`/timeout→`RETRY_BACKOFF`, demais `400`→`BUG`. `message is not modified`
-   é sucesso, não erro.
+   é sucesso, não erro. `400 message to react not found` → `BUG` com fallback para texto (§18.4).
 7. Testar que nenhum log, exceção ou `repr` de domínio contém token do bot ou `file_path`
    (invariante 10).
 8. Conectar o adaptador com `redis.asyncio` de forma injetável para dedup e buffer (o adapter não
@@ -172,9 +173,11 @@ T07 e T08 dependem de T05. T08 fecha a sprint integrando tudo.
 
 **Critérios de aceite:**
 
-- todos os tipos de update da tabela §18.2 parsing para `InboundMessage` correto;
+- todos os tipos de update da tabela §18.2 parsing para `InboundMessage` correto, incluindo
+  `video_note` como voz;
 - `verify` rejeita token errado e aceita o certo em tempo constante;
-- `classify_error` cobre toda a tabela do Telegram com testes parametrizados;
+- `classify_error` cobre toda a tabela do Telegram com testes parametrizados, incluindo o fallback
+  de reação para texto;
 - mídia com caption ≤ 1024 e botões ≤ 8 ≤ 64 bytes conforme `caps`;
 - nenhum fixture ou assert imprime token/`file_path`;
 - marcas de redação da §20.6 respeitadas.
@@ -201,27 +204,35 @@ e bufferiza em <200 ms.
 1. Escrever teste de integração falhando pela ausência do endpoint.
 2. `POST /webhook/telegram`: chama `adapter.verify`; 403 sem processar se falhar.
 3. Dedup `seen:telegram:{hash}:{update_id}` via `SET NX EX 86400`; se existir, 200 rápido e fim.
+   **A reserva é recoverable:** se qualquer passo posterior falhar (identidade, banco, buffer), a
+   chave é deletada para que o Telegram possa reentregar. O `SET NX` é o primeiro passo, mas o
+   sucesso só é confirmado após `raw_message` persistido e item no buffer.
 4. Resolver identidade pelo serviço `identity.py` com cache `identity:telegram:{external_id_hash}`
    (TTL 5 min) antes de decifrar; primeiro contato cria tenant + identidade pela fronteira
    pré-tenant da Sprint 01.
 5. Persistir `raw_message` com payload cifrado e `(identity_id, channel_message_id)` — segunda
    barreira de idempotência (§17.4).
-6. `RPUSH buffer:{tenant_id}` com envelope JSON `{channel, external_id_hash, channel_message_id,
+6. Filtrar antes do buffer: `message_reaction` é ignorado (não gera processamento); `photo` e
+   `document` recebem a resposta fixa de degradação (T06) e não entram no buffer. Somente
+   `text`, `voice`, `audio`, `video_note` e `callback_query` entram no buffer.
+7. `RPUSH buffer:{tenant_id}` com envelope JSON `{channel, external_id_hash, channel_message_id,
    kind, text, media_ref, button_payload, sent_at, raw_message_id}`.
-7. `SET debounce:{tenant_id} 1 EX 10` e enfileira `flush_check(tenant_id)` com delay de 10s no
-   ARQ.
-8. Responder 200 sempre — mesmo se o worker estiver morto.
-9. Testar rajada: 4 mensagens seguidas resultam em 4 itens no buffer e um único timer ativo.
-10. Testar que `external_id` (chat.id) nunca aparece em logs ou spans — somente o hash.
+8. `SET debounce:{tenant_id} 1 EX 10` e enfileira `flush_check(tenant_id)` com delay de 10s no
+   ARQ, usando job ID estável `flush:{tenant_id}` para que renovações não acumulem jobs.
+9. Responder 200 sempre — mesmo se o worker estiver morto.
+10. Testar rajada: 4 mensagens seguidas resultam em 4 itens no buffer e um único timer ativo.
+11. Testar que `external_id` (chat.id) nunca aparece em logs ou spans — somente o hash.
 
 **Critérios de aceite:**
 
 - webhook responde < 200 ms com Redis e Postgres reais no ambiente de CI;
 - dedup por `update_id` bloqueia reentrega e a reentrega vazia é descartada sem lookup;
+- falha após `SET NX` deleta a reserva para permitir reentrega;
 - `raw_message` cifrado + entrada no buffer acontecem na mesma requisição;
 - primeiro contato cria identidade somente via fronteira autorizada da Sprint 01;
 - cache de identidade evita decifrar em rajada e expira em 5 min;
-- `external_id` nunca em log/spans (teste de captura de logging).
+- `external_id` nunca em log/spans (teste de captura de logging);
+- `message_reaction`, `photo` e `document` não entram no buffer.
 
 ### S02-T04 — Buffer and debounce
 
@@ -241,6 +252,8 @@ e bufferiza em <200 ms.
 
 1. Escrever teste que falha porque `flush_check` não existe.
 2. `flush_check(tenant_id)`: se `debounce:{tenant_id}` ainda existe, reenfileira com 10s de novo.
+   O job ID é estável (`flush:{tenant_id}`), então renovações substituem o job anterior em vez de
+   acumular.
 3. Se expirou, adquire `lock:{tenant_id}` com TTL 120s e auto-extend; se ocupado, reenfileira com
    5s (§17.3).
 4. Com o lock, `RENAME buffer:{tenant_id} → drain:{tenant_id}:{batch_id}` e leitura apagada —
@@ -254,6 +267,7 @@ e bufferiza em <200 ms.
 **Critérios de aceite:**
 
 - debounce renova a cada mensagem; flush só dispara após silêncio de 10s;
+- job ID estável evita acúmulo de jobs de flush;
 - lock por `tenant_id` com auto-extend, e a ocupação reenfileira com 5s;
 - drain é atômico e sobrevive ao restart do worker;
 - nunca erro de `LRANGE+DEL` sobre `buffer:`.
@@ -276,14 +290,16 @@ Sprint 03.
 
 1. Escrever teste falhando pela ausência de `process_batch`.
 2. Para itens com `kind="voice"`: baixar via adaptador, transcrever com STT e entrar no texto com
-   `was_audio=true` (a execução do STT entra em T06/T07; aqui é o ponto de integração).
+   `was_audio=true` (a execução do STT entra em T07; aqui é o ponto de integração).
 3. Montar envelope do lote na ordem de chegada, sem concatenar (quem junta é o normalizer, §9.3).
 4. Persistir `processing_batch` com `combined_text` cifrado (AES-256-GCM, keyring da Sprint 01) e
-   `batch_status='pending'`.
+   `status='pending'` (o schema da Sprint 01 usa `status`, não `batch_status`).
 5. Enfileirar `process_batch(tenant_id, batch_id)` na fila `default` do ARQ com `max_tries=3` e
    backoff exponencial (§4.1).
-6. A função `process_batch` desta sprint termina aí: marca `batch_status='processing'` e para —
-   é o ponto de conexão do grafo; log estruturado registra o handoff.
+6. A função `process_batch` desta sprint termina aí: marca `status='done'` e para — é o ponto de
+   conexão do grafo; log estruturado registra o handoff. O lock por tenant é adquirido dentro de
+   `process_batch` (não apenas em `flush_check`), para que a execução do grafo na Sprint 03
+   permaneça serializada por tenant.
 7. Testar idempotência de retry: re-enfileirar o mesmo `batch_id` não duplica
    `processing_batch` e não refaz o download de voz (guardado por `raw_message_id`).
 
@@ -292,7 +308,8 @@ Sprint 03.
 - `processing_batch.combined_text` é `BYTEA` cifrado desde a primeira escrita;
 - fila `default` com `max_tries=3` e backoff, e o estado do batch sobrevive ao worker;
 - itens de voz são marcados `was_audio=true` antes da persistência do batch;
-- a função `process_batch` deixa o batch em `processing` e o `handoff` é auditável;
+- a função `process_batch` deixa o batch em `done` e o `handoff` é auditável;
+- o lock por tenant é adquirido dentro de `process_batch`, não apenas em `flush_check`;
 - nenhum conteúdo do usuário em log além de `raw_message.payload` cifrado.
 
 ### S02-T06 — Delivery and error classes
@@ -312,13 +329,18 @@ futuro grafo, com retry por classe.
 **Plano de implementação:**
 
 1. Escrever teste falhando pela ausência do envio com classes.
-2. Semáforo global do bot (~30 msgs/s) no worker; por chat ≥ 1s entre bolhas (§18.2).
+2. Rate limiter compartilhado via Redis (não semáforo local): o limite global do bot (~30 msgs/s)
+   e o espaçamento por chat (≥1s entre bolhas) são coordenados entre os 4 workers. Um semáforo
+   local por processo permitiria 4× o limite global.
 3. Fila de retry com a escada 2s, 8s, 32s, 2min, 8min e jitter ±25%, e a exceção de
-   `RETRY_AFTER` usando o valor literal do canal.
+   `RETRY_AFTER` usando o valor literal do canal. O valor de `retry_after` é carregado no
+   resultado de `classify_error` (não apenas a classe), para que o serviço de outbound possa
+   persistir `next_retry_at` sem conhecer o canal.
 4. `RETRY_BACKOFF`: até 5 tentativas; `RETRY_AFTER`: até 5; `UNDELIVERABLE`, `ACCOUNT`, `BUG`:
    não repetem; `DEFER_WINDOW` nunca gerado pelo Telegram (presente no enum por compat).
-5. Persistir tentativa em `outbound_queue` com `group_id`/`seq` só quando vier do grafo; para
-   mensagens fixas de degradação, registro direto é aceito e identificado como tal.
+5. Persistir tentativa em `outbound_queue` com `group_id`/`seq` para toda mensagem, incluindo
+   mensagens fixas de degradação. O `group_id` é gerado para cada resposta, mesmo que tenha um
+   único bloco.
 6. Proativas nunca repetem automaticamente (§18.4) — esta sprint não gera proativas, mas a
    política já está no serviço.
 7. Degradação de foto/documento: `OutboundBlock(kind="text")` fixo, redigido em
@@ -327,15 +349,17 @@ futuro grafo, com retry por classe.
 **Critérios de aceite:**
 
 - backoff respeita escada + jitter; `RETRY_AFTER` usa o número literal;
-- semáforo global limita sem bloquear a fila;
+- rate limiter é compartilhado via Redis entre workers;
+- `retry_after` é carregado no resultado de `classify_error` e usado para `next_retry_at`;
 - classes não repetíveis são persistidas `dead` com `error_code`;
+- toda mensagem em `outbound_queue` tem `group_id`/`seq`, incluindo degradação fixa;
 - foto/documento recebe resposta fixa e o caso é registrado.
 
 ### S02-T07 — Voice and STT via Groq
 
 **Objetivo.** Itens de voz entram no buffer como texto com `was_audio=true`.
 
-**Spec.** §4 (fluxo), §11 (teto e prompt de vocabulário), §289 (arquivo temporário).
+**Spec.** §4 (fluxo), §11 (teto, prompt de vocabulário, regras), §20.6 (redação).
 
 **Depende de:** S02-T05 (ponto de integração) e adaptador de download.
 
@@ -343,25 +367,39 @@ futuro grafo, com retry por classe.
 
 - `src/fittrack/services/stt.py`;
 - `config/prompts/stt_vocabulary.md` (exceção de idioma, AD-27);
-- `tests/unit/stt.py` com cliente injetado.
+- `tests/unit/test_stt.py` com cliente injetado.
 
 **Plano de implementação:**
 
 1. Escrever teste falhando pela ausência de `stt`.
-2. Download em `/tmp` (tmpfs), apagado após transcrição; duração limitada pela §11.
-3. POST Groq `/audio/transcriptions` com `whisper-large-v3`, `language=pt`, `prompt` lido de
+2. Download em `/tmp` (tmpfs), apagado após transcrição bem-sucedida; duração limitada pela §11
+   (5 min). Em falha de STT, o arquivo é mantido em `/tmp` por até 6h para retry (§11.3), depois
+   apagado.
+3. POST Groq `/audio/transcriptions` com `whisper-large-v3`, `language=pt`,
+   `response_format=verbose_json` (para `no_speech_prob` e segments), `prompt` lido de
    `config/prompts/stt_vocabulary.md`.
 4. `file_path` nunca em log (§20.6); destino do arquivo gravado com `O_NOFOLLOW` quando suportado.
-5. Falha do STT degrada o item: marca `was_audio=true` com texto vazio e `status='incomplete'`
-   no batch (invariante 6) — nunca perder o input.
+5. Transcrição vazia ou `no_speech_prob > 0.6` → resposta fixa "Não consegui ouvir, pode repetir?"
+   (§11.3), sem entrar no batch.
+6. Falha de STT (erro de rede, timeout, 5xx) → o item é marcado `was_audio=true` com texto vazio
+   e `status='incomplete'` no batch (invariante 6), e o arquivo é mantido para retry.
+7. Transcrição bem-sucedida → o texto é persistido em `raw_message.transcript` (cifrado) antes de
+   apagar o arquivo, para que retry de batch não repita download nem STT.
+8. Consentimento: o STT só é chamado se o tenant tiver consentimento `workout_data` ativo. Sem
+   consentimento, a voz é respondida com a mensagem fixa de onboarding (fora do escopo desta
+   sprint, mas o gate é implementado aqui).
 
 **Critérios de aceite:**
 
-- ogg/opus baixado em tmpfs e apagado após transcrição;
+- ogg/opus baixado em tmpfs e apagado após transcrição bem-sucedida;
+- falha de STT mantém o arquivo por até 6h para retry;
 - prompt de vocabulário carregado de `config/prompts/`;
+- `response_format=verbose_json` usado; `no_speech_prob > 0.6` ou texto vazio → resposta fixa;
 - duração acima do teto é recusada com resposta fixa;
 - nenhum log com `file_path` ou token;
-- falha de STT mantém o item registrado como `incomplete`.
+- falha de STT mantém o item registrado como `incomplete`;
+- transcrição persistida em `raw_message.transcript` antes de apagar o arquivo;
+- STT só é chamado com consentimento `workout_data` ativo.
 
 ### S02-T08 — Bootstrap polling and integration
 
@@ -381,19 +419,23 @@ para dev e webhook documentado.
 
 **Plano de implementação:**
 
-1. Escrever smoke test integrado falhando: update → buffer → batch `processing`.
+1. Escrever smoke test integrado falhando: update → buffer → batch `done`.
 2. `polling.py`: `getUpdates` long-polling com offset persistido em Redis (para sobreviver a
    restart), somente quando `TELEGRAM_MODE=polling`.
 3. `bootstrap.py`: em modo webhook chama `setWebhook` com `secret_token`,
-   `allowed_updates=["message","callback_query","message_reaction"]` e `max_connections=40`; em
-   modo polling chama `deleteWebhook` antes de subir o poller (§18.2).
-4. Documentar: dev roda 1 réplica do `ingress` com polling; produção usa webhook e Caddy.
-5. Rodar a suíte duas vezes para demonstrar idempotência do bootstrap.
-6. Atualizar `CLAUDE.md` removendo itens entregues da tabela "Estado atual".
+   `allowed_updates=["message","callback_query","message_reaction","my_chat_member"]` e
+   `max_connections=40`; em modo polling chama `deleteWebhook` antes de subir o poller (§18.2).
+4. `TELEGRAM_MODE` default é `webhook` em produção; `polling` é explicitamente de desenvolvimento
+   e o compose de produção não o permite (guarda no settings ou no compose).
+5. Documentar: dev roda 1 réplica do `ingress` com polling; produção usa webhook e Caddy.
+6. Rodar a suíte duas vezes para demonstrar idempotência do bootstrap.
+7. Atualizar `CLAUDE.md` removendo itens entregues da tabela "Estado atual".
 
 **Critérios de aceite:**
 
 - polling só em dev (1 réplica) e `bootstrap.py` reconcilia webhook/polling;
+- `allowed_updates` inclui `my_chat_member` para que `revoked_at` seja observável;
+- `TELEGRAM_MODE` default é `webhook`; polling exige override explícito;
 - smoke test passa de ponta a ponta contra Redis e Postgres reais;
 - `CLAUDE.md` reflete o estado real; suíte idempotente;
 - nenhum segredo ou payload sensível em log, fixture ou erro.
@@ -417,15 +459,25 @@ A sprint termina somente quando todos os itens abaixo forem demonstrados:
 
 - [ ] `POST /webhook/telegram` verifica o secret em tempo constante e responde < 200 ms;
 - [ ] dedup por `update_id` + `(identity_id, channel_message_id)` descarta reentrega sem lookup;
+- [ ] falha após `SET NX` deleta a reserva para permitir reentrega;
 - [ ] `raw_message.payload` é cifrado e nunca sai em log;
-- [ ] rajada acumula em `buffer:{tenant_id}` com debounce de 10s renovável;
+- [ ] rajada acumula em `buffer:{tenant_id}` com debounce de 10s renovável e job ID estável;
 - [ ] drain por `RENAME` é atômico com lock por tenant e auto-extend;
-- [ ] `processing_batch.combined_text` nasce cifrado e o batch fica em `processing`;
+- [ ] `processing_batch.combined_text` nasce cifrado e o batch fica em `done`;
+- [ ] o lock por tenant é adquirido dentro de `process_batch`, não apenas em `flush_check`;
 - [ ] voice é baixada em tmpfs, transcrita via Groq com vocabulário, e apagada;
-- [ ] todo update type da §18.2 parseia ou é descartado com a política correta;
+- [ ] falha de STT mantém o arquivo por até 6h para retry;
+- [ ] transcrição persistida em `raw_message.transcript` antes de apagar o arquivo;
+- [ ] STT só é chamado com consentimento `workout_data` ativo;
+- [ ] todo update type da §18.2 parseia ou é descartado com a política correta, incluindo
+  `video_note` e `my_chat_member`;
 - [ ] `classify_error` cobre a tabela do Telegram e o retry respeita `retry_after` literal;
+- [ ] `retry_after` é carregado no resultado de `classify_error` e usado para `next_retry_at`;
+- [ ] rate limiter é compartilhado via Redis entre workers;
+- [ ] toda mensagem em `outbound_queue` tem `group_id`/`seq`, incluindo degradação fixa;
 - [ ] foto/documento recebe resposta fixa de não suportado;
 - [ ] polling funciona em dev com 1 réplica; `bootstrap.py` reconcilia modos;
+- [ ] `TELEGRAM_MODE` default é `webhook`; polling exige override explícito;
 - [ ] teste de arquitetura `test_channel_isolation` continua verde;
 - [ ] CI obrigatório está verde, `make fmt/lint/typecheck/test` passam.
 
@@ -439,6 +491,9 @@ A sprint termina somente quando todos os itens abaixo forem demonstrados:
 | STT depender de rede nos testes | Médio — suíte instável | cliente HTTP injetado; fixtures gravadas; teste de unidade sem rede |
 | Polling e webhook ligados ao mesmo tempo | Médio — 409 do Telegram | `bootstrap.py` reconcilia; `TELEGRAM_MODE` exclusivo; dev com 1 réplica |
 | `file_path`/token vazarem em log | Crítico — segredo na URL | lista de redação da §20.6 coberta por teste; nunca logar |
+| Rate limiter local permitir 4× o limite global | Alto — 429s evitáveis | rate limiter compartilhado via Redis |
+| Lock por tenant liberado antes do grafo | Alto — processamento concorrente | lock adquirido dentro de `process_batch` |
+| STT sem consentimento | Crítico — LGPD | gate de consentimento `workout_data` antes de chamar Groq |
 
 ## Suposições registradas
 
@@ -451,6 +506,8 @@ A sprint termina somente quando todos os itens abaixo forem demonstrados:
   produção.
 - O teste de `test_graph_reducers` e `test_graph_topology` continuam fora até a Sprint 03, quando
   o grafo existir.
+- O `GROQ_API_KEY` é provisionado apenas ao worker (não ao ingress), e o compose de produção
+  reflete isso.
 
 ## Relatório de encerramento
 
