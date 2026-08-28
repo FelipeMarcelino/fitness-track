@@ -121,9 +121,24 @@ END $$;
 # owner's privileges — the classic escalation.
 IDENTITY_BOUNDARY = """
 DO $$
+DECLARE
+  v_super boolean;
 BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'fittrack_identity') THEN
-    CREATE ROLE fittrack_identity NOLOGIN NOSUPERUSER BYPASSRLS;
+  SELECT rolsuper INTO v_super FROM pg_roles WHERE rolname = 'fittrack_identity';
+  IF v_super IS NULL THEN
+    CREATE ROLE fittrack_identity NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE BYPASSRLS;
+  ELSIF v_super THEN
+    RAISE EXCEPTION 'role fittrack_identity already exists as a superuser: the two '
+                    'SECURITY DEFINER functions would run with superuser rights. '
+                    'Drop or demote it before migrating.';
+  ELSE
+    -- The role predates this migration, or an operator made it by hand. A bare
+    -- `IF NOT EXISTS` would accept whatever attributes it happens to carry, and
+    -- LOGIN with a password is the one that matters: it turns a boundary that
+    -- is only supposed to be reachable through two functions into a principal
+    -- anyone with the password can connect as -- one that bypasses RLS.
+    ALTER ROLE fittrack_identity
+      NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE BYPASSRLS PASSWORD NULL;
   END IF;
 END $$;
 

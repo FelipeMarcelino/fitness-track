@@ -18,6 +18,7 @@ from collections.abc import AsyncIterator
 
 import asyncpg
 import pytest
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from fittrack.db.engine import split_ssl_arguments
@@ -198,3 +199,96 @@ async def test_setting_a_nonsense_tenant_is_refused(session: AsyncSession, tenan
     async with session.begin():
         with pytest.raises(TenantContextError):
             await set_tenant(session, tenant_id)
+
+
+# --------------------------------------------------------------------------- #
+# What a write reports back
+# --------------------------------------------------------------------------- #
+
+
+async def test_execute_reports_how_many_rows_it_touched(
+    session: AsyncSession, owner: asyncpg.Connection
+) -> None:
+    """The count is the caller's only signal that a write did anything."""
+    tenant_id = await make_tenant(owner)
+
+    async with tenant_transaction(session, tenant_id):
+        repository = TenantRepository(session, tenant_id)
+        touched = await repository.execute(
+            "UPDATE workout_session SET label = :label WHERE tenant_id = :tenant",
+            label="leg day",
+            tenant=tenant_id,
+        )
+
+    assert touched == 1
+
+
+async def test_a_write_filtered_by_the_policy_reports_zero(
+    session: AsyncSession, owner: asyncpg.Connection
+) -> None:
+    """RLS removes rows from an UPDATE silently, so the statement succeeds.
+
+    Returning `None` from `execute` threw away the only evidence that the write
+    had reached nothing — a cross-tenant update would look exactly like a
+    successful one.
+    """
+    mine = await make_tenant(owner)
+    theirs = await make_tenant(owner)
+
+    async with tenant_transaction(session, mine):
+        repository = TenantRepository(session, mine)
+        touched = await repository.execute(
+            "UPDATE workout_session SET label = 'hijacked' WHERE tenant_id = :tenant",
+            tenant=theirs,
+        )
+
+    assert touched == 0
+    assert (
+        await owner.fetchval(
+            "SELECT count(*) FROM workout_session WHERE tenant_id = $1 AND label = 'hijacked'",
+            theirs,
+        )
+        == 0
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Who owns the transaction
+# --------------------------------------------------------------------------- #
+
+
+async def test_tenant_transaction_refuses_a_session_already_in_a_transaction(
+    session: AsyncSession, owner: asyncpg.Connection
+) -> None:
+    """`SET LOCAL` dies with the transaction, so this has to own one.
+
+    SQLAlchemy autobegins on the first statement. Joining that transaction
+    would leave the binding alive after the `async with` closed, and would
+    quietly rebind a transaction someone else had already bound.
+    """
+    tenant_id = await make_tenant(owner)
+    await session.execute(text("SELECT 1"))  # autobegins
+    assert session.in_transaction()
+
+    with pytest.raises(TenantContextError, match="already has an open transaction"):
+        async with tenant_transaction(session, tenant_id):
+            pass  # pragma: no cover - the context must not open
+
+    await session.rollback()
+
+
+async def test_the_binding_does_not_outlive_its_transaction(
+    session: AsyncSession, owner: asyncpg.Connection
+) -> None:
+    """The `LOCAL` in `SET LOCAL`, stated as a test.
+
+    This is what makes the context safe under a pooled connection: the next
+    tenant to borrow it cannot inherit the last one's binding.
+    """
+    tenant_id = await make_tenant(owner)
+
+    async with tenant_transaction(session, tenant_id):
+        assert await current_tenant(session) == tenant_id
+
+    assert await current_tenant(session) is None
+    await session.rollback()

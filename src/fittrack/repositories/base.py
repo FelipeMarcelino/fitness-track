@@ -15,9 +15,9 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, cast
 
-from sqlalchemy import text
+from sqlalchemy import CursorResult, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -53,7 +53,20 @@ async def current_tenant(session: AsyncSession) -> int | None:
 
 @asynccontextmanager
 async def tenant_transaction(session: AsyncSession, tenant_id: int) -> AsyncIterator[AsyncSession]:
-    """A transaction that is bound to a tenant before it does anything else."""
+    """A transaction that is bound to a tenant before it does anything else.
+
+    Refuses a session that is already in a transaction. `SET LOCAL` lives and
+    dies with the transaction, so this has to own one: joining someone else's
+    would leave the binding in place after the `async with` closed, and would
+    silently overwrite a tenant that transaction had already been bound to.
+    SQLAlchemy autobegins on the first statement, so an already-open
+    transaction means a query ran before this call — commit or roll it back.
+    """
+    if session.in_transaction():
+        raise TenantContextError(
+            "session already has an open transaction: tenant_transaction() must open its own, "
+            "so that SET LOCAL app.tenant_id is discarded with it"
+        )
     async with session.begin():
         await set_tenant(session, tenant_id)
         yield session
@@ -113,6 +126,17 @@ class TenantRepository:
         result = await self._session.execute(text(statement), params)
         return result.fetchone()
 
-    async def execute(self, statement: str, **params: Any) -> None:
+    async def execute(self, statement: str, **params: Any) -> int:
+        """Run a write in this repository's tenant context, returning rowcount.
+
+        The count is the caller's only way to tell "nothing matched" from "the
+        policy filtered it out": RLS removes rows from an UPDATE or DELETE
+        silently, so an unchecked write against another tenant's row succeeds
+        and does nothing. Discarding the number here would discard the only
+        evidence.
+        """
         await self._assert_bound()
-        await self._session.execute(text(statement), params)
+        # `rowcount` lives on `CursorResult`, which is what `execute` actually
+        # returns for DML; the declared `Result` is the common supertype.
+        result = cast(CursorResult[Any], await self._session.execute(text(statement), params))
+        return result.rowcount

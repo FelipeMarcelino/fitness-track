@@ -69,6 +69,25 @@ SEEDS: dict[str, str] = {
 }
 
 
+# The nine tables below need a parent row, so one statement is not enough to
+# seed them. They were absent from `SEEDS` and therefore walked by every
+# parametrised test above while proving nothing -- including `exercise_set`,
+# `raw_message` and `outbound_queue`, which hold the data actually worth
+# leaking. The acceptance criterion says every tenant-scoped table, not a
+# sample, and `test_the_suite_seeds_every_tenant_scoped_table` now enforces it.
+PARENTED = (
+    "exercise_alias",
+    "exercise_set",
+    "session_summary",
+    "raw_message",
+    "outbound_queue",
+    "conversation_window",
+    "program_phase",
+    "program_milestone",
+    "plan_item",
+)
+
+
 @pytest.fixture
 async def app_session(
     app_dsn: str, trusting_ssl_context: object, migrated: None
@@ -87,14 +106,27 @@ async def set_tenant(connection: asyncpg.Connection, tenant_id: int | None) -> N
     )
 
 
+ALL_SEEDABLE = tuple(sorted(set(SEEDS) | set(PARENTED)))
+
+
 async def seeded_tenant(owner: asyncpg.Connection, table: str) -> int:
-    """A tenant owning one row in `table`, written as the owner."""
+    """A tenant owning one row in `table`, written as the owner.
+
+    Raises for a table it cannot seed. Doing nothing quietly was how nine
+    tables sat in the parametrisation and proved nothing about themselves.
+    """
     tenant: int = await owner.fetchval(
         "INSERT INTO tenant (display_name) VALUES ('seed') RETURNING id"
     )
+    if table == "tenant":
+        return tenant
     if table in SEEDS:
         await owner.execute(*seed_args(table, tenant))
-    return tenant
+        return tenant
+    if table in PARENTED:
+        await seed_parented(owner, table, tenant)
+        return tenant
+    raise AssertionError(f"no seed for {table}: the isolation walk would skip it silently")
 
 
 def seed_args(table: str, tenant: int) -> tuple[object, ...]:
@@ -103,6 +135,144 @@ def seed_args(table: str, tenant: int) -> tuple[object, ...]:
     if "$2" in statement:
         return (statement, tenant, secrets.token_bytes(16))
     return (statement, tenant)
+
+
+async def seed_parented(owner: asyncpg.Connection, table: str, tenant: int) -> tuple[object, ...]:
+    """One row in a table that needs a parent, plus whatever it hangs from.
+
+    Written as the owner, so no policy is consulted while setting up; the tests
+    then read it back as `fittrack_runtime`, which is the principal under test.
+
+    Returns the child insert and its parameters, so the `WITH CHECK` test can
+    replay it as the wrong tenant. Postgres evaluates the RLS check before it
+    touches the indexes, so replaying an insert that would also collide on a
+    unique constraint still fails as a privilege error, not a duplicate key.
+    """
+    marker = secrets.token_bytes(16)
+    unique = secrets.token_hex(8)
+    child: tuple[object, ...]
+
+    if table == "exercise_alias":
+        exercise = await owner.fetchval(
+            "INSERT INTO exercise (tenant_id, slug, name, modality)"
+            " VALUES ($1, $2, 'x', 'forca') RETURNING id",
+            tenant,
+            unique,
+        )
+        child = (
+            "INSERT INTO exercise_alias (exercise_id, alias, normalized, tenant_id)"
+            " VALUES ($1, $2, $2, $3)",
+            exercise,
+            unique,
+            tenant,
+        )
+    elif table in ("exercise_set", "session_summary"):
+        session = await owner.fetchval(
+            "INSERT INTO workout_session (tenant_id, local_date)"
+            " VALUES ($1, CURRENT_DATE) RETURNING id",
+            tenant,
+        )
+        if table == "exercise_set":
+            exercise = await owner.fetchval(
+                "INSERT INTO exercise (tenant_id, slug, name, modality)"
+                " VALUES ($1, $2, 'x', 'forca') RETURNING id",
+                tenant,
+                unique,
+            )
+            child = (
+                "INSERT INTO exercise_set (tenant_id, session_id, exercise_id,"
+                " exercise_tenant_id, set_index, reps, load_kg)"
+                " VALUES ($1, $2, $3, $1, 1, 8, 80.0)",
+                tenant,
+                session,
+                exercise,
+            )
+        else:
+            child = (
+                "INSERT INTO session_summary (session_id, tenant_id, narrative)"
+                " VALUES ($1, $2, $3)",
+                session,
+                tenant,
+                marker,
+            )
+    elif table in ("raw_message", "outbound_queue", "conversation_window"):
+        identity = await owner.fetchval(
+            "INSERT INTO channel_identity (tenant_id, channel, external_id, external_id_hash)"
+            " VALUES ($1, 'telegram', $2, $2) RETURNING id",
+            tenant,
+            marker,
+        )
+        if table == "raw_message":
+            child = (
+                "INSERT INTO raw_message (tenant_id, identity_id, channel,"
+                " channel_message_id, direction, msg_type, payload)"
+                " VALUES ($1, $2, 'telegram', $3, 'inbound', 'text', $4)",
+                tenant,
+                identity,
+                unique,
+                marker,
+            )
+        elif table == "outbound_queue":
+            child = (
+                "INSERT INTO outbound_queue (tenant_id, identity_id, channel, kind,"
+                " payload, group_id)"
+                " VALUES ($1, $2, 'telegram', 'text', $3, gen_random_uuid())",
+                tenant,
+                identity,
+                marker,
+            )
+        else:
+            child = (
+                "INSERT INTO conversation_window (identity_id, tenant_id, last_inbound_at)"
+                " VALUES ($1, $2, now())",
+                identity,
+                tenant,
+            )
+    elif table in ("program_phase", "program_milestone"):
+        program = await owner.fetchval(
+            "INSERT INTO training_program (tenant_id, name, goal, horizon_weeks, rationale)"
+            " VALUES ($1, 'p', 'forca', 8, 'r') RETURNING id",
+            tenant,
+        )
+        if table == "program_phase":
+            child = (
+                "INSERT INTO program_phase (tenant_id, program_id, phase_order, name, weeks)"
+                " VALUES ($1, $2, 1, 'base', 4)",
+                tenant,
+                program,
+            )
+        else:
+            child = (
+                "INSERT INTO program_milestone (tenant_id, program_id, description,"
+                " metric, target_value)"
+                " VALUES ($1, $2, 'd', 'e1rm', 100)",
+                tenant,
+                program,
+            )
+    elif table == "plan_item":
+        plan = await owner.fetchval(
+            "INSERT INTO workout_plan (tenant_id, name) VALUES ($1, 'plano') RETURNING id",
+            tenant,
+        )
+        exercise = await owner.fetchval(
+            "INSERT INTO exercise (tenant_id, slug, name, modality)"
+            " VALUES ($1, $2, 'x', 'forca') RETURNING id",
+            tenant,
+            unique,
+        )
+        child = (
+            "INSERT INTO plan_item (tenant_id, plan_id, day_label, day_order, item_order,"
+            " exercise_id, exercise_tenant_id)"
+            " VALUES ($1, $2, 'A', 1, 1, $3, $1)",
+            tenant,
+            plan,
+            exercise,
+        )
+    else:  # pragma: no cover - guarded by seeded_tenant
+        raise AssertionError(f"seed_parented does not know {table}")
+
+    await owner.execute(*child)
+    return child
 
 
 # --------------------------------------------------------------------------- #
@@ -149,7 +319,7 @@ async def test_the_root_table_is_covered_too(owner: asyncpg.Connection) -> None:
     assert flags["relrowsecurity"] and flags["relforcerowsecurity"]
 
 
-@pytest.mark.parametrize("table", sorted(SEEDS))
+@pytest.mark.parametrize("table", ALL_SEEDABLE)
 async def test_a_tenant_reads_only_its_own_rows(
     owner: asyncpg.Connection, app_session: asyncpg.Connection, table: str
 ) -> None:
@@ -172,7 +342,7 @@ async def test_a_tenant_reads_only_its_own_rows(
     )
 
 
-@pytest.mark.parametrize("table", sorted(SEEDS))
+@pytest.mark.parametrize("table", ALL_SEEDABLE)
 async def test_a_tenant_cannot_update_another_tenants_rows(
     owner: asyncpg.Connection, app_session: asyncpg.Connection, table: str
 ) -> None:
@@ -188,7 +358,7 @@ async def test_a_tenant_cannot_update_another_tenants_rows(
     assert result.endswith(" 0"), f"{table} allowed a cross-tenant update: {result}"
 
 
-@pytest.mark.parametrize("table", sorted(SEEDS))
+@pytest.mark.parametrize("table", ALL_SEEDABLE)
 async def test_a_tenant_cannot_delete_another_tenants_rows(
     owner: asyncpg.Connection, app_session: asyncpg.Connection, table: str
 ) -> None:
@@ -212,6 +382,9 @@ async def test_a_tenant_cannot_delete_another_tenants_rows(
     )
 
 
+# Only the single-statement seeds: this test executes the insert *as the app*,
+# so it needs a statement it can run directly. The parented tables are covered
+# for `WITH CHECK` by `test_the_with_check_half_covers_the_parented_tables`.
 @pytest.mark.parametrize("table", sorted(SEEDS))
 async def test_a_tenant_cannot_write_a_row_for_another(
     owner: asyncpg.Connection, app_session: asyncpg.Connection, table: str
@@ -230,7 +403,7 @@ async def test_a_tenant_cannot_write_a_row_for_another(
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.parametrize("table", sorted(SEEDS))
+@pytest.mark.parametrize("table", ALL_SEEDABLE)
 async def test_a_connection_without_a_tenant_sees_nothing_private(
     owner: asyncpg.Connection, app_session: asyncpg.Connection, table: str
 ) -> None:
@@ -263,22 +436,107 @@ async def test_a_connection_without_a_tenant_sees_no_tenants(
 # --------------------------------------------------------------------------- #
 
 
+# The column carrying the marker, per catalogue table. The old test asserted
+# `count(*) IS NOT NULL`, which is true of every count ever taken -- and for
+# three of the four tables it inserted nothing at all, so it counted zero rows
+# and passed. Seeding a row and looking for that row is the difference between
+# testing the policy and testing that SQL works.
+GLOBAL_MARKER = {
+    "exercise": "slug",
+    "exercise_alias": "normalized",
+    "workout_plan": "name",
+    "plan_item": "day_label",
+}
+
+
+async def seed_global(owner: asyncpg.Connection, table: str) -> str:
+    """A catalogue row -- `tenant_id IS NULL` -- carrying a unique marker."""
+    marker = f"global-{secrets.token_hex(6)}"
+
+    if table == "exercise":
+        await owner.execute(
+            "INSERT INTO exercise (tenant_id, slug, name, modality)"
+            " VALUES (NULL, $1, 'global', 'forca')",
+            marker,
+        )
+    elif table == "exercise_alias":
+        exercise = await owner.fetchval(
+            "INSERT INTO exercise (tenant_id, slug, name, modality)"
+            " VALUES (NULL, $1, 'global', 'forca') RETURNING id",
+            f"parent-{marker}",
+        )
+        await owner.execute(
+            "INSERT INTO exercise_alias (exercise_id, alias, normalized, tenant_id)"
+            " VALUES ($1, $2, $2, NULL)",
+            exercise,
+            marker,
+        )
+    elif table == "workout_plan":
+        await owner.execute("INSERT INTO workout_plan (tenant_id, name) VALUES (NULL, $1)", marker)
+    elif table == "plan_item":
+        plan = await owner.fetchval(
+            "INSERT INTO workout_plan (tenant_id, name) VALUES (NULL, $1) RETURNING id",
+            f"parent-{marker}",
+        )
+        exercise = await owner.fetchval(
+            "INSERT INTO exercise (tenant_id, slug, name, modality)"
+            " VALUES (NULL, $1, 'global', 'forca') RETURNING id",
+            f"parent-{marker}",
+        )
+        await owner.execute(
+            "INSERT INTO plan_item (tenant_id, plan_id, day_label, day_order, item_order,"
+            " exercise_id, exercise_tenant_id)"
+            " VALUES (NULL, $1, $2, 1, 1, $3, NULL)",
+            plan,
+            marker,
+            exercise,
+        )
+    else:  # pragma: no cover - the parametrisation is GLOBAL_READABLE itself
+        raise AssertionError(f"seed_global does not know {table}")
+
+    return marker
+
+
 @pytest.mark.parametrize("table", sorted(GLOBAL_READABLE))
 async def test_global_rows_are_readable_by_any_tenant(
     owner: asyncpg.Connection, app_session: asyncpg.Connection, table: str
 ) -> None:
     """Without this policy the catalogue vanishes as soon as a tenant is set."""
-    if table == "exercise":
-        await owner.execute(
-            "INSERT INTO exercise (tenant_id, slug, name, modality)"
-            " VALUES (NULL, $1, 'global', 'forca')",
-            f"global-{secrets.token_hex(6)}",
-        )
+    marker = await seed_global(owner, table)
+    column = GLOBAL_MARKER[table]
     tenant = await seeded_tenant(owner, "tenant")
     await set_tenant(app_session, tenant)
 
-    total = await app_session.fetchval(f"SELECT count(*) FROM {table} WHERE tenant_id IS NULL")
-    assert total is not None  # readable, whatever the catalogue currently holds
+    visible = await app_session.fetchval(
+        f"SELECT count(*) FROM {table} WHERE {column} = $1 AND tenant_id IS NULL", marker
+    )
+    assert visible == 1
+
+
+@pytest.mark.parametrize("table", sorted(GLOBAL_READABLE))
+async def test_the_catalogue_policy_grants_reads_and_nothing_else(
+    owner: asyncpg.Connection, app_session: asyncpg.Connection, table: str
+) -> None:
+    """`FOR SELECT` is the whole policy: a readable row is not a writable one.
+
+    A tenant that could edit the shared catalogue would reach every other
+    tenant through it, which is the leak the policy exists to avoid.
+    """
+    marker = await seed_global(owner, table)
+    column = GLOBAL_MARKER[table]
+    tenant = await seeded_tenant(owner, "tenant")
+    await set_tenant(app_session, tenant)
+
+    # No policy grants UPDATE or DELETE over `tenant_id IS NULL`, so the rows
+    # are simply not there for either -- silently, as RLS filters rather than
+    # raises. The row surviving as the owner sees it is the assertion.
+    updated = await app_session.execute(
+        f"UPDATE {table} SET {column} = 'hijacked' WHERE {column} = $1", marker
+    )
+    deleted = await app_session.execute(f"DELETE FROM {table} WHERE {column} = $1", marker)
+    assert updated.endswith(" 0"), updated
+    assert deleted.endswith(" 0"), deleted
+    assert (await owner.fetchval(f"SELECT count(*) FROM {table} WHERE {column} = $1", marker)) == 1
 
 
 async def test_a_tenant_cannot_write_to_the_global_catalogue(
@@ -336,3 +594,35 @@ async def test_every_table_with_a_tenant_column_has_a_policy(
     }
     missing = sorted(with_column - set(TENANT_SCOPED))
     assert not missing, f"tables with tenant_id and no policy: {missing}"
+
+
+@pytest.mark.parametrize("table", PARENTED)
+async def test_the_with_check_half_covers_the_parented_tables(
+    owner: asyncpg.Connection, app_session: asyncpg.Connection, table: str
+) -> None:
+    """`WITH CHECK`, for the tables the single-statement walk cannot reach.
+
+    The parents are created as the owner and belong to the other tenant; the
+    child insert is then replayed as ours, naming theirs. A policy that only
+    filtered reads would let this through.
+    """
+    mine = await seeded_tenant(owner, table)
+    theirs: int = await owner.fetchval(
+        "INSERT INTO tenant (display_name) VALUES ('seed') RETURNING id"
+    )
+    child = await seed_parented(owner, table, theirs)
+
+    await set_tenant(app_session, mine)
+    with pytest.raises(asyncpg.InsufficientPrivilegeError):
+        await app_session.execute(*child)
+
+
+def test_the_suite_seeds_every_tenant_scoped_table() -> None:
+    """The criterion is every tenant-scoped table, not a sample.
+
+    Nine tables sat in `TENANT_SCOPED` with no seed, so the parametrised walks
+    ran against a tenant that owned no row in them and passed without asserting
+    anything -- `exercise_set`, `raw_message` and `outbound_queue` among them.
+    """
+    unseeded = sorted(set(TENANT_SCOPED) - set(ALL_SEEDABLE))
+    assert not unseeded, f"tenant-scoped tables the isolation walk would skip: {unseeded}"

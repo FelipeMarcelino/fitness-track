@@ -14,12 +14,15 @@ from collections.abc import AsyncIterator
 
 import asyncpg
 import pytest
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from fittrack.db.engine import split_ssl_arguments
+from fittrack.db.migrations.versions._0002_row_level_security import IDENTITY_BOUNDARY
+from fittrack.db.sql import split_statements
 from fittrack.security.crypto import ColumnCipher, Keyring, identity_aad
 from fittrack.security.identity_hash import identity_hash
-from fittrack.services.identity import IdentityService
+from fittrack.services.identity import IdentityService, ResolvedIdentity
 from tests.conftest import CA_FILE
 
 PEPPER = b"a-bootstrap-pepper-of-sufficient-length!"
@@ -270,3 +273,125 @@ async def test_the_definer_role_has_only_the_grants_it_needs(
         ("channel_identity", "INSERT"),
         ("tenant", "INSERT"),
     }, f"unexpected grants: {sorted(grants)}"
+
+
+async def test_a_lost_race_does_not_roll_back_the_caller(
+    app_dsn: str,
+    app_session: AsyncSession,
+    service: IdentityService,
+    cipher: ColumnCipher,
+    owner: asyncpg.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Losing the race undoes one insert, not the whole transaction.
+
+    The handler that calls this has usually already written in the same
+    transaction — the raw message, at least. A blanket `session.rollback()`
+    threw that away too, silently, on a path whose whole point is that nothing
+    went wrong.
+
+    The stale read is forced rather than raced: `resolve` is made to answer
+    `None` once, which is exactly what a real racer sees when the winner
+    commits between the lookup and the insert.
+    """
+    contested = f"lost-{secrets.token_hex(6)}"
+    ours = f"ours-{secrets.token_hex(6)}"
+
+    url, ssl_args = split_ssl_arguments(
+        app_dsn.replace("postgresql://", "postgresql+asyncpg://")
+        + f"?sslmode=verify-full&sslrootcert={CA_FILE}"
+    )
+    engine = create_async_engine(url, connect_args=ssl_args)
+    try:
+        async with async_sessionmaker(engine, expire_on_commit=False)() as other:
+            winner = await IdentityService(other, cipher, PEPPER).resolve_or_create(
+                "telegram", contested
+            )
+            await other.commit()
+    finally:
+        await engine.dispose()
+
+    # Work the caller did before the contested lookup, still uncommitted.
+    earlier = await service.resolve_or_create("telegram", ours)
+    assert earlier.created
+
+    real_resolve = service.resolve
+    calls = {"n": 0}
+
+    async def stale(channel: str, external_id: str) -> int | None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None
+        return await real_resolve(channel, external_id)
+
+    monkeypatch.setattr(service, "resolve", stale)
+
+    result = await service.resolve_or_create("telegram", contested)
+    assert result == ResolvedIdentity(tenant_id=winner.tenant_id, created=False)
+
+    await app_session.commit()
+
+    assert (
+        await owner.fetchval(
+            "SELECT count(*) FROM channel_identity WHERE external_id_hash = $1",
+            identity_hash("telegram", ours, PEPPER),
+        )
+        == 1
+    ), "the caller's earlier insert was rolled back by someone else's lost race"
+
+
+async def test_a_real_failure_is_not_mistaken_for_a_lost_race(
+    service: IdentityService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a uniqueness conflict means "someone got here first".
+
+    A bare `except Exception` answered a dropped connection or a bad key
+    version with whatever `resolve` happened to return next — or swallowed the
+    fault and re-raised something unrelated to the actual cause.
+    """
+    boom = OperationalError("SELECT create_tenant_with_identity(...)", {}, Exception("gone"))
+
+    async def fail(*_: object, **__: object) -> None:
+        raise boom
+
+    monkeypatch.setattr(service._session, "scalar", fail)
+
+    with pytest.raises(OperationalError):
+        await service.resolve_or_create("telegram", f"boom-{secrets.token_hex(6)}")
+
+
+async def test_the_migration_normalises_a_role_that_already_exists(
+    owner: asyncpg.Connection,
+) -> None:
+    """`IF NOT EXISTS` accepts whatever attributes it finds, which is the bug.
+
+    A `fittrack_identity` left over from an older run — or made by hand — can
+    carry LOGIN and a password. That turns a boundary reachable only through
+    two functions into a principal anyone with the password can connect as, and
+    one that bypasses RLS at that.
+    """
+    guard = split_statements(IDENTITY_BOUNDARY)[0]
+    assert "fittrack_identity" in guard and guard.lstrip().startswith("DO")
+
+    await owner.execute("ALTER ROLE fittrack_identity LOGIN PASSWORD 'let-me-in'")
+    try:
+        assert await owner.fetchval(
+            "SELECT rolcanlogin FROM pg_roles WHERE rolname = 'fittrack_identity'"
+        )
+        await owner.execute(guard)
+    finally:
+        await owner.execute(
+            "ALTER ROLE fittrack_identity NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE"
+            " BYPASSRLS PASSWORD NULL"
+        )
+
+    role = await owner.fetchrow(
+        "SELECT r.rolcanlogin, r.rolsuper, r.rolbypassrls,"
+        "       a.rolpassword IS NOT NULL AS has_password"
+        "  FROM pg_roles r JOIN pg_authid a ON a.oid = r.oid"
+        " WHERE r.rolname = 'fittrack_identity'"
+    )
+    assert not role["rolcanlogin"]
+    assert not role["rolsuper"]
+    assert role["rolbypassrls"]
+    assert not role["has_password"], "NOLOGIN alone leaves the password in place"

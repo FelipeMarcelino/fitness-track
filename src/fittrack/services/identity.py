@@ -17,6 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from fittrack.security.crypto import ColumnCipher, identity_aad
@@ -71,28 +72,34 @@ class IdentityService:
         )
 
         try:
-            tenant_id: int | None = await self._session.scalar(
-                text(
-                    "SELECT create_tenant_with_identity("
-                    "  CAST(:channel AS channel_kind), :external_id, :digest,"
-                    "  CAST(:key_version AS smallint))"
-                ),
-                {
-                    "channel": channel,
-                    "external_id": sealed,
-                    "digest": digest,
-                    "key_version": self._cipher.active_version,
-                },
-            )
-        except Exception:
-            # A concurrent first contact committed between the resolve and the
-            # insert. Its tenant is the right answer; a second one would split
-            # the same person's history in two.
-            await self._session.rollback()
+            # A savepoint, not the whole transaction. The losing side of a race
+            # has to undo its failed insert without touching work the caller
+            # had already done in the same transaction — rolling that back was
+            # destroying data this function never owned.
+            async with self._session.begin_nested():
+                tenant_id: int | None = await self._session.scalar(
+                    text(
+                        "SELECT create_tenant_with_identity("
+                        "  CAST(:channel AS channel_kind), :external_id, :digest,"
+                        "  CAST(:key_version AS smallint))"
+                    ),
+                    {
+                        "channel": channel,
+                        "external_id": sealed,
+                        "digest": digest,
+                        "key_version": self._cipher.active_version,
+                    },
+                )
+        except IntegrityError:
+            # Narrow on purpose: only a uniqueness conflict means "someone else
+            # got here first". A dropped connection or a bad key version is a
+            # real failure, and treating it as a lost race would answer with a
+            # tenant nobody verified — or hide the fault behind a `None`.
             concurrent = await self.resolve(channel, external_id)
             if concurrent is None:
                 raise
             return ResolvedIdentity(tenant_id=concurrent, created=False)
 
-        assert tenant_id is not None
+        if tenant_id is None:  # pragma: no cover - the function cannot return NULL
+            raise RuntimeError("create_tenant_with_identity returned no tenant")
         return ResolvedIdentity(tenant_id=tenant_id, created=True)
