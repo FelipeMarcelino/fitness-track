@@ -18,6 +18,7 @@ o ADR explica *como se chegou nele*.
 | --- | --- | --- | --- |
 | 0001 | Groq como provider primário | aceito | AD-19 |
 | [0002](0002-portao-do-judge-suspenso.md) | Portão do LLM-as-judge suspenso na fundação | aceito | — |
+| [0003](0003-escopo-de-tenant-dentro-da-chave-estrangeira.md) | Escopo de tenant dentro da chave estrangeira | aceito | — |
 
 > ⚠️ **ADR-0001 está referenciado mas ausente da árvore.** O `CLAUDE.md` e a §2 da spec apontam para
 > `doc/adr/0001-groq-como-provider-primario.md`, e o arquivo não existe. O conteúdo da decisão está
