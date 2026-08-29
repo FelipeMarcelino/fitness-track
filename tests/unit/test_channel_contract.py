@@ -208,6 +208,19 @@ def test_a_channel_without_reactions_has_no_reaction_set() -> None:
         dataclasses.replace(CAPS, reactions=False, reaction_set="arbitrary")
 
 
+@pytest.mark.parametrize("hours", [0, -24], ids=["never open", "already closed"])
+def test_a_windowed_channel_has_a_window_that_opens(hours: int) -> None:
+    """A window of zero hours is not a window, and the code would read it as one.
+
+    `proactive="windowed"` sends the coach down the branch that asks whether the
+    last inbound message is inside the window (14.1). With this at zero every
+    answer is no, so every proactive message is deferred or templatised —
+    silently, and identically to a channel that genuinely could not be reached.
+    """
+    with pytest.raises(ValueError, match="window_hours"):
+        dataclasses.replace(CAPS, proactive="windowed", window_hours=hours)
+
+
 def test_a_channel_with_reactions_names_its_set() -> None:
     """A descriptor that supports reactions says *which* ones (spec 18.1).
 
@@ -706,6 +719,38 @@ def test_the_registry_holds_a_webhook_secret_to_its_shape(secret: str, why: str)
         )
     assert secret not in str(raised.value), f"the rejected secret was quoted back ({why})"
     assert factories.built == {}
+
+
+@pytest.mark.parametrize(
+    "padded",
+    ["123:abc\n", " 123:abc", "123:abc ", "\t123:abc\n"],
+    ids=["trailing newline", "leading space", "trailing space", "both"],
+)
+def test_a_credential_wearing_whitespace_is_not_usable(padded: str) -> None:
+    """A mounted secret file ends in a newline, and the token then does too.
+
+    Non-blank, so the presence check passes and the padded value reaches the
+    provider, where it fails as a bad token. The registry refuses rather than
+    trimming: it does not own the configuration, and quietly normalising a
+    broken one hides the deployment that needs fixing.
+    """
+    factories = RecordingFactories()
+    with pytest.raises(MissingCredentialError, match="TELEGRAM_BOT_TOKEN") as raised:
+        ChannelRegistry.from_config(
+            telegram_config(telegram_bot_token=StubSecret(padded)),
+            factories=factories.table("telegram"),
+        )
+    assert "123:abc" not in str(raised.value), "the rejected credential was quoted back"
+    assert factories.built == {}
+
+
+def test_a_credential_that_fits_exactly_is_accepted() -> None:
+    """The check is padding, not content: a token with no slack still builds."""
+    registry = ChannelRegistry.from_config(
+        telegram_config(telegram_bot_token=StubSecret("123:abc")),
+        factories=RecordingFactories().table("telegram"),
+    )
+    assert registry.enabled == ("telegram",)
 
 
 def test_a_polling_deployment_is_never_asked_about_the_shape() -> None:

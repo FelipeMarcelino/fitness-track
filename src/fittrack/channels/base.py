@@ -161,6 +161,12 @@ class ChannelCaps:
         # down the wrong branch, silently.
         if (self.window_hours is None) != (self.proactive == "free"):
             raise ValueError("window_hours is set if and only if proactive == 'windowed'")
+        # And it has to open. At zero the coach asks "is the last inbound
+        # message inside the window" (spec 14.1), gets no every time, and
+        # defers or templatises everything — indistinguishable from a channel
+        # that genuinely could not be reached.
+        if self.window_hours is not None and self.window_hours <= 0:
+            raise ValueError(f"window_hours is a window, and {self.window_hours} never opens")
         # Also both directions: `reactions=True` with no set tells the ack
         # formatter it may react and nothing about what with, so it picks an
         # emoji the channel rejects — Telegram takes a fixed list, WhatsApp

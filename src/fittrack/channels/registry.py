@@ -10,10 +10,11 @@ Two rules, both from Apêndice A:
 1. **Only what is listed is built.** A deployment that has WhatsApp credentials
    but does not list the channel has no WhatsApp adapter — the environment says
    what runs, not the presence of a secret.
-2. **A listed channel without usable credentials fails here.** Absent, blank, or
-   — for the webhook secret, which authenticates every update — the wrong shape.
-   An environment variable that is set and empty is a credential in name only,
-   and a three-character shared secret is one in name only too.
+2. **A listed channel without usable credentials fails here.** Absent, blank,
+   wearing whitespace, or — for the webhook secret, which authenticates every
+   update — the wrong shape. An environment variable that is set and empty is a
+   credential in name only; so is a token that kept the newline of the file it
+   was mounted from, and so is a three-character shared secret.
    `Settings` already refuses to boot in that state; this check exists because
    the registry is also fed by scripts and tests that build a configuration
    directly, and because a half-built adapter fails on the first webhook instead
@@ -116,16 +117,29 @@ class ChannelConfig(Protocol):
 ChannelFactory = Callable[[ChannelConfig], Channel]
 
 
-def _absent(secret: SecretStr | None) -> bool:
-    """Whether a credential is missing — which includes being blank.
+def _unusable(name: str, secret: SecretStr | None) -> str | None:
+    """What to say about a credential that cannot be used, if it cannot.
 
-    Presence is the wrong question. A `SecretStr("")` — an environment variable
-    that is set and empty is the ordinary way to get one — satisfies every
-    `is None` check and reaches the factory, so the process starts and the
-    failure moves to the first call the adapter makes to the provider. That is
-    an incident; the point of this check is a deployment that never happened.
+    Presence is the wrong question, twice over. A `SecretStr("")` — an
+    environment variable that is set and empty is the ordinary way to get one —
+    satisfies every `is None` check; so does a token that kept the newline of
+    the secret file it was mounted from. Both reach the factory, the process
+    starts, and the failure moves to the first call the adapter makes to the
+    provider. That is an incident; the point of this check is a deployment that
+    never happened.
+
+    Padding is refused rather than trimmed. The registry does not own the
+    configuration, and quietly repairing a broken one hides the deployment that
+    needs fixing. The complaint never quotes the value.
     """
-    return secret is None or not secret.get_secret_value().strip()
+    if secret is None:
+        return name
+    value = secret.get_secret_value()
+    if not value.strip():
+        return name
+    if value != value.strip():
+        return f"{name} without the whitespace around it"
+    return None
 
 
 def _unusable_webhook_secret(secret: SecretStr) -> str | None:
@@ -147,14 +161,14 @@ def _unusable_webhook_secret(secret: SecretStr) -> str | None:
 
 def _missing_telegram_credentials(config: ChannelConfig) -> list[str]:
     missing = []
-    if _absent(config.telegram_bot_token):
-        missing.append("TELEGRAM_BOT_TOKEN")
+    if complaint := _unusable("TELEGRAM_BOT_TOKEN", config.telegram_bot_token):
+        missing.append(complaint)
     # Only the webhook needs a secret: it is what authenticates every update
     # (spec 18.2). Polling authenticates itself by holding the bot token.
     if config.telegram_mode == "webhook":
         secret = config.telegram_webhook_secret
-        if _absent(secret):
-            missing.append("TELEGRAM_WEBHOOK_SECRET")
+        if complaint := _unusable("TELEGRAM_WEBHOOK_SECRET", secret):
+            missing.append(complaint)
         elif secret is not None and (why := _unusable_webhook_secret(secret)):
             # Present but unusable is the same failure as absent, one step
             # later: `setWebhook` refuses the first, and the second is a shared
@@ -165,14 +179,14 @@ def _missing_telegram_credentials(config: ChannelConfig) -> list[str]:
 
 def _missing_whatsapp_credentials(config: ChannelConfig) -> list[str]:
     return [
-        name
+        complaint
         for name, value in (
             ("WABA_PHONE_NUMBER_ID", config.waba_phone_number_id),
             ("WABA_TOKEN", config.waba_token),
             ("WABA_APP_SECRET", config.waba_app_secret),
             ("WABA_VERIFY_TOKEN", config.waba_verify_token),
         )
-        if _absent(value)
+        if (complaint := _unusable(name, value))
     ]
 
 
