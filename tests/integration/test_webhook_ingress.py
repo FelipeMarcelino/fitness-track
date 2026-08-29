@@ -11,8 +11,11 @@ import pytest
 
 from fittrack.channels.base import ChannelAuthenticationError, InboundMessage
 from fittrack.services.webhook import (
+    DedupReservation,
+    DedupState,
     IngressIdentity,
     TelegramWebhookIngress,
+    UpdateInFlightError,
 )
 from fittrack.settings import ChannelKind
 
@@ -36,17 +39,23 @@ class FakeChannel:
 
 
 class FakeDeduplicator:
-    def __init__(self, *, accepted: bool = True) -> None:
-        self.accepted = accepted
+    def __init__(self, *, state: DedupState = DedupState.ACQUIRED) -> None:
+        self.state = state
         self.reserved: list[int] = []
-        self.released: list[int] = []
+        self.released: list[DedupReservation] = []
+        self.completed: list[DedupReservation] = []
 
-    async def reserve(self, update_id: int) -> bool:
+    async def reserve(self, update_id: int) -> DedupReservation:
         self.reserved.append(update_id)
-        return self.accepted
+        return DedupReservation(
+            update_id, self.state, "token" if self.state is DedupState.ACQUIRED else None
+        )
 
-    async def release(self, update_id: int) -> None:
-        self.released.append(update_id)
+    async def complete(self, reservation: DedupReservation) -> None:
+        self.completed.append(reservation)
+
+    async def release(self, reservation: DedupReservation) -> None:
+        self.released.append(reservation)
 
 
 class FakeIdentityResolver:
@@ -63,7 +72,7 @@ class FakeRawMessages:
         self.fail = fail
         self.messages: list[InboundMessage] = []
 
-    async def persist(self, *, identity: IngressIdentity, message: InboundMessage) -> int | None:
+    async def persist(self, *, identity: IngressIdentity, message: InboundMessage) -> int:
         self.messages.append(message)
         if self.fail:
             raise RuntimeError("database unavailable")
@@ -124,9 +133,9 @@ def ingress(
     )
 
 
-async def test_a_duplicate_update_returns_before_identity_lookup() -> None:
+async def test_a_completed_duplicate_returns_before_identity_lookup() -> None:
     service, seen, identities, persisted, buffer = ingress(
-        deduplicator=FakeDeduplicator(accepted=False)
+        deduplicator=FakeDeduplicator(state=DedupState.COMPLETED)
     )
 
     await service.receive({"x-secret": "valid"}, b'{"update_id": 901}')
@@ -143,7 +152,7 @@ async def test_a_failure_after_the_reservation_releases_it_for_redelivery() -> N
     with pytest.raises(RuntimeError, match="database unavailable"):
         await service.receive({"x-secret": "valid"}, b'{"update_id": 902}')
 
-    assert seen.released == [902]
+    assert [reservation.update_id for reservation in seen.released] == [902]
     assert buffer.envelopes == []
 
 
@@ -176,3 +185,17 @@ async def test_a_buffered_envelope_contains_the_hash_and_never_the_external_id()
         }
     ]
     assert "private-chat-id" not in repr(buffer.envelopes)
+
+
+async def test_an_inflight_duplicate_is_not_acknowledged() -> None:
+    service, seen, identities, persisted, buffer = ingress(
+        deduplicator=FakeDeduplicator(state=DedupState.IN_FLIGHT)
+    )
+
+    with pytest.raises(UpdateInFlightError):
+        await service.receive({"x-secret": "valid"}, b'{"update_id": 905}')
+
+    assert seen.reserved == [905]
+    assert identities.external_ids == []
+    assert persisted.messages == []
+    assert buffer.envelopes == []

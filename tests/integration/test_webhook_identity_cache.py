@@ -18,6 +18,11 @@ class MemoryCache:
         self.values[key] = value
         self.writes.append((key, value, ex))
 
+    async def delete(self, *names: str) -> int:
+        for name in names:
+            self.values.pop(name, None)
+        return len(names)
+
 
 class RecordingResolver:
     def __init__(self) -> None:
@@ -56,3 +61,17 @@ async def test_identity_cache_uses_only_the_hash_and_avoids_a_second_lookup() ->
         )
     ]
     assert "private-chat-id" not in repr(cache.values)
+
+
+async def test_identity_invalidation_uses_the_same_hashed_cache_key() -> None:
+    cache = MemoryCache()
+    resolver = CachedIdentityResolver(
+        cache=cache,
+        delegate=RecordingResolver(),
+        hash_identity=hash_identity,
+    )
+    await resolver.resolve_or_create(channel="telegram", external_id="private-chat-id")
+
+    await resolver.invalidate(channel="telegram", external_id="private-chat-id")
+
+    assert cache.values == {}

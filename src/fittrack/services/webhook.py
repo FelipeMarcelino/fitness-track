@@ -8,8 +8,10 @@ can be developed independently (Sprint 02 tasks S02-T02 and S02-T03).
 from __future__ import annotations
 
 import json
+import secrets
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any, ClassVar, Protocol
 
 from sqlalchemy import text
@@ -20,6 +22,8 @@ from fittrack.security.crypto import ColumnCipher
 from fittrack.settings import ChannelKind
 
 DEDUP_TTL_S = 24 * 60 * 60
+PROCESSING_TTL_S = 60
+BUFFER_TTL_S = 60 * 60
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,13 +35,33 @@ class IngressIdentity:
     external_id_hash: bytes
 
 
+class DedupState(StrEnum):
+    ACQUIRED = "acquired"
+    COMPLETED = "completed"
+    IN_FLIGHT = "in_flight"
+
+
+@dataclass(frozen=True, slots=True)
+class DedupReservation:
+    update_id: int
+    state: DedupState
+    token: str | None = None
+
+
+class UpdateInFlightError(RuntimeError):
+    """A concurrent delivery must retry instead of being acknowledged."""
+
+
 class UpdateDeduplicator(Protocol):
     """Reserves a Telegram update until all durable work has succeeded."""
 
-    async def reserve(self, update_id: int) -> bool:
-        """Return false when another delivery already completed or is running."""
+    async def reserve(self, update_id: int) -> DedupReservation:
+        """Classify this delivery as acquired, complete, or still processing."""
 
-    async def release(self, update_id: int) -> None:
+    async def complete(self, reservation: DedupReservation) -> None:
+        """Atomically mark an acquired reservation completed for 24 hours."""
+
+    async def release(self, reservation: DedupReservation) -> None:
         """Make a failed update eligible for Telegram redelivery."""
 
 
@@ -69,12 +93,15 @@ class IdentityCache(Protocol):
     async def set(self, key: str, value: str, *, ex: int) -> None:
         """Store a value with its mandatory expiry."""
 
+    async def delete(self, *names: str) -> int:
+        """Remove a mapping after its channel identity is revoked."""
+
 
 class RawMessageStore(Protocol):
     """Persists encrypted inbound payloads under the resolved tenant context."""
 
-    async def persist(self, *, identity: IngressIdentity, message: InboundMessage) -> int | None:
-        """Return the raw-message id, or None for its SQL deduplication conflict."""
+    async def persist(self, *, identity: IngressIdentity, message: InboundMessage) -> int:
+        """Return the inserted or SQL-deduplicated raw-message id."""
 
 
 class TenantBuffer(Protocol):
@@ -90,14 +117,20 @@ class RedisIngressClient(Protocol):
     async def delete(self, *names: str) -> int:
         """Delete one or more keys."""
 
-    async def exists(self, *names: str) -> int:
-        """Return how many of the requested keys currently exist."""
+    async def expire(self, name: str, time: int) -> bool:
+        """Apply a bounded lifetime to sensitive list data."""
+
+    async def get(self, name: str) -> str | bytes | None:
+        """Read a string key."""
 
     async def rpush(self, name: str, *values: str) -> int:
         """Append strings to a list."""
 
     async def set(self, name: str, value: str, *, ex: int, nx: bool = False) -> bool | None:
         """Set a TTL-bound string, optionally only when absent."""
+
+    async def eval(self, script: str, numkeys: int, *keys_and_args: str | int) -> int:
+        """Run the compare-and-set scripts used by reservations."""
 
 
 class FlushScheduler(Protocol):
@@ -138,13 +171,16 @@ class TelegramWebhookIngress:
         Authentication deliberately comes before JSON parsing.  A forged body
         must neither consume compute in the adapter nor reveal any tenant state.
         """
-        self._channel.verify(headers, body)
+        self.verify(headers)
         payload = _parse_update(body)
         update_id = _update_id(payload)
         if update_id is None:
             return
-        if not await self._deduplicator.reserve(update_id):
+        reservation = await self._deduplicator.reserve(update_id)
+        if reservation.state is DedupState.COMPLETED:
             return
+        if reservation.state is DedupState.IN_FLIGHT:
+            raise UpdateInFlightError
 
         try:
             for message in self._channel.parse(payload):
@@ -155,7 +191,7 @@ class TelegramWebhookIngress:
                     identity=identity,
                     message=message,
                 )
-                if raw_message_id is None or not _is_processable(message):
+                if not _is_processable(message):
                     continue
                 await self._buffer.append(
                     tenant_id=identity.tenant_id,
@@ -165,9 +201,14 @@ class TelegramWebhookIngress:
                         raw_message_id=raw_message_id,
                     ),
                 )
+            await self._deduplicator.complete(reservation)
         except Exception:
-            await self._deduplicator.release(update_id)
+            await self._deduplicator.release(reservation)
             raise
+
+    def verify(self, headers: Mapping[str, str]) -> None:
+        """Use Telegram's header-only secret before FastAPI reads the body."""
+        self._channel.verify(headers, b"")
 
 
 class CachedIdentityResolver:
@@ -219,24 +260,58 @@ class CachedIdentityResolver:
         await self._cache.set(key, value, ex=self._ttl_s)
         return identity
 
+    async def invalidate(self, *, channel: ChannelKind, external_id: str) -> None:
+        """Drop the exact mapping the authorized revocation path changed."""
+        digest = self._hash_identity(channel, external_id)
+        await self._cache.delete(f"identity:{channel}:{digest.hex()}")
+
 
 class RedisUpdateDeduplicator:
     """Redis ``SET NX EX`` reservation for global Telegram update ids."""
 
-    def __init__(self, redis: RedisIngressClient, *, ttl_s: int = DEDUP_TTL_S) -> None:
-        if ttl_s <= 0:
+    def __init__(
+        self,
+        redis: RedisIngressClient,
+        *,
+        ttl_s: int = DEDUP_TTL_S,
+        processing_ttl_s: int = PROCESSING_TTL_S,
+    ) -> None:
+        if ttl_s <= 0 or processing_ttl_s <= 0:
             raise ValueError("deduplication TTL must be positive")
         self._redis = redis
         self._ttl_s = ttl_s
+        self._processing_ttl_s = processing_ttl_s
 
-    async def reserve(self, update_id: int) -> bool:
+    async def reserve(self, update_id: int) -> DedupReservation:
         if update_id < 0:
             raise ValueError("Telegram update_id must be non-negative")
-        reserved = await self._redis.set(_seen_key(update_id), "1", nx=True, ex=self._ttl_s)
-        return bool(reserved)
+        token = f"processing:{secrets.token_urlsafe(16)}"
+        key = _seen_key(update_id)
+        reserved = await self._redis.set(key, token, nx=True, ex=self._processing_ttl_s)
+        if reserved:
+            return DedupReservation(update_id, DedupState.ACQUIRED, token)
+        existing = await self._redis.get(key)
+        if existing == "completed":
+            return DedupReservation(update_id, DedupState.COMPLETED)
+        return DedupReservation(update_id, DedupState.IN_FLIGHT)
 
-    async def release(self, update_id: int) -> None:
-        await self._redis.delete(_seen_key(update_id))
+    async def complete(self, reservation: DedupReservation) -> None:
+        if reservation.state is not DedupState.ACQUIRED or reservation.token is None:
+            return
+        await self._redis.eval(
+            _COMPLETE_RESERVATION,
+            1,
+            _seen_key(reservation.update_id),
+            reservation.token,
+            self._ttl_s,
+        )
+
+    async def release(self, reservation: DedupReservation) -> None:
+        if reservation.state is not DedupState.ACQUIRED or reservation.token is None:
+            return
+        await self._redis.eval(
+            _RELEASE_RESERVATION, 1, _seen_key(reservation.update_id), reservation.token
+        )
 
 
 class RedisTenantBuffer:
@@ -264,18 +339,16 @@ class RedisTenantBuffer:
     async def append(self, *, tenant_id: int, envelope: dict[str, object]) -> None:
         if tenant_id <= 0:
             raise ValueError("tenant_id must be positive")
-        debounce_key = f"debounce:{tenant_id}"
-        was_debouncing = bool(await self._redis.exists(debounce_key))
         await self._redis.rpush(
             f"buffer:{tenant_id}",
             json.dumps(envelope, separators=(",", ":"), sort_keys=True),
         )
-        await self._redis.set(debounce_key, "1", ex=self._debounce_window_s)
-        if not was_debouncing:
-            await self._scheduler.schedule_flush_check(
-                tenant_id=tenant_id,
-                delay_s=self._debounce_window_s,
-            )
+        await self._redis.expire(f"buffer:{tenant_id}", BUFFER_TTL_S)
+        await self._redis.set(f"debounce:{tenant_id}", "1", ex=self._debounce_window_s)
+        await self._scheduler.schedule_flush_check(
+            tenant_id=tenant_id,
+            delay_s=self._debounce_window_s,
+        )
 
 
 class DatabaseIdentityResolver:
@@ -327,7 +400,7 @@ class SqlRawMessageStore:
         self._sessions = sessions
         self._cipher = cipher
 
-    async def persist(self, *, identity: IngressIdentity, message: InboundMessage) -> int | None:
+    async def persist(self, *, identity: IngressIdentity, message: InboundMessage) -> int:
         from fittrack.db.engine import tenant_session
         from fittrack.security.crypto import column_aad
 
@@ -370,7 +443,36 @@ class SqlRawMessageStore:
                 },
             )
             inserted = result.scalar_one_or_none()
-        return int(inserted) if inserted is not None else None
+            if inserted is not None:
+                return int(inserted)
+            existing = await session.scalar(
+                text(
+                    "SELECT id FROM raw_message WHERE identity_id = :identity_id "
+                    "AND channel_message_id = :channel_message_id"
+                ),
+                {
+                    "identity_id": identity.identity_id,
+                    "channel_message_id": message.channel_message_id,
+                },
+            )
+        if existing is None:  # pragma: no cover - conflict row must be visible in the transaction
+            raise RuntimeError("raw-message deduplication conflict has no existing row")
+        return int(existing)
+
+
+_COMPLETE_RESERVATION = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  redis.call('SET', KEYS[1], 'completed', 'EX', ARGV[2])
+  return 1
+end
+return 0
+"""
+_RELEASE_RESERVATION = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
 
 
 def _parse_update(body: bytes) -> Mapping[str, Any]:

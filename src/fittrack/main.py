@@ -14,6 +14,7 @@ from typing import Literal, Protocol
 from fastapi import FastAPI, HTTPException, Request, Response
 
 from fittrack.channels.base import ChannelAuthenticationError
+from fittrack.services.webhook import UpdateInFlightError
 from fittrack.startup import startup
 
 
@@ -24,6 +25,9 @@ class TelegramIngress(Protocol):
     S02-T03 implement the ingress in parallel with the Telegram adapter in
     S02-T02 while keeping failed authentication outside every later step.
     """
+
+    def verify(self, headers: Mapping[str, str]) -> None:
+        """Reject a forged request before FastAPI buffers its body."""
 
     async def receive(self, headers: Mapping[str, str], body: bytes) -> None:
         """Verify and accept one Telegram update, or reject its secret."""
@@ -57,9 +61,14 @@ def create_app(*, telegram_ingress: TelegramIngress | None = None) -> FastAPI:
         if telegram_ingress is None:
             raise HTTPException(status_code=503, detail="telegram ingress is unavailable")
         try:
-            await telegram_ingress.receive(dict(request.headers), await request.body())
+            telegram_ingress.verify(request.headers)
+            await telegram_ingress.receive(request.headers, await request.body())
         except ChannelAuthenticationError:
             raise HTTPException(status_code=403, detail="forbidden") from None
+        except UpdateInFlightError:
+            raise HTTPException(
+                status_code=503, detail="telegram update is still processing"
+            ) from None
         return Response(status_code=200)
 
     return app

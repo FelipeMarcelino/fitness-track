@@ -18,10 +18,12 @@ class RecordingIngress:
         self.reject = reject
         self.calls: list[tuple[dict[str, str], bytes]] = []
 
-    async def receive(self, headers: Mapping[str, str], body: bytes) -> None:
-        self.calls.append((dict(headers), body))
+    def verify(self, headers: Mapping[str, str]) -> None:
         if self.reject:
             raise ChannelAuthenticationError
+
+    async def receive(self, headers: Mapping[str, str], body: bytes) -> None:
+        self.calls.append((dict(headers), body))
 
 
 @pytest.mark.asyncio
@@ -44,4 +46,4 @@ async def test_telegram_webhook_rejects_an_invalid_secret_before_processing() ->
         response = await client.post("/webhook/telegram", content=b'{"update_id": 1}')
 
     assert response.status_code == 403
-    assert len(ingress.calls) == 1
+    assert ingress.calls == []

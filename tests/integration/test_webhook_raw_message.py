@@ -73,7 +73,7 @@ async def test_raw_message_is_encrypted_and_uses_the_second_dedup_barrier(
     duplicate = await store.persist(identity=identity, message=inbound())
 
     assert raw_message_id is not None
-    assert duplicate is None
+    assert duplicate == raw_message_id
     stored = await owner.fetchrow(
         "SELECT payload, key_version FROM raw_message WHERE id = $1", raw_message_id
     )
