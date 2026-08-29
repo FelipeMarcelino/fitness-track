@@ -66,6 +66,16 @@ x-app: &app
       target: /certs/ca.crt
       read_only: true
       bind: { create_host_path: false }
+    # Spec 11.1: a downloaded voice recording lands in tmpfs, never on a volume.
+    # Without this, `/tmp` is the container's writable layer — disk, and it
+    # survives a restart — while 11.3 deliberately keeps a failed transcription
+    # there for six hours. Bounded, because an unbounded tmpfs is host memory a
+    # malformed `file_id` can spend: 256 MB is a dozen downloads at the 20 MB
+    # ceiling of 18.2. The worker and scheduler heartbeats live here too, and
+    # are ephemeral by design.
+    - type: tmpfs
+      target: /tmp
+      tmpfs: { size: 268435456 }
   networks: [internal]
   depends_on:
     postgres: {condition: service_healthy}

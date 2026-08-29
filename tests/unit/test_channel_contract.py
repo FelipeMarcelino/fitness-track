@@ -766,10 +766,19 @@ def test_the_shipped_table_covers_every_known_channel() -> None:
     assert set(ADAPTERS) == set(KNOWN_CHANNELS)
 
 
+def test_the_shipped_table_builds_a_real_telegram_adapter() -> None:
+    """The registry hands out a `Channel`, and since S02-T02 there is one."""
+    registry = ChannelRegistry.from_config(telegram_config())
+    adapter = registry.get("telegram")
+    assert isinstance(adapter, Channel)
+    assert adapter.kind == "telegram"
+    assert type(adapter).__name__ == "TelegramAdapter"
+
+
 def test_an_adapter_that_does_not_exist_yet_says_so() -> None:
-    """Until S02-T02 lands, enabling telegram fails by name and not by ImportError."""
-    with pytest.raises(ChannelUnavailableError, match="telegram"):
-        ChannelRegistry.from_config(telegram_config())
+    """WhatsApp is phase 2.0: enabling it fails by name, not by ImportError."""
+    with pytest.raises(ChannelUnavailableError, match="whatsapp"):
+        ChannelRegistry.from_config(whatsapp_config())
 
 
 if TYPE_CHECKING:  # pragma: no cover

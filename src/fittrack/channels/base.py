@@ -60,6 +60,7 @@ __all__ = [
     "SendReceipt",
     "TemplateRef",
     "ensure_addressable",
+    "ensure_identity",
 ]
 
 
@@ -284,6 +285,20 @@ class SendReceipt:
     media_ref: str | None = None
 
 
+def ensure_identity(kind: ChannelKind, identity: ChannelIdentity) -> None:
+    """Refuse an identity that belongs to another channel.
+
+    Split out of `ensure_addressable` because `send` is not the only way out: an
+    adapter also edits, types and acknowledges, and each of those puts an
+    `external_id` on the wire. One definition, called from all of them.
+    """
+    if identity.channel != kind:
+        raise ChannelMismatchError(
+            f"{kind} adapter cannot send to a {identity.channel} identity "
+            f"(identity_id={identity.identity_id})"
+        )
+
+
 def ensure_addressable(kind: ChannelKind, identity: ChannelIdentity, block: OutboundBlock) -> None:
     """Refuse to send a block that names another channel.
 
@@ -295,11 +310,7 @@ def ensure_addressable(kind: ChannelKind, identity: ChannelIdentity, block: Outb
 
     Called first thing in `send`, so the rejection happens before any HTTP.
     """
-    if identity.channel != kind:
-        raise ChannelMismatchError(
-            f"{kind} adapter cannot send to a {identity.channel} identity "
-            f"(identity_id={identity.identity_id})"
-        )
+    ensure_identity(kind, identity)
     if block.reply_to is not None and block.reply_to[0] != kind:
         raise ChannelMismatchError(
             f"{kind} adapter cannot reply to a {block.reply_to[0]} message; "
