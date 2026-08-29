@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -171,6 +171,18 @@ def test_a_channel_without_reactions_has_no_reaction_set() -> None:
         dataclasses.replace(CAPS, reactions=False, reaction_set="arbitrary")
 
 
+def test_a_channel_with_reactions_names_its_set() -> None:
+    """A descriptor that supports reactions says *which* ones (spec 18.1).
+
+    Telegram takes one emoji from a fixed list and WhatsApp takes any, and the
+    ack map of 13.2 has a table per channel. `reactions=True` without the set
+    tells the formatter it may react while telling it nothing about what with —
+    so it picks an emoji the channel rejects, at send time.
+    """
+    with pytest.raises(ValueError, match="reaction_set"):
+        dataclasses.replace(CAPS, reactions=True, reaction_set=None)
+
+
 @pytest.mark.parametrize(
     "value",
     [
@@ -203,6 +215,54 @@ def test_an_identity_never_reprs_its_external_id() -> None:
     """`external_id` is opaque and encrypted at rest; a repr reaches logs."""
     assert "123456789" not in repr(TELEGRAM_IDENTITY)
     assert "identity_id=1" in repr(TELEGRAM_IDENTITY)
+
+
+def inbound_message(**overrides: Any) -> InboundMessage:
+    """A text update as an adapter would hand it over, payload and all."""
+    base: dict[str, Any] = {
+        "channel": "telegram",
+        "external_id": "987654321",
+        "channel_message_id": "2",
+        "kind": "text",
+        "text": "supino 80kg x8",
+        "media_ref": None,
+        "button_payload": None,
+        "sent_at": datetime.now(UTC),
+        "raw": {"message": {"chat": {"id": 987654321}, "text": "supino 80kg x8"}},
+    }
+    return InboundMessage(**{**base, **overrides})
+
+
+def test_an_inbound_message_never_reprs_what_the_user_wrote() -> None:
+    """`channel.payload` and `user.text` are both redacted at the OTel processor
+    (20.2), and the raw update carries the `chat.id` as well — so a repr walks
+    the external id straight past the `repr=False` that guards the field itself.
+    One logged exception with this object in the frame is the whole leak.
+    """
+    printed = repr(inbound_message())
+    assert "987654321" not in printed
+    assert "supino 80kg x8" not in printed
+    assert "channel_message_id='2'" in printed, "the safe fields still identify it"
+
+
+def test_the_raw_payload_is_a_snapshot_of_the_authenticated_update() -> None:
+    """What lands in `raw_message` is what arrived, not what was left behind.
+
+    An adapter ordinarily keeps the dict it parsed. Annotating the field as a
+    `Mapping` does not copy it: without the snapshot, an edit anywhere in that
+    tree rewrites an audit record that is supposed to be the received bytes
+    (invariant 6).
+    """
+    payload: dict[str, Any] = {"message": {"chat": {"id": 987654321}, "text": "supino 80kg x8"}}
+    message = inbound_message(raw=payload)
+
+    payload["message"]["text"] = "agachamento 200kg"
+    payload["message"]["chat"]["id"] = 111
+    payload["edited"] = True
+
+    assert message.raw["message"]["text"] == "supino 80kg x8"
+    assert message.raw["message"]["chat"]["id"] == 987654321
+    assert "edited" not in message.raw
 
 
 def test_an_outbound_block_needs_only_its_kind() -> None:
@@ -302,6 +362,18 @@ def test_a_classified_error_defaults_to_no_number() -> None:
 def test_only_retry_after_carries_a_delay() -> None:
     with pytest.raises(ValueError, match="retry_after"):
         ClassifiedError(ErrorClass.RETRY_BACKOFF, retry_after=17)
+
+
+def test_retry_after_without_the_number_is_not_retry_after() -> None:
+    """The class means "the channel said when" — the number is the whole point.
+
+    The ladder belongs to `RETRY_BACKOFF`; `RETRY_AFTER` waits exactly what the
+    429 carried (spec 18.4). An adapter that classifies without the value hands
+    the outbound service a verdict it cannot write `next_retry_at` from, and the
+    discovery happens in the worker rather than here.
+    """
+    with pytest.raises(ValueError, match="retry_after"):
+        ClassifiedError(ErrorClass.RETRY_AFTER)
 
 
 # --------------------------------------------------------------------------- #
@@ -452,6 +524,43 @@ def test_the_registry_refuses_a_channel_without_its_credentials(
     with pytest.raises(MissingCredentialError, match=missing):
         ChannelRegistry.from_config(config, factories=factories.table("telegram", "whatsapp"))
     assert factories.built == {}, "the adapter was built before the credential check"
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\n"], ids=["empty", "spaces", "newline"])
+@pytest.mark.parametrize(
+    ("build", "credential", "missing"),
+    [
+        pytest.param(telegram_config, "telegram_bot_token", "TELEGRAM_BOT_TOKEN", id="bot token"),
+        pytest.param(
+            telegram_config,
+            "telegram_webhook_secret",
+            "TELEGRAM_WEBHOOK_SECRET",
+            id="webhook secret",
+        ),
+        pytest.param(
+            whatsapp_config, "waba_phone_number_id", "WABA_PHONE_NUMBER_ID", id="phone number id"
+        ),
+        pytest.param(whatsapp_config, "waba_token", "WABA_TOKEN", id="waba token"),
+        pytest.param(whatsapp_config, "waba_app_secret", "WABA_APP_SECRET", id="app secret"),
+        pytest.param(whatsapp_config, "waba_verify_token", "WABA_VERIFY_TOKEN", id="verify token"),
+    ],
+)
+def test_a_blank_credential_is_a_missing_credential(
+    build: Callable[..., StubConfig], credential: str, missing: str, blank: str
+) -> None:
+    """An empty secret is not a credential, and presence is not the test.
+
+    A `SecretStr("")` passes every `is None` check and reaches the factory, so
+    the deployment starts and the failure moves to the first webhook — an
+    incident instead of a deployment that never happened.
+    """
+    factories = RecordingFactories()
+    with pytest.raises(MissingCredentialError, match=missing):
+        ChannelRegistry.from_config(
+            build(**{credential: StubSecret(blank)}),
+            factories=factories.table("telegram", "whatsapp"),
+        )
+    assert factories.built == {}, "the adapter was built with an unusable credential"
 
 
 def test_polling_needs_no_webhook_secret() -> None:

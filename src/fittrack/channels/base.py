@@ -18,12 +18,21 @@ Two rules are enforced in code rather than trusted:
   adapter opens a connection.
 - **`external_id` never reprs.** It is opaque, encrypted at rest, and the single
   most sensitive identifier in the system (spec 20.6, invariant 10). A repr is
-  one exception away from a log line.
+  one exception away from a log line. The inbound payload and the message text
+  are held to the same rule, because `channel.payload` and `user.text` are on
+  the same redaction list (spec 20.2) and the raw update carries the
+  `external_id` inside it.
+- **The inbound payload is a snapshot.** `raw` is deep-copied on the way in. The
+  `Mapping` annotation is a promise to the reader and nothing to the runtime,
+  and an adapter ordinarily keeps the dict it parsed: without the copy, an edit
+  in that tree rewrites the audit record that `raw_message` is supposed to hold
+  (invariant 6).
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
@@ -100,9 +109,14 @@ class ClassifiedError:
     code: str | None = None
 
     def __post_init__(self) -> None:
-        if self.retry_after is not None and self.error_class is not ErrorClass.RETRY_AFTER:
+        # Both directions. The class *is* the number: an adapter that saw a 429
+        # without one has RETRY_BACKOFF and its ladder, and letting the verdict
+        # through without the seconds moves the discovery to the moment the
+        # outbound service writes `next_retry_at` (spec 18.4).
+        if (self.retry_after is None) != (self.error_class is not ErrorClass.RETRY_AFTER):
             raise ValueError(
-                f"retry_after belongs to {ErrorClass.RETRY_AFTER}, not {self.error_class}"
+                f"retry_after is set if and only if the class is {ErrorClass.RETRY_AFTER}; "
+                f"got {self.error_class} with retry_after={self.retry_after}"
             )
 
 
@@ -137,8 +151,15 @@ class ChannelCaps:
         # down the wrong branch, silently.
         if (self.window_hours is None) != (self.proactive == "free"):
             raise ValueError("window_hours is set if and only if proactive == 'windowed'")
-        if not self.reactions and self.reaction_set is not None:
-            raise ValueError("reaction_set requires reactions")
+        # Also both directions: `reactions=True` with no set tells the ack
+        # formatter it may react and nothing about what with, so it picks an
+        # emoji the channel rejects — Telegram takes a fixed list, WhatsApp
+        # takes any (spec 18.1).
+        if self.reactions != (self.reaction_set is not None):
+            raise ValueError(
+                "reaction_set is set if and only if reactions is true; "
+                f"got reactions={self.reactions} with reaction_set={self.reaction_set!r}"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,14 +186,26 @@ class InboundMessage:
     external_id: str = field(repr=False)
     channel_message_id: str
     kind: Literal["text", "voice", "button_reply", "image", "document", "other"]
-    text: str | None
+    # What the user wrote is `user.text` on the redaction list (spec 20.2). It
+    # belongs in Langfuse, where it is put deliberately — never in a repr, which
+    # is how it would arrive somewhere nobody chose.
+    text: str | None = field(repr=False)
     media_ref: str | None  # file_id | media_id
     button_payload: str | None
     sent_at: datetime
     # The original payload, on its way to `raw_message` (invariant 6). A
-    # `Mapping` rather than the spec's `dict`: this object is frozen, and a dict
-    # anyone can mutate in place is not.
-    raw: Mapping[str, Any]
+    # `Mapping` rather than the spec's `dict`, and deep-copied below: the
+    # annotation says "do not mutate" and the copy makes it so. It never reprs
+    # either — it is `channel.payload`, and it contains the `external_id`.
+    raw: Mapping[str, Any] = field(repr=False)
+
+    def __post_init__(self) -> None:
+        # A snapshot, taken once, at the only boundary that sees the update.
+        # Left as a plain dict on purpose: this value is serialised to JSON on
+        # its way to `raw_message`, and a mapping proxy is neither JSON- nor
+        # pickle-serialisable, which would trade a mutation nobody makes for a
+        # failure in a worker.
+        object.__setattr__(self, "raw", deepcopy(dict(self.raw)))
 
 
 @dataclass(frozen=True, slots=True)

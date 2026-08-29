@@ -10,11 +10,13 @@ Two rules, both from Apêndice A:
 1. **Only what is listed is built.** A deployment that has WhatsApp credentials
    but does not list the channel has no WhatsApp adapter — the environment says
    what runs, not the presence of a secret.
-2. **A listed channel without its credentials fails here.** `Settings` already
-   refuses to boot in that state; this check exists because the registry is also
-   fed by scripts and tests that build a configuration directly, and because a
-   half-built adapter fails on the first webhook instead of at startup — which
-   is an incident rather than a deployment that never happened.
+2. **A listed channel without usable credentials fails here.** Absent or blank:
+   an environment variable that is set and empty is a credential in name only.
+   `Settings` already refuses to boot in that state; this check exists because
+   the registry is also fed by scripts and tests that build a configuration
+   directly, and because a half-built adapter fails on the first webhook instead
+   of at startup — which is an incident rather than a deployment that never
+   happened.
 
 The adapters are imported lazily inside their factories. That is what lets this
 module name every channel while loading only the one in use, and it keeps the
@@ -97,13 +99,25 @@ class ChannelConfig(Protocol):
 ChannelFactory = Callable[[ChannelConfig], Channel]
 
 
+def _absent(secret: SecretStr | None) -> bool:
+    """Whether a credential is missing — which includes being blank.
+
+    Presence is the wrong question. A `SecretStr("")` — an environment variable
+    that is set and empty is the ordinary way to get one — satisfies every
+    `is None` check and reaches the factory, so the process starts and the
+    failure moves to the first call the adapter makes to the provider. That is
+    an incident; the point of this check is a deployment that never happened.
+    """
+    return secret is None or not secret.get_secret_value().strip()
+
+
 def _missing_telegram_credentials(config: ChannelConfig) -> list[str]:
     missing = []
-    if config.telegram_bot_token is None:
+    if _absent(config.telegram_bot_token):
         missing.append("TELEGRAM_BOT_TOKEN")
     # Only the webhook needs a secret: it is what authenticates every update
     # (spec 18.2). Polling authenticates itself by holding the bot token.
-    if config.telegram_mode == "webhook" and config.telegram_webhook_secret is None:
+    if config.telegram_mode == "webhook" and _absent(config.telegram_webhook_secret):
         missing.append("TELEGRAM_WEBHOOK_SECRET")
     return missing
 
@@ -117,7 +131,7 @@ def _missing_whatsapp_credentials(config: ChannelConfig) -> list[str]:
             ("WABA_APP_SECRET", config.waba_app_secret),
             ("WABA_VERIFY_TOKEN", config.waba_verify_token),
         )
-        if value is None
+        if _absent(value)
     ]
 
 
