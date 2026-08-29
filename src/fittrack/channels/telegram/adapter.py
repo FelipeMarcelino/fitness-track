@@ -107,6 +107,11 @@ _UNDELIVERABLE = (
 )
 _NOTHING_TO_REACT_TO = "message to react not found"
 
+# Marks a `channel_message_id` that identifies an event rather than a message.
+# Neither can be addressed, and both are numbers in Telegram's own vocabulary.
+PRESS_PREFIX = "press:"
+UPDATE_PREFIX = "update:"
+
 
 class TelegramAdapter:
     """Telegram, behind the `Channel` protocol."""
@@ -142,8 +147,12 @@ class TelegramAdapter:
     def parse(self, payload: Mapping[str, Any]) -> list[InboundMessage]:
         """One update, as zero or one messages the domain understands."""
         if message := payload.get("message"):
+            if not _is_private(message.get("chat")):
+                return []
             return [self._from_message(payload, message)]
         if press := payload.get("callback_query"):
+            if not _is_private((press.get("message") or {}).get("chat")):
+                return []
             return [self._from_callback(payload, press)]
         # Recognised but not processed. Both still become a message so the
         # payload reaches `raw_message`: the reaction because 18.2 ignores it,
@@ -266,10 +275,16 @@ class TelegramAdapter:
         return InboundMessage(
             channel=self.kind,
             external_id=external_id,
-            # The press, not the message it sits under: two presses on one
-            # message are two events, and `raw_message` is unique on
-            # `(identity_id, channel_message_id)` (spec 17.4).
-            channel_message_id=str(press["id"]),
+            # The press, not the message it sits under: two answers to one
+            # clarification are two events, and `raw_message` is unique on
+            # `(identity_id, channel_message_id)` (spec 17.4) — keying by the
+            # message would swallow the second answer as a duplicate.
+            #
+            # Prefixed because the same field is what `reply_to` carries, and
+            # Telegram numbers presses and messages alike: an unprefixed press
+            # id would be sent as `reply_parameters.message_id` and land on
+            # whatever message happens to hold that number. `send` refuses it.
+            channel_message_id=f"{PRESS_PREFIX}{press['id']}",
             kind="button_reply",
             text=None,
             media_ref=None,
@@ -288,7 +303,7 @@ class TelegramAdapter:
             # The update, not the message it refers to: two reactions to one
             # message are two events, and `raw_message` is unique on
             # `(identity_id, channel_message_id)` (spec 17.4).
-            channel_message_id=f"update:{payload['update_id']}",
+            channel_message_id=f"{UPDATE_PREFIX}{payload['update_id']}",
             kind="other",
             text=None,
             media_ref=None,
@@ -326,6 +341,7 @@ class TelegramAdapter:
         if block.reply_to is None:
             raise ChannelError("a reaction needs the message it reacts to (spec 18.2)")
         message_id = block.reply_to[1]
+        addressable = _addressable(message_id)
 
         if emoji not in TELEGRAM_REACTIONS:
             # 13.2 puts this here: which emoji a channel takes is protocol, and
@@ -340,7 +356,7 @@ class TelegramAdapter:
                 "setMessageReaction",
                 {
                     "chat_id": identity.external_id,
-                    "message_id": int(message_id),
+                    "message_id": addressable,
                     "reaction": [{"type": "emoji", "emoji": emoji}],
                 },
             )
@@ -367,8 +383,12 @@ class TelegramAdapter:
             raise ChannelError("a media block needs a file to send")
         data: dict[str, Any] = {"chat_id": identity.external_id}
         if block.text:
-            data["caption"] = clip_caption(
-                to_telegram_html(block.text), limit=self.caps.caption_limit
+            # Clip first, translate second. Telegram counts a caption after
+            # entities are parsed, so the ceiling belongs on the visible text —
+            # and slicing the HTML instead would cut through a tag and lose the
+            # whole request to a parse error.
+            data["caption"] = to_telegram_html(
+                clip_caption(block.text, limit=self.caps.caption_limit)
             )
             data["parse_mode"] = "HTML"
         sent = await self._client.upload(
@@ -390,7 +410,7 @@ class TelegramAdapter:
             "link_preview_options": {"is_disabled": True},
         }
         if block.reply_to is not None and block.kind != "reaction":
-            payload["reply_parameters"] = {"message_id": int(block.reply_to[1])}
+            payload["reply_parameters"] = {"message_id": _addressable(block.reply_to[1])}
         return payload
 
     def _receipt(self, sent: Any, *, media_ref: str | None = None) -> SendReceipt:
@@ -400,6 +420,18 @@ class TelegramAdapter:
             sent_at=self._now(),
             media_ref=media_ref,
         )
+
+
+def _is_private(chat: Mapping[str, Any] | None) -> bool:
+    """Whether this chat is one person talking to the bot.
+
+    The bot operates in private chat only (spec 18.2). A group's `chat.id` is
+    shared by everyone in it, so accepting a group update would file every
+    member's messages under one tenant and send the answers — somebody else's
+    training history — back to the whole room. Silence is the right answer to
+    being added to a group.
+    """
+    return chat is not None and chat.get("type") == "private"
 
 
 def _classify_message(
@@ -412,6 +444,12 @@ def _classify_message(
     # Voice, and the two containers that are voice when they are short enough
     # (spec 11). Past the ceiling it is still recorded, but with no `media_ref`:
     # nothing downstream should fetch what will not be transcribed.
+    #
+    # `other` is the only truthful value the closed Literal of 18.1 offers, and
+    # it is doing three jobs at once — this, a reaction update to discard, and a
+    # membership change to act on. The ingress has to tell them apart from the
+    # payload, because 11.3 asks the user to split the recording and 18.4 says
+    # never silence. Noted for S02-T03; giving 18.1 a field instead is an ADR.
     for field in ("voice", "audio", "video_note"):
         if media := message.get(field):
             if int(media.get("duration", 0)) > MAX_AUDIO_SECONDS:
@@ -424,6 +462,25 @@ def _classify_message(
     if document := message.get("document"):
         return "document", None, str(document["file_id"])
     return "other", None, None
+
+
+def _addressable(channel_message_id: str) -> int:
+    """A `channel_message_id` as the message number Telegram will accept.
+
+    A press and a bare update are events, not messages: there is nothing to
+    reply to and nothing to react to. Both are prefixed for exactly this check,
+    so the category error fails here instead of addressing a stranger's message
+    that happens to carry the same number.
+    """
+    if channel_message_id.startswith((PRESS_PREFIX, UPDATE_PREFIX)):
+        raise ChannelError(
+            f"{channel_message_id!r} identifies an event, not a message: "
+            "a button press and an update have nothing to reply to"
+        )
+    try:
+        return int(channel_message_id)
+    except ValueError:
+        raise ChannelError(f"{channel_message_id!r} is not a telegram message id") from None
 
 
 def _photo_file_id(sent: Any) -> str | None:

@@ -198,6 +198,27 @@ def test_a_wrong_secret_is_refused(
         adapter.verify(headers, b'{"update_id": 1}')
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param("segrèdo", id="an accent"),
+        pytest.param("🔑" * 10, id="an emoji"),
+        pytest.param("s" * 42 + "ç", id="one byte off the real one"),
+    ],
+)
+def test_a_header_that_is_not_ascii_is_refused_and_not_a_crash(
+    adapter: TelegramAdapter, value: str
+) -> None:
+    """`hmac.compare_digest` raises `TypeError` on a non-ASCII `str`.
+
+    The header is whatever the public internet put there. Letting the comparison
+    raise turns a wrong secret into a 500, which is both the wrong answer and a
+    way to tell unauthenticated requests apart by their status code.
+    """
+    with pytest.raises(ChannelAuthenticationError):
+        adapter.verify({SECRET_HEADER: value}, b"{}")
+
+
 def test_the_refusal_does_not_quote_the_secret(adapter: TelegramAdapter) -> None:
     """The message says which header failed, never what either side held."""
     with pytest.raises(ChannelAuthenticationError) as raised:
@@ -359,8 +380,36 @@ def test_a_button_press_is_identified_by_the_press(adapter: TelegramAdapter) -> 
         },
     }
     [parsed] = adapter.parse(press)
-    assert parsed.channel_message_id == "3141592653"
+    assert parsed.channel_message_id == "press:3141592653"
     assert parsed.sent_at == FROZEN_NOW, "a callback query has no date of its own"
+
+
+async def test_a_press_cannot_be_addressed_as_if_it_were_a_message() -> None:
+    """The press id is not a message id, and Telegram numbers both.
+
+    Keying by the press is what keeps two answers to one clarification from
+    colliding on `(identity_id, channel_message_id)` (17.4). But the same field
+    is what `reply_to` carries, so an unprefixed press id would be sent as
+    `reply_parameters.message_id` and land on whatever message happens to hold
+    that number. The prefix makes the mistake impossible to make quietly.
+    """
+    adapter, recorder = build_adapter()
+    with pytest.raises(ChannelError, match="press"):
+        await adapter.send(
+            IDENTITY,
+            OutboundBlock(kind="text", text="ok", reply_to=("telegram", "press:3141592653")),
+        )
+    assert recorder.calls == []
+
+
+async def test_a_reaction_to_a_press_is_refused_for_the_same_reason() -> None:
+    adapter, recorder = build_adapter()
+    with pytest.raises(ChannelError, match="press"):
+        await adapter.send(
+            IDENTITY,
+            OutboundBlock(kind="reaction", emoji="👍", reply_to=("telegram", "press:271828")),
+        )
+    assert recorder.calls == []
 
 
 def test_a_reaction_update_is_recorded_and_not_processed(adapter: TelegramAdapter) -> None:
@@ -431,6 +480,46 @@ def test_a_block_is_recorded_so_the_identity_can_be_revoked(adapter: TelegramAda
     )
     assert parsed.kind == "other"
     assert parsed.raw["my_chat_member"]["new_chat_member"]["status"] == "kicked"
+
+
+@pytest.mark.parametrize(
+    "chat_type", ["group", "supergroup", "channel"], ids=["group", "supergroup", "channel"]
+)
+def test_a_message_from_a_group_is_not_ours_to_process(
+    adapter: TelegramAdapter, chat_type: str
+) -> None:
+    """The bot operates in private chat only (18.2), and this is why.
+
+    A group's `chat.id` is shared by everyone in it. Accepting the update would
+    file every member's messages under one tenant and send the answers — another
+    person's training history — back to the whole group.
+    """
+    assert (
+        adapter.parse(message(text="supino 80kg", chat={"id": -1001234567890, "type": chat_type}))
+        == []
+    )
+
+
+def test_a_group_button_press_is_refused_too(adapter: TelegramAdapter) -> None:
+    """Same reasoning: the press names the group chat it happened in."""
+    assert (
+        adapter.parse(
+            {
+                "update_id": 18,
+                "callback_query": {
+                    "id": "271828",
+                    "from": {"id": 987654321},
+                    "data": "opt:1",
+                    "message": {
+                        "message_id": 4242,
+                        "date": EPOCH,
+                        "chat": {"id": -1001234567890, "type": "supergroup"},
+                    },
+                },
+            }
+        )
+        == []
+    )
 
 
 @pytest.mark.parametrize(
@@ -656,6 +745,26 @@ async def test_media_goes_up_in_one_request_with_its_caption(tmp_path: Path) -> 
     assert receipt.channel_message_id == "81"
 
 
+async def test_a_caption_is_clipped_before_it_becomes_html(tmp_path: Path) -> None:
+    """Clipping the HTML can cut a tag in half, and Telegram rejects the request.
+
+    1020 plain characters followed by `**bold**` expand past 1024, and slicing
+    the serialised HTML lands inside `<b>...` with no `</b>`. Telegram counts
+    the caption after entities are parsed, so the limit belongs on the visible
+    text — which is also the only place it can be applied without breaking one.
+    """
+    chart = tmp_path / "progress.png"
+    chart.write_bytes(b"\x89PNG")
+    adapter, recorder = build_adapter(
+        Recorder({"sendPhoto": {"message_id": 83, "date": EPOCH, "photo": [{"file_id": "A"}]}})
+    )
+    await adapter.send(
+        IDENTITY, OutboundBlock(kind="media", text="c" * 1020 + "**negrito**", media_path=chart)
+    )
+    body = recorder.payload("sendPhoto")["multipart"]
+    assert b"<b>" not in body or b"</b>" in body, "a tag was cut in half"
+
+
 async def test_a_caption_longer_than_the_api_takes_is_clipped(tmp_path: Path) -> None:
     chart = tmp_path / "progress.png"
     chart.write_bytes(b"\x89PNG")
@@ -737,6 +846,38 @@ async def test_a_download_over_the_ceiling_is_refused(tmp_path: Path) -> None:
     with pytest.raises(TelegramTransportError, match="ceiling"):
         await adapter.download_media("AwACAgE")
     assert list(tmp_path.iterdir()) == [], "a refused download leaves nothing behind"
+
+
+async def test_a_write_that_fails_midway_leaves_no_recording_behind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A full disk is neither an HTTP error nor an API error, and the caller
+    never sees the path — so if this method does not clean up, nobody can. What
+    would be left is half of somebody's voice message, sitting in tmpfs.
+    """
+    real_open = Path.open
+    written: list[Path] = []
+
+    def failing_open(self: Path, *args: Any, **kwargs: Any) -> Any:
+        handle = real_open(self, *args, **kwargs)
+        written.append(self)
+        original = handle.write
+
+        def write(data: Any) -> int:
+            original(data)
+            raise OSError(28, "No space left on device")
+
+        handle.write = write
+        return handle
+
+    monkeypatch.setattr(Path, "open", failing_open)
+    adapter, _ = build_adapter(downloading(), download_dir=tmp_path)
+
+    with pytest.raises(OSError, match="No space left"):
+        await adapter.download_media("AwACAgE")
+
+    assert written, "the test did not exercise the write path"
+    assert list(tmp_path.iterdir()) == [], "a partial recording was left in tmpfs"
 
 
 async def test_a_file_id_that_telegram_does_not_know_fails_as_an_api_error(

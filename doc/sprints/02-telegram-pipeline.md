@@ -215,6 +215,13 @@ e bufferiza em <200 ms.
 6. Filtrar antes do buffer: `message_reaction` é ignorado (não gera processamento); `photo` e
    `document` recebem a resposta fixa de degradação (T06) e não entram no buffer. Somente
    `text`, `voice`, `audio`, `video_note` e `callback_query` entram no buffer.
+
+   > **Nota da S02-T02.** O adaptador entrega `kind="other"` para três coisas diferentes: o
+   > `message_reaction` (descartar em silêncio), o `my_chat_member` com status `kicked`/`blocked`
+   > (revogar a identidade, §18.2) e o **áudio acima do teto de 5 min da §11.3** (pedir para
+   > dividir). Só a primeira pode virar silêncio. O `kind` da §18.1 é um `Literal` fechado e não
+   > distingue as três, então o filtro precisa olhar o `raw` para separá-las — ou a §18.1 ganha um
+   > campo, o que é um ADR. Áudio longo que não recebe resposta viola a §18.4 ("nunca silêncio").
 7. `RPUSH buffer:{tenant_id}` com envelope JSON `{channel, external_id_hash, channel_message_id,
    kind, text, media_ref, button_payload, sent_at, raw_message_id}`.
 8. `SET debounce:{tenant_id} 1 EX 10` e enfileira `flush_check(tenant_id)` com delay de 10s no

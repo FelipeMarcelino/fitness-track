@@ -187,6 +187,7 @@ class TelegramClient:
         url = f"{API_ROOT}/file/bot{self._token.get_secret_value()}/{file_path}"
 
         written = 0
+        complete = False
         try:
             async with self._http.stream("GET", url) as response:
                 if response.status_code >= httpx.codes.BAD_REQUEST:
@@ -204,14 +205,17 @@ class TelegramClient:
                                 f"the download is over the {MAX_DOWNLOAD_BYTES} byte ceiling"
                             )
                         sink.write(chunk)
+            complete = True
         except httpx.HTTPError as error:
-            destination.unlink(missing_ok=True)
             raise TelegramTransportError(f"download failed: {type(error).__name__}") from None
-        except TelegramError:
-            # A refused or oversized download leaves no half-file behind: the
-            # next stage would read it as a truncated recording.
-            destination.unlink(missing_ok=True)
-            raise
+        finally:
+            # Every unsuccessful exit, not just the two we can name. A full disk
+            # raises `OSError`, which is neither an HTTP error nor an API error,
+            # and the caller never receives the path — so if this method does
+            # not clean up, nobody can, and half of somebody's voice message
+            # stays in tmpfs.
+            if not complete:
+                destination.unlink(missing_ok=True)
         return destination
 
     async def aclose(self) -> None:

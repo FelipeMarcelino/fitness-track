@@ -38,10 +38,21 @@ def verify_secret_header(headers: Mapping[str, str], expected: str | None) -> No
         raise ChannelAuthenticationError(
             f"{SECRET_HEADER} cannot be verified: this process has no webhook secret"
         )
-    if not hmac.compare_digest(_header(headers, SECRET_HEADER), expected):
+    if not hmac.compare_digest(_encode(_header(headers, SECRET_HEADER)), _encode(expected)):
         # The message names the header and nothing else. Quoting either side of
         # a failed comparison publishes the secret to whoever reads the log.
         raise ChannelAuthenticationError(f"{SECRET_HEADER} does not match")
+
+
+def _encode(value: str) -> bytes:
+    """The value as bytes, whatever it holds.
+
+    `hmac.compare_digest` raises `TypeError` on a `str` that is not ASCII, and
+    the header is whatever the public internet put there. Comparing bytes keeps
+    the comparison constant time and turns "not even ASCII" into the refusal it
+    is, rather than a 500 that answers a different question than a 403 does.
+    """
+    return value.encode("utf-8", "surrogateescape")
 
 
 def _header(headers: Mapping[str, str], name: str) -> str:
