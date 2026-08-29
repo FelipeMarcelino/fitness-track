@@ -36,8 +36,11 @@ MAX_KEY_VERSION = 32767
 KEY_BYTES = 32
 
 # Telegram accepts 1..256 characters of this alphabet in the secret token and
-# rejects the request outright otherwise (spec 18.2).
-WEBHOOK_SECRET_ALPHABET = re.compile(r"^[A-Za-z0-9_-]{1,256}$")
+# rejects the request outright otherwise (spec 18.2). Anchored with `\A` and
+# `\Z` rather than `^` and `$`, because `$` also matches before a final
+# newline — and a secret that kept a stray newline is exactly the one that
+# looks right in a `.env`, passes here, and is refused at `setWebhook`.
+WEBHOOK_SECRET_ALPHABET = re.compile(r"\A[A-Za-z0-9_-]{1,256}\Z")
 # The floor is ours, not Telegram's. Their limit would accept one character;
 # the spec asks for 32 random bytes, because this value authenticates every
 # update the webhook receives (spec 18.2).

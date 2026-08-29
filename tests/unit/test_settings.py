@@ -257,6 +257,23 @@ def test_telegram_in_polling_mode_needs_only_the_token() -> None:
     assert settings.channels == ("telegram",)
 
 
+def test_a_webhook_secret_with_a_trailing_newline_is_not_in_the_alphabet() -> None:
+    """`$` matches before a final newline; `\\Z` is the anchor this needed.
+
+    A secret that keeps a stray newline — the ordinary way to get one is a
+    heredoc or an editor that adds it — is outside the alphabet Telegram
+    accepts, so the deployment boots and `setWebhook` refuses it later.
+    """
+    with pytest.raises(ValidationError, match="alphabet"):
+        build(
+            FITTRACK_CHANNELS="telegram",
+            TELEGRAM_BOT_TOKEN="t",
+            TELEGRAM_MODE="webhook",
+            TELEGRAM_WEBHOOK_URL="https://example.com/hook",
+            TELEGRAM_WEBHOOK_SECRET="a" * 43 + "\n",
+        )
+
+
 def test_the_webhook_secret_must_match_the_alphabet_telegram_accepts() -> None:
     with pytest.raises(ValidationError, match="alphabet"):
         build(
