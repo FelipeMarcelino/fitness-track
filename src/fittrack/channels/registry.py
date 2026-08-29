@@ -10,8 +10,10 @@ Two rules, both from Apêndice A:
 1. **Only what is listed is built.** A deployment that has WhatsApp credentials
    but does not list the channel has no WhatsApp adapter — the environment says
    what runs, not the presence of a secret.
-2. **A listed channel without usable credentials fails here.** Absent or blank:
-   an environment variable that is set and empty is a credential in name only.
+2. **A listed channel without usable credentials fails here.** Absent, blank, or
+   — for the webhook secret, which authenticates every update — the wrong shape.
+   An environment variable that is set and empty is a credential in name only,
+   and a three-character shared secret is one in name only too.
    `Settings` already refuses to boot in that state; this check exists because
    the registry is also fed by scripts and tests that build a configuration
    directly, and because a half-built adapter fails on the first webhook instead
@@ -33,7 +35,13 @@ from collections.abc import Callable, Iterator, Mapping
 from typing import TYPE_CHECKING, Protocol
 
 from fittrack.channels.base import Channel
-from fittrack.settings import KNOWN_CHANNELS, ChannelKind, TelegramMode
+from fittrack.settings import (
+    KNOWN_CHANNELS,
+    MIN_WEBHOOK_SECRET_CHARS,
+    WEBHOOK_SECRET_ALPHABET,
+    ChannelKind,
+    TelegramMode,
+)
 
 if TYPE_CHECKING:
     from pydantic import SecretStr
@@ -120,14 +128,38 @@ def _absent(secret: SecretStr | None) -> bool:
     return secret is None or not secret.get_secret_value().strip()
 
 
+def _unusable_webhook_secret(secret: SecretStr) -> str | None:
+    """Why the webhook secret cannot authenticate an update, if it cannot.
+
+    The rules and the constants are `Settings`', imported rather than restated:
+    two spellings of "43 characters, url-safe alphabet" would drift, and this
+    one would be the copy nobody remembers to update. The reason never quotes
+    the value — a rejection that publishes the secret to every log that catches
+    it is a worse outcome than the secret it rejected.
+    """
+    value = secret.get_secret_value()
+    if not WEBHOOK_SECRET_ALPHABET.match(value):
+        return "must be 1-256 characters of A-Z a-z 0-9 _ - , which is what Telegram accepts"
+    if len(value) < MIN_WEBHOOK_SECRET_CHARS:
+        return f"must be at least {MIN_WEBHOOK_SECRET_CHARS} characters, being 32 random bytes"
+    return None
+
+
 def _missing_telegram_credentials(config: ChannelConfig) -> list[str]:
     missing = []
     if _absent(config.telegram_bot_token):
         missing.append("TELEGRAM_BOT_TOKEN")
     # Only the webhook needs a secret: it is what authenticates every update
     # (spec 18.2). Polling authenticates itself by holding the bot token.
-    if config.telegram_mode == "webhook" and _absent(config.telegram_webhook_secret):
-        missing.append("TELEGRAM_WEBHOOK_SECRET")
+    if config.telegram_mode == "webhook":
+        secret = config.telegram_webhook_secret
+        if _absent(secret):
+            missing.append("TELEGRAM_WEBHOOK_SECRET")
+        elif secret is not None and (why := _unusable_webhook_secret(secret)):
+            # Present but unusable is the same failure as absent, one step
+            # later: `setWebhook` refuses the first, and the second is a shared
+            # secret short enough to guess. Both are startup problems.
+            missing.append(f"TELEGRAM_WEBHOOK_SECRET that {why}")
     return missing
 
 

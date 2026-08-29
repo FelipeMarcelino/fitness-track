@@ -310,6 +310,36 @@ def test_an_outbound_block_needs_only_its_kind() -> None:
     assert block.template is None
 
 
+def test_an_outbound_block_never_reprs_what_it_will_say() -> None:
+    """The outbound half of the same rule, for the same reason.
+
+    A block carries the coaching text and the clarification options, which hold
+    private exercise names and, in a recommendation, the numbers behind them.
+    It is `llm.response` on the redaction list (20.2) — sanitising the inbound
+    repr and leaving this one open just moves the leak downstream.
+    """
+    block = OutboundBlock(
+        kind="buttons",
+        text="Foi supino reto ou inclinado?",
+        buttons=("supino reto", "supino inclinado"),
+        reply_to=("telegram", "42"),
+    )
+    printed = repr(block)
+    assert "supino" not in printed
+    assert "kind='buttons'" in printed, "the safe fields still say what it is"
+    assert "reply_to=('telegram', '42')" in printed
+
+
+def test_a_template_never_reprs_its_parameters() -> None:
+    """A template's parameters are the user's name and their numbers (14.5)."""
+    printed = repr(
+        TemplateRef(name="retomada_treino", language="pt_BR", parameters=("Felipe", "8"))
+    )
+    assert "Felipe" not in printed
+    assert "retomada_treino" in printed, "which template is operational, not personal"
+    assert "pt_BR" in printed
+
+
 def test_reply_to_is_a_channel_and_a_message_id() -> None:
     block = OutboundBlock(kind="reaction", emoji="👍", reply_to=("telegram", "42"))
     assert block.reply_to == ("telegram", "42")
@@ -644,6 +674,42 @@ def test_a_registry_built_by_hand_is_held_to_the_same_rule() -> None:
     """`from_config` is not the only door; the check belongs on the constructor."""
     with pytest.raises(ChannelRegistryError, match="whatsapp"):
         ChannelRegistry({"whatsapp": FakeChannel()})
+
+
+@pytest.mark.parametrize(
+    ("secret", "why"),
+    [
+        pytest.param("s" * 42, "too short by one", id="short"),
+        pytest.param("short-secret", "a secret short enough to guess", id="short enough to guess"),
+        pytest.param("!" * 43, "outside the alphabet Telegram accepts", id="wrong alphabet"),
+        pytest.param("s" * 42 + " ", "a space is not in the alphabet either", id="padded"),
+    ],
+)
+def test_the_registry_holds_a_webhook_secret_to_its_shape(secret: str, why: str) -> None:
+    """Present is not the same as usable, and this one authenticates every update.
+
+    `Settings` already applies the alphabet and the length (18.2), so a real
+    deployment cannot get here. A configuration built directly could, and the
+    two outcomes are a secret Telegram refuses at `setWebhook` or a shared
+    secret short enough to guess — both discovered in production.
+    """
+    factories = RecordingFactories()
+    with pytest.raises(MissingCredentialError, match="TELEGRAM_WEBHOOK_SECRET") as raised:
+        ChannelRegistry.from_config(
+            telegram_config(telegram_webhook_secret=StubSecret(secret)),
+            factories=factories.table("telegram"),
+        )
+    assert secret not in str(raised.value), f"the rejected secret was quoted back ({why})"
+    assert factories.built == {}
+
+
+def test_a_polling_deployment_is_never_asked_about_the_shape() -> None:
+    """There is no webhook to authenticate, so there is no secret to hold up."""
+    registry = ChannelRegistry.from_config(
+        telegram_config(telegram_mode="polling", telegram_webhook_secret=StubSecret("nope")),
+        factories=RecordingFactories().table("telegram"),
+    )
+    assert registry.enabled == ("telegram",)
 
 
 def test_the_shipped_table_covers_every_known_channel() -> None:

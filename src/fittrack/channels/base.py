@@ -22,6 +22,8 @@ Two rules are enforced in code rather than trusted:
   are held to the same rule, because `channel.payload` and `user.text` are on
   the same redaction list (spec 20.2) and the raw update carries the
   `external_id` inside it.
+  The same rule runs outbound: an `OutboundBlock` keeps its text and its
+  buttons out of a repr, and a `TemplateRef` its parameters.
 - **The inbound payload is a snapshot.** `raw` is deep-copied on the way in. The
   `Mapping` annotation is a promise to the reader and nothing to the runtime,
   and an adapter ordinarily keeps the dict it parsed: without the copy, an edit
@@ -226,7 +228,10 @@ class TemplateRef:
 
     name: str
     language: str  # e.g. "pt_BR"
-    parameters: tuple[str, ...] = ()
+    # Which template is operational; what goes in it is the user's name and
+    # their numbers (spec 14.5), so the parameters follow the same rule as the
+    # rest of the content on this boundary.
+    parameters: tuple[str, ...] = field(default=(), repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,9 +243,14 @@ class OutboundBlock:
     """
 
     kind: Literal["text", "reaction", "buttons", "media", "template"]
-    text: str | None = None
+    # The outbound half of the repr rule. What the coach says is `llm.response`
+    # on the redaction list (spec 20.2), and the clarification options carry
+    # private exercise names — sanitising the inbound repr and leaving this one
+    # open moves the leak downstream rather than closing it. The emoji and the
+    # kind stay: they say what happened without saying what was said.
+    text: str | None = field(default=None, repr=False)
     emoji: str | None = None
-    buttons: tuple[str, ...] | None = None
+    buttons: tuple[str, ...] | None = field(default=None, repr=False)
     media_path: Path | None = None
     reply_to: tuple[ChannelKind, str] | None = None  # (channel, channel_message_id)
     template: TemplateRef | None = None  # windowed channels only
