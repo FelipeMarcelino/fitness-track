@@ -197,11 +197,28 @@ CREDENTIALS: Mapping[ChannelKind, Callable[[ChannelConfig], list[str]]] = {
 
 
 def _build_telegram(config: ChannelConfig) -> Channel:
-    # S02-T02 replaces the body with the lazy import of `TelegramAdapter`. The
-    # entry exists now so that enabling the channel fails by name at boot,
-    # rather than as a KeyError from the middle of the registry.
-    raise ChannelUnavailableError(
-        "the telegram adapter is not implemented yet (sprint 02, task S02-T02)"
+    # Imported here, not at module level: this is what lets the registry name
+    # every channel while loading only the one in use, and it keeps `httpx` out
+    # of the import graph of anything that merely wants the `Channel` type.
+    import httpx
+
+    from fittrack.channels.telegram.adapter import TelegramAdapter
+    from fittrack.channels.telegram.client import DEFAULT_TIMEOUT_SECONDS, TelegramClient
+
+    token = config.telegram_bot_token
+    if token is None:  # pragma: no cover - the credential check ran first
+        raise MissingCredentialError("telegram needs TELEGRAM_BOT_TOKEN")
+
+    # The pool is built here and owned by the process, not opened per send. The
+    # adapter never constructs a connection of its own.
+    http = httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_SECONDS)
+    return TelegramAdapter(
+        TelegramClient(token, http=http),
+        # Polling has no webhook to authenticate, and an adapter holding a
+        # secret it must not use is worse than one that refuses (spec 18.2).
+        webhook_secret=(
+            config.telegram_webhook_secret if config.telegram_mode == "webhook" else None
+        ),
     )
 
 
