@@ -683,6 +683,11 @@ def test_a_registry_built_by_hand_is_held_to_the_same_rule() -> None:
         pytest.param("short-secret", "a secret short enough to guess", id="short enough to guess"),
         pytest.param("!" * 43, "outside the alphabet Telegram accepts", id="wrong alphabet"),
         pytest.param("s" * 42 + " ", "a space is not in the alphabet either", id="padded"),
+        pytest.param(
+            "s" * 43 + "\n",
+            "`$` matches before a final newline, and `\\Z` does not",
+            id="trailing newline",
+        ),
     ],
 )
 def test_the_registry_holds_a_webhook_secret_to_its_shape(secret: str, why: str) -> None:
