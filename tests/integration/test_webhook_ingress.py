@@ -51,8 +51,9 @@ class FakeDeduplicator:
             update_id, self.state, "token" if self.state is DedupState.ACQUIRED else None
         )
 
-    async def complete(self, reservation: DedupReservation) -> None:
+    async def complete(self, reservation: DedupReservation) -> bool:
         self.completed.append(reservation)
+        return True
 
     async def release(self, reservation: DedupReservation) -> None:
         self.released.append(reservation)

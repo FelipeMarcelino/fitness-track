@@ -58,7 +58,7 @@ class UpdateDeduplicator(Protocol):
     async def reserve(self, update_id: int) -> DedupReservation:
         """Classify this delivery as acquired, complete, or still processing."""
 
-    async def complete(self, reservation: DedupReservation) -> None:
+    async def complete(self, reservation: DedupReservation) -> bool:
         """Atomically mark an acquired reservation completed for 24 hours."""
 
     async def release(self, reservation: DedupReservation) -> None:
@@ -201,7 +201,8 @@ class TelegramWebhookIngress:
                         raw_message_id=raw_message_id,
                     ),
                 )
-            await self._deduplicator.complete(reservation)
+            if not await self._deduplicator.complete(reservation):
+                raise UpdateInFlightError("lost the Telegram update reservation")
         except Exception:
             await self._deduplicator.release(reservation)
             raise
@@ -291,20 +292,21 @@ class RedisUpdateDeduplicator:
         if reserved:
             return DedupReservation(update_id, DedupState.ACQUIRED, token)
         existing = await self._redis.get(key)
-        if existing == "completed":
+        if existing in {"completed", b"completed"}:
             return DedupReservation(update_id, DedupState.COMPLETED)
         return DedupReservation(update_id, DedupState.IN_FLIGHT)
 
-    async def complete(self, reservation: DedupReservation) -> None:
+    async def complete(self, reservation: DedupReservation) -> bool:
         if reservation.state is not DedupState.ACQUIRED or reservation.token is None:
-            return
-        await self._redis.eval(
+            return False
+        changed = await self._redis.eval(
             _COMPLETE_RESERVATION,
             1,
             _seen_key(reservation.update_id),
             reservation.token,
             self._ttl_s,
         )
+        return bool(changed)
 
     async def release(self, reservation: DedupReservation) -> None:
         if reservation.state is not DedupState.ACQUIRED or reservation.token is None:
@@ -339,12 +341,19 @@ class RedisTenantBuffer:
     async def append(self, *, tenant_id: int, envelope: dict[str, object]) -> None:
         if tenant_id <= 0:
             raise ValueError("tenant_id must be positive")
-        await self._redis.rpush(
+        raw_message_id = envelope.get("raw_message_id")
+        if not isinstance(raw_message_id, int) or isinstance(raw_message_id, bool):
+            raise ValueError("buffer envelope requires an integer raw_message_id")
+        await self._redis.eval(
+            _APPEND_ENVELOPE,
+            3,
             f"buffer:{tenant_id}",
+            f"debounce:{tenant_id}",
+            f"buffered:{tenant_id}:{raw_message_id}",
             json.dumps(envelope, separators=(",", ":"), sort_keys=True),
+            BUFFER_TTL_S,
+            self._debounce_window_s,
         )
-        await self._redis.expire(f"buffer:{tenant_id}", BUFFER_TTL_S)
-        await self._redis.set(f"debounce:{tenant_id}", "1", ex=self._debounce_window_s)
         await self._scheduler.schedule_flush_check(
             tenant_id=tenant_id,
             delay_s=self._debounce_window_s,
@@ -472,6 +481,14 @@ if redis.call('GET', KEYS[1]) == ARGV[1] then
   return redis.call('DEL', KEYS[1])
 end
 return 0
+"""
+_APPEND_ENVELOPE = """
+if redis.call('SET', KEYS[3], '1', 'NX', 'EX', ARGV[2]) then
+  redis.call('RPUSH', KEYS[1], ARGV[1])
+  redis.call('EXPIRE', KEYS[1], ARGV[2])
+end
+redis.call('SET', KEYS[2], '1', 'EX', ARGV[3])
+return 1
 """
 
 
