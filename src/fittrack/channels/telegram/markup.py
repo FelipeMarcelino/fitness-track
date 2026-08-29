@@ -12,6 +12,7 @@ and the tags this module just wrote would be escaped too; escape never and any
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import TYPE_CHECKING
 
@@ -25,6 +26,8 @@ __all__ = [
     "inline_keyboard",
     "to_telegram_html",
 ]
+
+logger = logging.getLogger(__name__)
 
 # Telegram's ceiling on `callback_data` (spec 18.2). An index is a handful of
 # bytes, so this is a guard against a future edit, not a live constraint.
@@ -40,12 +43,42 @@ _TRANSLATIONS: tuple[tuple[re.Pattern[str], str], ...] = (
 )
 
 
+# Only the four this module writes; nothing else survives the escaping above.
+_TAG = re.compile(r"</?(b|i|s|code)>")
+
+
+def _well_nested(html: str) -> bool:
+    """Whether the tags this module produced open and close in order."""
+    stack: list[str] = []
+    for match in _TAG.finditer(html):
+        tag = match.group(1)
+        if match.group(0).startswith("</"):
+            if not stack or stack.pop() != tag:
+                return False
+        else:
+            stack.append(tag)
+    return not stack
+
+
 def to_telegram_html(text: str) -> str:
-    """The neutral dialect as Telegram HTML, everything else escaped."""
+    """The neutral dialect as Telegram HTML, everything else escaped.
+
+    Crossed delimiters — `**bold __italic** tail__` — would translate into
+    crossed tags, and Telegram answers those with a non-retryable parse error:
+    the user loses the whole response over an emphasis. 13.4 put the translation
+    here precisely so that malformed markup is not a 400, which only holds if
+    this function refuses to emit HTML it can see is invalid. The delimiters
+    stay as written, so the message arrives and the agent's bug is visible in
+    the log rather than in a dead letter.
+    """
     escaped = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    rendered = escaped
     for pattern, replacement in _TRANSLATIONS:
-        escaped = pattern.sub(replacement, escaped)
-    return escaped
+        rendered = pattern.sub(replacement, rendered)
+    if not _well_nested(rendered):
+        logger.warning("neutral markup crossed its delimiters; sending it as text")
+        return escaped
+    return rendered
 
 
 def callback_data(index: int) -> str:

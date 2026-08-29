@@ -421,7 +421,7 @@ def test_a_reaction_update_is_recorded_and_not_processed(adapter: TelegramAdapte
         {
             "update_id": 12,
             "message_reaction": {
-                "chat": {"id": 987654321},
+                "chat": {"id": 987654321, "type": "private"},
                 "message_id": 4242,
                 "user": {"id": 987654321},
                 "date": EPOCH,
@@ -447,7 +447,7 @@ def test_two_reactions_to_one_message_are_two_recordable_events(
         return {
             "update_id": update_id,
             "message_reaction": {
-                "chat": {"id": 987654321},
+                "chat": {"id": 987654321, "type": "private"},
                 "message_id": 4242,
                 "user": {"id": 987654321},
                 "date": EPOCH,
@@ -496,6 +496,33 @@ def test_a_message_from_a_group_is_not_ours_to_process(
     """
     assert (
         adapter.parse(message(text="supino 80kg", chat={"id": -1001234567890, "type": chat_type}))
+        == []
+    )
+
+
+@pytest.mark.parametrize("event", ["message_reaction", "my_chat_member"])
+def test_a_group_event_is_refused_like_a_group_message(
+    adapter: TelegramAdapter, event: str
+) -> None:
+    """The same rule, on the branch the first fix did not reach.
+
+    `my_chat_member` is exactly what arrives when the bot is added to a group,
+    and the ingress resolves identity before it filters these — so an unguarded
+    event would create or mutate an identity keyed by the group's shared
+    `chat.id`, which is the very thing the private-chat rule exists to prevent.
+    """
+    assert (
+        adapter.parse(
+            {
+                "update_id": 19,
+                event: {
+                    "chat": {"id": -1001234567890, "type": "supergroup"},
+                    "from": {"id": 987654321},
+                    "date": EPOCH,
+                    "new_chat_member": {"status": "member"},
+                },
+            }
+        )
         == []
     )
 
@@ -596,6 +623,38 @@ def test_the_ampersand_of_an_entity_is_escaped_once() -> None:
     assert to_telegram_html("&lt;") == "&amp;lt;"
 
 
+@pytest.mark.parametrize(
+    "neutral",
+    [
+        pytest.param("**bold __italic** tail__", id="crossed bold and italic"),
+        pytest.param("__a **b__ c**", id="crossed the other way"),
+        pytest.param("**a `b** c`", id="crossed with mono"),
+    ],
+)
+def test_crossed_markup_degrades_to_text_instead_of_invalid_html(neutral: str) -> None:
+    """Crossed delimiters would produce crossed tags, which Telegram refuses.
+
+    `<b>bold <i>italic</b> tail</i>` is a non-retryable parse error, and the
+    user loses the entire response over an emphasis. 13.4 put the translation
+    here precisely so malformed markup is not a 400; that only holds if this
+    function refuses to emit HTML it knows is invalid.
+    """
+    rendered = to_telegram_html(neutral)
+    assert "<b>" not in rendered
+    assert "<i>" not in rendered
+    assert "<code>" not in rendered
+
+
+def test_well_nested_markup_still_becomes_html() -> None:
+    """The fallback is for crossings, not for nesting, which is valid."""
+    assert to_telegram_html("**a __b__ c**") == "<b>a <i>b</i> c</b>"
+
+
+def test_a_lone_delimiter_is_just_text() -> None:
+    """`2 ** 3` is arithmetic, and nothing here should turn it into a tag."""
+    assert to_telegram_html("2 ** 3") == "2 ** 3"
+
+
 def test_callback_data_carries_an_index_and_nothing_else() -> None:
     """A `callback_data` with an `exercise_id` is a client-controlled parameter
     walking into the domain (18.2). It carries the option's position instead.
@@ -670,7 +729,24 @@ async def test_a_reaction_uses_set_message_reaction() -> None:
     assert body["chat_id"] == "987654321"
     assert body["message_id"] == 4242
     assert body["reaction"] == [{"type": "emoji", "emoji": "👍"}]
-    assert receipt.channel_message_id == "4242", "the receipt points at the message reacted to"
+    assert receipt.channel_message_id == "reaction:4242"
+
+
+async def test_a_reaction_receipt_cannot_be_edited_as_if_it_were_ours() -> None:
+    """A reaction creates no message of ours, so there is nothing to rewrite.
+
+    `caps.edit_message` invites a correction to edit the confirmation (13.2),
+    and an unmarked receipt would send `editMessageText` at the *user's* message
+    — which the bot does not own and Telegram refuses with a non-retryable 400.
+    """
+    adapter, recorder = build_adapter(Recorder({"setMessageReaction": True}))
+    receipt = await adapter.send(
+        IDENTITY, OutboundBlock(kind="reaction", emoji="👍", reply_to=("telegram", "4242"))
+    )
+    recorder.calls.clear()
+    with pytest.raises(ChannelError, match="reaction"):
+        await adapter.edit(IDENTITY, receipt.channel_message_id, "corrigindo")
+    assert recorder.calls == []
 
 
 def test_the_reaction_set_is_the_one_telegram_publishes() -> None:
@@ -854,6 +930,26 @@ async def test_a_transient_body_is_classified_as_worth_retrying() -> None:
         assert adapter.classify_error(error).error_class is ErrorClass.RETRY_BACKOFF
     else:  # pragma: no cover
         pytest.fail("the send should not have succeeded")
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        pytest.param(lambda a: a.send_typing(WHATSAPP_IDENTITY), id="typing"),
+        pytest.param(lambda a: a.edit(WHATSAPP_IDENTITY, "4242", "oi"), id="edit"),
+    ],
+)
+async def test_every_way_out_checks_the_channel_first(call: Any) -> None:
+    """`send` is not the only door, and the guard belongs on all of them.
+
+    A WhatsApp identity's external id is a number too. Sent as a `chat_id` it is
+    either a provider error or, if it happens to name a real chat, an edit in
+    somebody else's conversation.
+    """
+    adapter, recorder = build_adapter()
+    with pytest.raises(ChannelMismatchError):
+        await call(adapter)
+    assert recorder.calls == []
 
 
 async def test_typing_is_an_action_and_not_a_bubble() -> None:

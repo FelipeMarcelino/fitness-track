@@ -37,6 +37,7 @@ from fittrack.channels.base import (
     InboundMessage,
     SendReceipt,
     ensure_addressable,
+    ensure_identity,
 )
 from fittrack.channels.telegram.client import (
     TelegramApiError,
@@ -111,6 +112,9 @@ _NOTHING_TO_REACT_TO = "message to react not found"
 # Neither can be addressed, and both are numbers in Telegram's own vocabulary.
 PRESS_PREFIX = "press:"
 UPDATE_PREFIX = "update:"
+# And a reaction, which is a mark on somebody else's message rather than a
+# message of ours: there is nothing there for `editMessageText` to rewrite.
+REACTION_PREFIX = "reaction:"
 
 
 class TelegramAdapter:
@@ -160,6 +164,12 @@ class TelegramAdapter:
         # job and it needs the event to do it.
         for name in ("message_reaction", "my_chat_member"):
             if event := payload.get(name):
+                # The same private-chat rule. `my_chat_member` is exactly what
+                # arrives when the bot is added to a group, and the ingress
+                # resolves identity before it filters these — so an unguarded
+                # event would mint an identity for the group's shared `chat.id`.
+                if not _is_private(event.get("chat")):
+                    return []
                 return [self._from_event(payload, event)]
         return []
 
@@ -214,6 +224,7 @@ class TelegramAdapter:
 
     async def send_typing(self, identity: ChannelIdentity) -> None:
         """ "typing…", which expires after about five seconds and is repeated."""
+        ensure_identity(self.kind, identity)
         await self._client.call(
             "sendChatAction", {"chat_id": identity.external_id, "action": "typing"}
         )
@@ -225,11 +236,13 @@ class TelegramAdapter:
         adding a bubble. An edit that changes nothing answers `message is not
         modified`, which the client reports as the success it is.
         """
+        ensure_identity(self.kind, identity)
+        addressable = _addressable(message_id)
         await self._client.call(
             "editMessageText",
             {
                 "chat_id": identity.external_id,
-                "message_id": int(message_id),
+                "message_id": addressable,
                 "text": to_telegram_html(text),
                 "parse_mode": "HTML",
                 "link_preview_options": {"is_disabled": True},
@@ -383,9 +396,15 @@ class TelegramAdapter:
             logger.info("telegram reaction target is gone", extra={"channel": "telegram"})
             return await self._send_degraded(identity, emoji, block)
 
-        # `setMessageReaction` answers `true`, not a message. The receipt points
-        # at what was reacted to, which is what a later edit or retry needs.
-        return SendReceipt(channel=self.kind, channel_message_id=message_id, sent_at=self._now())
+        # `setMessageReaction` answers `true`, not a message. The receipt names
+        # what was reacted to, marked as a reaction: `caps.edit_message` invites
+        # a correction to rewrite the confirmation (13.2), and this one is the
+        # *user's* message — which the bot does not own and Telegram refuses.
+        return SendReceipt(
+            channel=self.kind,
+            channel_message_id=f"{REACTION_PREFIX}{message_id}",
+            sent_at=self._now(),
+        )
 
     async def _send_degraded(
         self, identity: ChannelIdentity, emoji: str, block: OutboundBlock
@@ -488,10 +507,10 @@ def _addressable(channel_message_id: str) -> int:
     so the category error fails here instead of addressing a stranger's message
     that happens to carry the same number.
     """
-    if channel_message_id.startswith((PRESS_PREFIX, UPDATE_PREFIX)):
+    if channel_message_id.startswith((PRESS_PREFIX, UPDATE_PREFIX, REACTION_PREFIX)):
         raise ChannelError(
-            f"{channel_message_id!r} identifies an event, not a message: "
-            "a button press and an update have nothing to reply to"
+            f"{channel_message_id!r} does not identify a message of ours: "
+            "a press, an update and a reaction have nothing to reply to or rewrite"
         )
     try:
         return int(channel_message_id)
