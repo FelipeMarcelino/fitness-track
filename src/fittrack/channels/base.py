@@ -118,6 +118,14 @@ class ClassifiedError:
                 f"retry_after is set if and only if the class is {ErrorClass.RETRY_AFTER}; "
                 f"got {self.error_class} with retry_after={self.retry_after}"
             )
+        # `next_retry_at = now + retry_after` is what the outbound service
+        # computes from this. A negative number is a time already past, and the
+        # worker would repeat the request the channel had just rate-limited,
+        # immediately and every time — a sign slip becomes a retry loop.
+        if self.retry_after is not None and self.retry_after < 0:
+            raise ValueError(
+                f"retry_after is a wait, not a deadline in the past: {self.retry_after}"
+            )
 
 
 @dataclass(frozen=True, slots=True)

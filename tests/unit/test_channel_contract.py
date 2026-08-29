@@ -47,6 +47,7 @@ from fittrack.channels.registry import (
     ChannelFactory,
     ChannelNotEnabledError,
     ChannelRegistry,
+    ChannelRegistryError,
     ChannelUnavailableError,
     MissingCredentialError,
 )
@@ -106,6 +107,42 @@ class FakeChannel:
 
     def classify_error(self, exc: Exception) -> ClassifiedError:
         return ClassifiedError(ErrorClass.BUG)
+
+
+WHATSAPP_CAPS = ChannelCaps(
+    reactions=True,
+    reaction_set="arbitrary",
+    buttons=True,
+    max_buttons=3,
+    text_limit=4096,
+    caption_limit=1024,
+    typing_indicator=False,
+    edit_message=False,
+    delete_message=False,
+    proactive="windowed",
+    window_hours=24,
+    media_upload="two_step",
+    markup="whatsapp_basic",
+    max_bubbles=3,
+)
+
+
+class FakeWhatsApp(FakeChannel):
+    """The same recorder, answering to the other channel.
+
+    Two of them exist because the registry now refuses an adapter filed under a
+    kind it does not answer to, and a suite with one fake could not tell the
+    rule from a typo.
+    """
+
+    kind: ClassVar[ChannelKind] = "whatsapp"
+    caps: ClassVar[ChannelCaps] = WHATSAPP_CAPS
+
+
+FAKES: dict[ChannelKind, type[FakeChannel]] = {
+    "telegram": FakeChannel,
+    "whatsapp": FakeWhatsApp,
+}
 
 
 TELEGRAM_IDENTITY = ChannelIdentity(
@@ -364,6 +401,24 @@ def test_only_retry_after_carries_a_delay() -> None:
         ClassifiedError(ErrorClass.RETRY_BACKOFF, retry_after=17)
 
 
+@pytest.mark.parametrize("seconds", [-1, -30], ids=["one second ago", "half a minute ago"])
+def test_a_retry_delay_never_points_at_the_past(seconds: int) -> None:
+    """A negative delay is a retry loop, not a wait.
+
+    The outbound service turns this into `next_retry_at = now + retry_after`
+    (sprint S02-T06). A sign slip while parsing a malformed 429 would produce a
+    time already past, and the worker would repeat the request the channel had
+    just rate-limited, immediately and every time.
+    """
+    with pytest.raises(ValueError, match="retry_after"):
+        ClassifiedError(ErrorClass.RETRY_AFTER, retry_after=seconds)
+
+
+def test_a_retry_delay_of_zero_is_a_delay() -> None:
+    """Nonsensical from a 429, but it says "now" — and now is not the past."""
+    assert ClassifiedError(ErrorClass.RETRY_AFTER, retry_after=0).retry_after == 0
+
+
 def test_retry_after_without_the_number_is_not_retry_after() -> None:
     """The class means "the channel said when" — the number is the whole point.
 
@@ -446,7 +501,7 @@ class RecordingFactories:
 
     def _factory(self, kind: ChannelKind) -> ChannelFactory:
         def factory(config: ChannelConfig) -> Channel:
-            adapter = FakeChannel()
+            adapter = FAKES[kind]()
             self.built[kind] = adapter
             return adapter
 
@@ -572,6 +627,25 @@ def test_polling_needs_no_webhook_secret() -> None:
     assert registry.enabled == ("telegram",)
 
 
+def test_the_registry_refuses_an_adapter_of_another_kind() -> None:
+    """A factory under the wrong key is a WhatsApp channel that speaks Telegram.
+
+    The type system cannot see it: `kind` is the union of both names, so a
+    Telegram adapter returned by the whatsapp factory type-checks, gets handed
+    out by `get("whatsapp")`, and fails at `ensure_addressable` on every send —
+    at which point the failure is per message rather than per deployment.
+    """
+    wrong: dict[ChannelKind, ChannelFactory] = {"whatsapp": lambda config: FakeChannel()}
+    with pytest.raises(ChannelRegistryError, match="whatsapp"):
+        ChannelRegistry.from_config(whatsapp_config(), factories=wrong)
+
+
+def test_a_registry_built_by_hand_is_held_to_the_same_rule() -> None:
+    """`from_config` is not the only door; the check belongs on the constructor."""
+    with pytest.raises(ChannelRegistryError, match="whatsapp"):
+        ChannelRegistry({"whatsapp": FakeChannel()})
+
+
 def test_the_shipped_table_covers_every_known_channel() -> None:
     assert set(ADAPTERS) == set(KNOWN_CHANNELS)
 
@@ -599,7 +673,29 @@ if TYPE_CHECKING:  # pragma: no cover
 CONCRETE = ("fittrack.channels.telegram", "fittrack.channels.whatsapp")
 
 
-def imported_modules(source: str, *, module_level_only: bool = False) -> set[str]:
+def absolute(module: str, *, level: int, package: str) -> str:
+    """The module a `from ... import` names, relative spellings resolved.
+
+    A guard that reads `node.module` and ignores `node.level` is a guard with a
+    hole the width of `from ..channels.telegram import TelegramAdapter`, which
+    is the spelling a module inside the package would reach for first.
+    """
+    if not level:
+        return module
+    parts = package.split(".") if package else []
+    base = parts[: len(parts) - (level - 1)]
+    return ".".join([*base, module]) if module else ".".join(base)
+
+
+def package_of(path: Path) -> str:
+    """The package a file's relative imports are resolved against."""
+    parts = path.relative_to(SRC).with_suffix("").parts
+    return ".".join(parts[:-1])
+
+
+def imported_modules(
+    source: str, *, package: str = "", module_level_only: bool = False
+) -> set[str]:
     """Every absolute module path a source file imports, in any spelling."""
     tree = ast.parse(source)
     nodes = ast.iter_child_nodes(tree) if module_level_only else ast.walk(tree)
@@ -607,9 +703,12 @@ def imported_modules(source: str, *, module_level_only: bool = False) -> set[str
     for node in nodes:
         if isinstance(node, ast.Import):
             names.update(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
-            names.add(node.module)
-            names.update(f"{node.module}.{alias.name}" for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            module = absolute(node.module or "", level=node.level, package=package)
+            if not module:
+                continue
+            names.add(module)
+            names.update(f"{module}.{alias.name}" for alias in node.names)
     return names
 
 
@@ -625,6 +724,58 @@ def test_the_import_check_sees_what_it_should() -> None:
     assert not names_a_concrete_channel("fittrack.channels.registry")
 
 
+@pytest.mark.parametrize(
+    ("source", "package"),
+    [
+        pytest.param(
+            "from ..channels.telegram import TelegramAdapter", "fittrack.graph", id="up one package"
+        ),
+        pytest.param("from .telegram import TelegramAdapter", "fittrack.channels", id="sibling"),
+        pytest.param("from ..channels import telegram", "fittrack.graph", id="up, then a name"),
+        pytest.param("from . import telegram", "fittrack.channels", id="bare relative"),
+        pytest.param(
+            "from ...channels.whatsapp.client import post",
+            "fittrack.graph.subgraphs",
+            id="up two packages",
+        ),
+        pytest.param(
+            "from fittrack.channels.telegram import TelegramAdapter",
+            "fittrack.graph",
+            id="absolute",
+        ),
+        pytest.param("import fittrack.channels.telegram", "fittrack.graph", id="plain import"),
+    ],
+)
+def test_the_guard_resolves_every_spelling_of_the_import(source: str, package: str) -> None:
+    """Each of these reaches the same module, and the guard has to see all of them."""
+    found = imported_modules(source, package=package)
+    assert any(names_a_concrete_channel(module) for module in found), f"{source} slipped past"
+
+
+@pytest.mark.parametrize(
+    ("source", "package"),
+    [
+        pytest.param(
+            "from ..settings import Settings", "fittrack.channels", id="a sibling package"
+        ),
+        pytest.param("from .base import Channel", "fittrack.channels", id="the contract itself"),
+        pytest.param("from . import registry", "fittrack.channels", id="the registry"),
+        pytest.param("from ..channels.base import ChannelCaps", "fittrack.graph", id="caps"),
+    ],
+)
+def test_the_guard_does_not_fire_on_an_innocent_import(source: str, package: str) -> None:
+    found = imported_modules(source, package=package)
+    assert not any(names_a_concrete_channel(module) for module in found), (
+        f"{source} was a false positive"
+    )
+
+
+def test_the_package_of_a_file_is_where_its_relative_imports_start() -> None:
+    """`__init__.py` *is* its package; every other module is one below it."""
+    assert package_of(SRC / "fittrack" / "channels" / "registry.py") == "fittrack.channels"
+    assert package_of(SRC / "fittrack" / "channels" / "__init__.py") == "fittrack.channels"
+
+
 def test_nothing_outside_channels_imports_a_concrete_adapter() -> None:
     """The registry hands out a `Channel`; the rest of `src/` knows nothing else.
 
@@ -635,7 +786,7 @@ def test_nothing_outside_channels_imports_a_concrete_adapter() -> None:
         path.relative_to(ROOT).as_posix()
         for path in sorted(SRC.rglob("*.py"))
         if "fittrack/channels/" not in path.as_posix()
-        for module in imported_modules(path.read_text(encoding="utf-8"))
+        for module in imported_modules(path.read_text(encoding="utf-8"), package=package_of(path))
         if names_a_concrete_channel(module)
     ]
     assert not offenders, f"{offenders} import a concrete channel; the registry returns Channel"
@@ -643,9 +794,13 @@ def test_nothing_outside_channels_imports_a_concrete_adapter() -> None:
 
 def test_the_registry_does_not_import_an_adapter_at_module_level() -> None:
     """A lazy import is what lets the registry name every channel and load one."""
-    source = (SRC / "fittrack" / "channels" / "registry.py").read_text(encoding="utf-8")
+    path = SRC / "fittrack" / "channels" / "registry.py"
     assert not {
         module
-        for module in imported_modules(source, module_level_only=True)
+        for module in imported_modules(
+            path.read_text(encoding="utf-8"),
+            package=package_of(path),
+            module_level_only=True,
+        )
         if names_a_concrete_channel(module)
     }

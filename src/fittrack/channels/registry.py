@@ -18,6 +18,10 @@ Two rules, both from Apêndice A:
    of at startup — which is an incident rather than a deployment that never
    happened.
 
+3. **An adapter answers to the kind it is filed under.** The types cannot see
+   the difference — `kind` is the union of both channel names — so the registry
+   checks it once, where the adapters go in.
+
 The adapters are imported lazily inside their factories. That is what lets this
 module name every channel while loading only the one in use, and it keeps the
 protocol code out of the import graph of anything that merely wants the type.
@@ -38,6 +42,7 @@ __all__ = [
     "ADAPTERS",
     "ChannelConfig",
     "ChannelFactory",
+    "ChannelKindMismatchError",
     "ChannelNotEnabledError",
     "ChannelRegistry",
     "ChannelRegistryError",
@@ -56,6 +61,10 @@ class MissingCredentialError(ChannelRegistryError):
 
 class ChannelNotEnabledError(ChannelRegistryError, LookupError):
     """A channel was addressed that this process does not run."""
+
+
+class ChannelKindMismatchError(ChannelRegistryError):
+    """An adapter was filed under a kind it does not answer to."""
 
 
 class ChannelUnavailableError(ChannelRegistryError, NotImplementedError):
@@ -166,6 +175,17 @@ class ChannelRegistry:
     """The adapters this process runs, keyed by kind."""
 
     def __init__(self, adapters: Mapping[ChannelKind, Channel]) -> None:
+        # A factory under the wrong key, or one that returns the other channel's
+        # adapter, type-checks perfectly: `kind` is the union of both names. It
+        # would be handed out by `get`, reported as enabled, and fail at
+        # `ensure_addressable` on every send — a per-message failure where a
+        # per-deployment one was available. The constructor is where both doors
+        # meet, so the check lives here rather than in `from_config`.
+        for kind, adapter in adapters.items():
+            if adapter.kind != kind:
+                raise ChannelKindMismatchError(
+                    f"the adapter filed under {kind} answers to {adapter.kind}"
+                )
         self._adapters: dict[ChannelKind, Channel] = dict(adapters)
 
     @classmethod
