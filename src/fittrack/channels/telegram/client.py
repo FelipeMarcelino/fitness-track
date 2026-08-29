@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import re
 import uuid
+from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -192,11 +193,7 @@ class TelegramClient:
             async with self._http.stream("GET", url) as response:
                 if response.status_code >= httpx.codes.BAD_REQUEST:
                     await response.aread()
-                    raise TelegramApiError(
-                        method="download",
-                        status_code=response.status_code,
-                        description="the file could not be downloaded",
-                    )
+                    raise self._download_refused(response)
                 with destination.open("wb") as sink:
                     async for chunk in response.aiter_bytes():
                         written += len(chunk)
@@ -236,6 +233,35 @@ class TelegramClient:
             raise TelegramTransportError(
                 f"{method} did not complete: {type(error).__name__}"
             ) from None
+
+    @staticmethod
+    def _download_refused(response: httpx.Response) -> TelegramApiError:
+        """The file endpoint's refusal, with the number it came with.
+
+        It rate-limits like the method endpoint does, and says by how much.
+        Throwing the body away turned an exact wait into the generic ladder,
+        which is the one thing 18.4 says not to do when the channel gave a
+        number. The description is Telegram's own and names no URL.
+        """
+        body: Any = None
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+        if not isinstance(body, dict):
+            body = {}
+        parameters = body.get("parameters")
+        if not isinstance(parameters, dict):
+            parameters = {}
+        if "retry_after" not in parameters and (header := response.headers.get("retry-after")):
+            with suppress(ValueError):
+                parameters = {**parameters, "retry_after": int(header)}
+        return TelegramApiError(
+            method="download",
+            status_code=int(body.get("error_code", response.status_code)),
+            description=str(body.get("description") or "the file could not be downloaded"),
+            parameters=parameters,
+        )
 
     def _result(self, method: str, response: httpx.Response) -> Any:
         try:

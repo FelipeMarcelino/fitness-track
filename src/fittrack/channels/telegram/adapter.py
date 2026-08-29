@@ -24,6 +24,7 @@ its business.
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
@@ -417,6 +418,11 @@ class TelegramAdapter:
         if block.media_path is None:
             raise ChannelError("a media block needs a file to send")
         data: dict[str, Any] = {"chat_id": identity.external_id}
+        if block.reply_to is not None:
+            # `ensure_addressable` already validated the target; dropping it
+            # here would waste the check and deliver a chart that answers
+            # nothing. Multipart carries it as JSON, like every other field.
+            data["reply_parameters"] = json.dumps({"message_id": _addressable(block.reply_to[1])})
         if block.text:
             # Clip first, translate second. Telegram counts a caption after
             # entities are parsed, so the ceiling belongs on the visible text —

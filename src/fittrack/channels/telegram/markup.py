@@ -39,8 +39,18 @@ _TRANSLATIONS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\*\*(.+?)\*\*", re.DOTALL), r"<b>\1</b>"),
     (re.compile(r"__(.+?)__", re.DOTALL), r"<i>\1</i>"),
     (re.compile(r"~~(.+?)~~", re.DOTALL), r"<s>\1</s>"),
-    (re.compile(r"`(.+?)`", re.DOTALL), r"<code>\1</code>"),
 )
+
+# Code is taken out first and put back last, so nothing can be translated
+# inside it. Telegram's rule is about which entities may contain which, not
+# about nesting: `code` may not contain any other entity, so `<code><b>x</b>
+# </code>` is a parse error even though it is perfectly nested — which is
+# precisely what `_well_nested` cannot see. A code span shows literal text
+# anyway, so the delimiters inside one belong there as characters.
+_MONO = re.compile(r"`(.+?)`", re.DOTALL)
+# NUL cannot survive the escaping above and cannot appear in a Telegram
+# message, so it cannot collide with anything the agent wrote.
+_STASHED = re.compile(r"\x00(\d+)\x00")
 
 
 # Only the four this module writes; nothing else survives the escaping above.
@@ -72,13 +82,20 @@ def to_telegram_html(text: str) -> str:
     the log rather than in a dead letter.
     """
     escaped = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    rendered = escaped
+
+    spans: list[str] = []
+
+    def stash(match: re.Match[str]) -> str:
+        spans.append(match.group(1))
+        return f"\x00{len(spans) - 1}\x00"
+
+    rendered = _MONO.sub(stash, escaped)
     for pattern, replacement in _TRANSLATIONS:
         rendered = pattern.sub(replacement, rendered)
     if not _well_nested(rendered):
         logger.warning("neutral markup crossed its delimiters; sending it as text")
         return escaped
-    return rendered
+    return _STASHED.sub(lambda match: f"<code>{spans[int(match.group(1))]}</code>", rendered)
 
 
 def callback_data(index: int) -> str:

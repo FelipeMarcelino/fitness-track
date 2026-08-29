@@ -40,6 +40,7 @@ from fittrack.channels.base import (
     ChannelError,
     ChannelIdentity,
     ChannelMismatchError,
+    ErrorClass,
     OutboundBlock,
     TemplateRef,
 )
@@ -628,7 +629,6 @@ def test_the_ampersand_of_an_entity_is_escaped_once() -> None:
     [
         pytest.param("**bold __italic** tail__", id="crossed bold and italic"),
         pytest.param("__a **b__ c**", id="crossed the other way"),
-        pytest.param("**a `b** c`", id="crossed with mono"),
     ],
 )
 def test_crossed_markup_degrades_to_text_instead_of_invalid_html(neutral: str) -> None:
@@ -648,6 +648,34 @@ def test_crossed_markup_degrades_to_text_instead_of_invalid_html(neutral: str) -
 def test_well_nested_markup_still_becomes_html() -> None:
     """The fallback is for crossings, not for nesting, which is valid."""
     assert to_telegram_html("**a __b__ c**") == "<b>a <i>b</i> c</b>"
+
+
+@pytest.mark.parametrize(
+    ("neutral", "html"),
+    [
+        pytest.param("`**80 kg**`", "<code>**80 kg**</code>", id="bold inside code"),
+        pytest.param("`__x__`", "<code>__x__</code>", id="italic inside code"),
+        pytest.param("`~~y~~`", "<code>~~y~~</code>", id="struck inside code"),
+    ],
+)
+def test_a_code_span_is_atomic(neutral: str, html: str) -> None:
+    """Telegram refuses bold inside code: `code` may not contain other entities.
+
+    `_well_nested` reads `<code><b>x</b></code>` as perfectly nested, because
+    structurally it is — the rule that forbids it is Telegram's, about which
+    entities may contain which. A code span shows literal text anyway, so the
+    delimiters inside one stay as characters, exactly as they read.
+    """
+    assert to_telegram_html(neutral) == html
+
+
+def test_a_code_span_wins_over_a_delimiter_that_opens_outside_it() -> None:
+    """Code binds tightest, as it does in every dialect that has both.
+
+    The result is not what the author meant, but it is valid, it arrives, and
+    the stray `**` is visible — which is the same bargain as the crossed case.
+    """
+    assert to_telegram_html("**a `b** c`") == "**a <code>b** c</code>"
 
 
 def test_a_lone_delimiter_is_just_text() -> None:
@@ -819,6 +847,38 @@ async def test_media_goes_up_in_one_request_with_its_caption(tmp_path: Path) -> 
     assert "sendPhoto" in recorder.methods
     assert receipt.media_ref == "AgACX", "the file_id makes a later retry free (18.2)"
     assert receipt.channel_message_id == "81"
+
+
+async def test_media_is_delivered_as_a_reply_when_it_answers_one(tmp_path: Path) -> None:
+    """`ensure_addressable` validated the target; dropping it wastes the check.
+
+    A chart answers a question the user asked, and `sendPhoto` takes
+    `reply_parameters` like every other send does.
+    """
+    chart = tmp_path / "progress.png"
+    chart.write_bytes(b"\x89PNG")
+    adapter, recorder = build_adapter(
+        Recorder({"sendPhoto": {"message_id": 84, "date": EPOCH, "photo": [{"file_id": "A"}]}})
+    )
+    await adapter.send(
+        IDENTITY,
+        OutboundBlock(kind="media", media_path=chart, reply_to=("telegram", "4242")),
+    )
+    body = recorder.payload("sendPhoto")["multipart"]
+    assert b"reply_parameters" in body
+    assert b"4242" in body
+
+
+async def test_media_answering_a_press_is_refused_like_any_other_send(tmp_path: Path) -> None:
+    chart = tmp_path / "progress.png"
+    chart.write_bytes(b"\x89PNG")
+    adapter, recorder = build_adapter()
+    with pytest.raises(ChannelError, match="press"):
+        await adapter.send(
+            IDENTITY,
+            OutboundBlock(kind="media", media_path=chart, reply_to=("telegram", "press:1")),
+        )
+    assert recorder.calls == []
 
 
 async def test_a_caption_is_clipped_before_it_becomes_html(tmp_path: Path) -> None:
@@ -1042,6 +1102,62 @@ async def test_a_write_that_fails_midway_leaves_no_recording_behind(
 
     assert written, "the test did not exercise the write path"
     assert list(tmp_path.iterdir()) == [], "a partial recording was left in tmpfs"
+
+
+async def test_a_rate_limited_download_keeps_the_number_telegram_sent(
+    tmp_path: Path,
+) -> None:
+    """The file endpoint rate-limits too, and it says by how much.
+
+    Throwing the body away turned an exact wait into the generic ladder, which
+    is the one thing 18.4 says not to do when the channel has given a number.
+    """
+    recorder = Recorder({"getFile": {"file_id": "AwACAgE", "file_path": FILE_PATH}})
+    inner = recorder.handler
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "/file/bot" in request.url.path:
+            return httpx.Response(
+                429,
+                json={
+                    "ok": False,
+                    "error_code": 429,
+                    "description": "Too Many Requests: retry later",
+                    "parameters": {"retry_after": 12},
+                },
+            )
+        return inner(request)
+
+    recorder.handler = handler  # type: ignore[method-assign]
+    adapter, _ = build_adapter(recorder, download_dir=tmp_path)
+
+    with pytest.raises(TelegramApiError) as raised:
+        await adapter.download_media("AwACAgE")
+
+    verdict = adapter.classify_error(raised.value)
+    assert verdict.error_class is ErrorClass.RETRY_AFTER
+    assert verdict.retry_after == 12
+    assert list(tmp_path.iterdir()) == []
+
+
+async def test_a_download_refused_without_a_number_is_still_an_api_error(
+    tmp_path: Path,
+) -> None:
+    """A body that says nothing useful must not become a crash on the way out."""
+    recorder = Recorder({"getFile": {"file_id": "AwACAgE", "file_path": FILE_PATH}})
+    inner = recorder.handler
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "/file/bot" in request.url.path:
+            return httpx.Response(403, content=b"<html>forbidden</html>")
+        return inner(request)
+
+    recorder.handler = handler  # type: ignore[method-assign]
+    adapter, _ = build_adapter(recorder, download_dir=tmp_path)
+    with pytest.raises(TelegramApiError) as raised:
+        await adapter.download_media("AwACAgE")
+    assert raised.value.status_code == 403
+    assert FILE_PATH not in str(raised.value)
 
 
 async def test_a_file_id_that_telegram_does_not_know_fails_as_an_api_error(
