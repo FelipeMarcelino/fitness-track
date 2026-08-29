@@ -113,7 +113,7 @@ class ClassifiedError:
         # without one has RETRY_BACKOFF and its ladder, and letting the verdict
         # through without the seconds moves the discovery to the moment the
         # outbound service writes `next_retry_at` (spec 18.4).
-        if (self.retry_after is None) != (self.error_class is not ErrorClass.RETRY_AFTER):
+        if (self.retry_after is not None) != (self.error_class is ErrorClass.RETRY_AFTER):
             raise ValueError(
                 f"retry_after is set if and only if the class is {ErrorClass.RETRY_AFTER}; "
                 f"got {self.error_class} with retry_after={self.retry_after}"
