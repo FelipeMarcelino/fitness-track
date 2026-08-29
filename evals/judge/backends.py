@@ -7,8 +7,9 @@ import os
 import secrets
 import textwrap
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 import yaml
 from pydantic import ValidationError as PydanticValidationError
@@ -17,19 +18,52 @@ from evals.judge.models import CaseVerdict, JudgeCase, RubricScore
 from evals.judge.rubrics import Rubric
 
 if TYPE_CHECKING:
-    from anthropic.types import ToolChoiceToolParam, ToolParam
+    from openai.types.responses import ResponseTextConfigParam
+    from openai.types.shared_params import Reasoning
 
-CREDENTIAL_ENV = "ANTHROPIC_API_KEY"
+CREDENTIAL_ENV = "OPENAI_API_KEY"
 
 CONFIG_DIR = Path(__file__).resolve().parents[2] / "config"
 MODELS_FILE = CONFIG_DIR / "models.yaml"
 PROMPT_FILE = CONFIG_DIR / "prompts" / "judge.md"
 
 NONCE_BYTES = 8
+# Responses counts hidden reasoning and visible JSON against the same ceiling.
+# The judge uses high effort, so the old 2,048 visible-token budget could end
+# before a complete structured verdict was emitted.
+MAX_OUTPUT_TOKENS = 16_384
+ReasoningEffort = Literal["low", "medium", "high"]
 
 
 class MissingCredentialsError(RuntimeError):
     """No provider credential is available for a live judge run."""
+
+
+@dataclass(frozen=True, slots=True)
+class JudgeModelConfig:
+    """The provider-specific settings of the configured judge role."""
+
+    provider: str
+    model: str
+    reasoning_effort: ReasoningEffort
+
+
+def judge_config(models_file: Path | None = None) -> JudgeModelConfig:
+    """Resolve the live judge settings from `config/models.yaml`."""
+    path = models_file or MODELS_FILE
+    config = yaml.safe_load(path.read_text(encoding="utf-8"))
+    try:
+        fallback = config["roles"]["JUDGE"]["fallback"]
+        reasoning_effort = fallback["reasoning_effort"]
+        if reasoning_effort not in ("low", "medium", "high"):
+            raise ValueError(f"invalid JUDGE reasoning_effort in {path}: {reasoning_effort!r}")
+        return JudgeModelConfig(
+            provider=str(fallback["provider"]),
+            model=str(fallback["model"]),
+            reasoning_effort=cast("ReasoningEffort", reasoning_effort),
+        )
+    except (KeyError, TypeError) as error:
+        raise KeyError(f"no complete JUDGE role configured in {path}") from error
 
 
 def judge_model(models_file: Path | None = None) -> str:
@@ -43,12 +77,7 @@ def judge_model(models_file: Path | None = None) -> str:
     The role has no primary by design: a judge sharing a failure mode with the
     model under evaluation is not a judge (spec 7.2), so the fallback *is* it.
     """
-    path = models_file or MODELS_FILE
-    config = yaml.safe_load(path.read_text(encoding="utf-8"))
-    try:
-        return str(config["roles"]["JUDGE"]["fallback"]["model"])
-    except (KeyError, TypeError) as error:
-        raise KeyError(f"no JUDGE role configured in {path}") from error
+    return judge_config(models_file).model
 
 
 class JudgeBackend(Protocol):
@@ -195,25 +224,36 @@ class ReplayBackend:
 
 
 # --------------------------------------------------------------------------- #
-# Anthropic
+# OpenAI
 # --------------------------------------------------------------------------- #
 
 
-class AnthropicBackend:
-    """Live judge (spec 21.2). Requires ANTHROPIC_API_KEY."""
+class OpenAIBackend:
+    """Live judge (spec 21.2). Requires OPENAI_API_KEY."""
 
-    name = "anthropic"
+    name = "openai"
 
-    def __init__(self, model: str | None = None, api_key: str | None = None) -> None:
+    def __init__(
+        self,
+        model: str | None = None,
+        api_key: str | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
+    ) -> None:
         key = api_key or os.environ.get(CREDENTIAL_ENV)
         if not key:
             raise MissingCredentialsError(CREDENTIAL_ENV)
-        import anthropic  # imported lazily so the offline path needs no SDK call
+        import openai  # imported lazily so the offline path needs no SDK call
 
-        self.model = model or judge_model()
-        self._client = anthropic.Anthropic(api_key=key)
+        configured = judge_config()
+        if configured.provider != self.name:
+            raise ValueError(
+                f"JUDGE is configured for provider {configured.provider!r}, not {self.name!r}"
+            )
+        self.model = model or configured.model
+        self.reasoning_effort = reasoning_effort or configured.reasoning_effort
+        self._client = openai.OpenAI(api_key=key)
 
-    def _tool_schema(self, rubrics: Mapping[str, Rubric]) -> dict[str, Any]:
+    def _response_format(self, rubrics: Mapping[str, Rubric]) -> dict[str, Any]:
         properties = {
             name: {
                 "type": "object",
@@ -222,36 +262,40 @@ class AnthropicBackend:
                     "justification": {"type": "string"},
                 },
                 "required": ["score", "justification"],
+                "additionalProperties": False,
             }
             for name in rubrics
         }
         return {
             "name": "record_scores",
-            "description": "Registra a nota e a justificativa de cada rubrica.",
-            "input_schema": {
+            "type": "json_schema",
+            "strict": True,
+            "schema": {
                 "type": "object",
                 "properties": properties,
                 "required": list(rubrics),
+                "additionalProperties": False,
             },
         }
 
     def score(self, case: JudgeCase, rubrics: dict[str, Rubric]) -> CaseVerdict:
-        tool = self._tool_schema(rubrics)
         block, nonce = build_case_block(case)
-        message = self._client.messages.create(
+        response = self._client.responses.create(
             model=self.model,
-            max_tokens=2048,
-            system=build_system_prompt(nonce),
-            tools=[cast("ToolParam", tool)],
-            tool_choice=cast("ToolChoiceToolParam", {"type": "tool", "name": tool["name"]}),
-            messages=[
-                {
-                    "role": "user",
-                    "content": f"Rubricas:\n\n{_render_rubrics(rubrics)}\n\n{block}",
-                }
-            ],
+            instructions=build_system_prompt(nonce),
+            input=f"Rubricas:\n\n{_render_rubrics(rubrics)}\n\n{block}",
+            max_output_tokens=MAX_OUTPUT_TOKENS,
+            reasoning=cast("Reasoning", {"effort": self.reasoning_effort}),
+            text=cast(
+                "ResponseTextConfigParam",
+                {"format": self._response_format(rubrics)},
+            ),
+            store=False,
         )
-        raw = next((part.input for part in message.content if part.type == "tool_use"), None)
+        try:
+            raw = json.loads(response.output_text)
+        except (json.JSONDecodeError, TypeError) as error:
+            raise ValueError(f"case {case.id!r}: judge did not return valid JSON") from error
         if not isinstance(raw, dict):
-            raise ValueError(f"judge returned no structured scores for case {case.id!r}")
+            raise ValueError(f"case {case.id!r}: judge JSON is not an object")
         return verdict_from_payload(case.id, raw, rubrics)

@@ -17,13 +17,14 @@ o ADR explica *como se chegou nele*.
 | ADR | Título | Estado | Revisa |
 | --- | --- | --- | --- |
 | 0001 | Groq como provider primário | aceito | AD-19 |
-| [0002](0002-portao-do-judge-suspenso.md) | Portão do LLM-as-judge suspenso na fundação | aceito | — |
+| [0002](0002-portao-do-judge-suspenso.md) | Portão do LLM-as-judge suspenso na fundação | substituído por ADR-0004 | — |
 | [0003](0003-escopo-de-tenant-dentro-da-chave-estrangeira.md) | Escopo de tenant dentro da chave estrangeira | aceito | — |
+| [0004](0004-openai-como-provider-do-judge.md) | OpenAI como provider do LLM-as-judge | aceito | AD-19 (somente JUDGE) |
 
 > ⚠️ **ADR-0001 está referenciado mas ausente da árvore.** O `CLAUDE.md` e a §2 da spec apontam para
 > `doc/adr/0001-groq-como-provider-primario.md`, e o arquivo não existe. O conteúdo da decisão está
-> descrito na §7.2 e no Apêndice A (Groq primário, Anthropic como fallback de todo papel e único
-> provider do `JUDGE`, OpenAI só para embeddings), mas o racional que a substituiu do AD-19 não foi
+> descrito na §7.2 e no Apêndice A (Groq primário e Anthropic como fallback dos papéis de produto),
+> mas o racional que a substituiu do AD-19 não foi
 > escrito em lugar nenhum. Escrevê-lo a partir de inferência seria inventar a justificativa, então
 > fica registrado aqui como lacuna a preencher por quem tomou a decisão.
 

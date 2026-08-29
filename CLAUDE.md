@@ -104,16 +104,17 @@ O quinto alvo é o LLM-as-judge da §21.2, e ele tem dois modos, de propósito:
 | Modo | Onde | Credencial ausente |
 | --- | --- | --- |
 | Tolerante — `make eval-judge` | local | Relata "judge não executado" e sai com 0 |
-| Estrito — `--backend anthropic` | CI | Sai com 1 |
+| Estrito — `--backend openai` | CI | Sai com 1 |
 
 A diferença não é conveniência: reprovar uma PR por falta de credencial *local* seria ruído, mas um
 *required check* verde diria que segurança e fidelidade numérica foram avaliadas quando ninguém
 avaliou. A política completa (o que bloqueia, o que vira tendência, o que descarta a rodada) está em
 `evals/rubrics/README.md`.
 
-> ⚠️ **O portão está suspenso** — [ADR-0002](doc/adr/0002-portao-do-judge-suspenso.md). A conta
-> Anthropic não tem saldo, então o job roda, falha e **não** reprova o merge. Ele continua vermelho
-> no PR; o que se perdeu foi o veto, não a visibilidade. A reversão é uma linha no `ci.yml`.
+O portão está ativo com OpenAI conforme o
+[ADR-0004](doc/adr/0004-openai-como-provider-do-judge.md). O modo estrito exige
+`OPENAI_API_KEY`, e uma mudança em `config/models.yaml` também dispara a rodada para que uma troca
+do próprio juiz nunca passe sem calibração.
 
 Para reavaliar uma rodada gravada, sem rede e sem credencial:
 
@@ -408,10 +409,14 @@ ponta, sem pedir aprovação entre elas.
 ```
 fitness-track/          ← raiz do projeto e raiz do git
 ├── .git/
+├── .github/workflows/  ← quality, integration e LLM-as-judge
 ├── .gitignore
 ├── CLAUDE.md
-└── doc/
-    └── spec.md
+├── config/             ← modelos, RAG, quotas e prompts versionados
+├── doc/                ← spec, ADRs e sprints
+├── evals/              ← judge, rubricas e datasets
+├── src/fittrack/       ← fundação executável da aplicação
+└── tests/              ← unitários, arquitetura e integração
 ```
 
 Remote: `github.com/FelipeMarcelino/fitness-track`, branch padrão `main`.

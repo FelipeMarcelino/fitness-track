@@ -2,9 +2,13 @@
 
 | Campo | Valor |
 | --- | --- |
-| Estado | aceito |
+| Estado | substituído pelo ADR-0004 |
 | Data | 2026-08-27 |
 | Revisa | — (não altera nenhuma decisão da §2; suspende temporariamente um portão da §21.4) |
+
+> Substituído em 2026-08-28 pelo
+> [ADR-0004](0004-openai-como-provider-do-judge.md), que migrou o judge para OpenAI e reativou o
+> portão. O restante deste documento preserva o contexto histórico da suspensão.
 
 ## Contexto
 
