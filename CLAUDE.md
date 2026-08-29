@@ -355,9 +355,20 @@ Nunca commitar direto na `main`. Todo trabalho sai em branch, **com nome em ingl
 
 ### 4. Pull request via `gh`
 
+**Título de PR de feature começa pela tarefa que ele executa:** `S<sprint>-T<tarefa>-<título>`.
+A tarefa 3 da sprint 2 vira `S02-T03-ingress webhook`. Dois dígitos nos dois números, para que a
+lista de PRs ordene sozinha.
+
+O motivo é a rastreabilidade que a §24 e o `doc/sprints/` já pressupõem: o PR é a unidade de entrega
+de uma tarefa, e um título que não a nomeia obriga a abrir o diff para descobrir qual das quinze é.
+Quem procura "onde entrou o adaptador do Telegram" procura por `S02-T02`, não por "telegram".
+
+PR que não executa tarefa de sprint — `hotfix/`, `doc/`, correção de infraestrutura — não leva o
+prefixo, porque não há tarefa para nomear. Título descritivo comum.
+
 ```bash
 # criar o PR a partir da branch atual
-gh pr create --base main --title "<título>" --body "<o que muda e por quê>"
+gh pr create --base main --title "S02-T03-ingress webhook" --body "<o que muda e por quê>"
 
 # solicitar a revisão do Codex imediatamente após criar o PR
 gh pr comment --body '@codex review'
