@@ -788,6 +788,74 @@ async def test_a_template_block_is_refused() -> None:
     assert recorder.calls == []
 
 
+async def test_a_button_press_can_be_acknowledged_at_once() -> None:
+    """18.2: answer the callback *immediately*, before anything is queued.
+
+    Until it is answered the button keeps spinning in the client, whatever the
+    pipeline is doing. `parse` is synchronous by the protocol of 18.1 and cannot
+    make the call itself, so the adapter offers it and the ingress makes it as
+    soon as the update is verified (S02-T03).
+    """
+    adapter, recorder = build_adapter(Recorder({"answerCallbackQuery": True}))
+    await adapter.answer_callback("3141592653")
+    assert recorder.payload("answerCallbackQuery") == {"callback_query_id": "3141592653"}
+
+
+async def test_acknowledging_a_press_accepts_the_id_as_it_was_parsed() -> None:
+    """The prefix is ours; Telegram wants the number it issued."""
+    adapter, recorder = build_adapter(Recorder({"answerCallbackQuery": True}))
+    await adapter.answer_callback("press:3141592653")
+    assert recorder.payload("answerCallbackQuery") == {"callback_query_id": "3141592653"}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param("null", id="null"),
+        pytest.param("[]", id="an array"),
+        pytest.param('"gateway timeout"', id="a bare string"),
+    ],
+)
+async def test_a_json_body_that_is_not_an_object_is_a_transport_failure(body: str) -> None:
+    """An intermediary answering `null` is a transient failure, not our bug.
+
+    `response.json()` parses it happily and the `.get` that follows raises
+    `AttributeError`, which `classify_error` reads as `BUG` — so a message that
+    should have been retried gets dead-lettered instead (18.4).
+    """
+    adapter, _ = build_adapter(
+        Recorder(
+            {
+                "sendMessage": httpx.Response(
+                    502, content=body, headers={"content-type": "application/json"}
+                )
+            }
+        )
+    )
+    with pytest.raises(TelegramTransportError):
+        await adapter.send(IDENTITY, OutboundBlock(kind="text", text="oi"))
+
+
+async def test_a_transient_body_is_classified_as_worth_retrying() -> None:
+    adapter, _ = build_adapter(
+        Recorder(
+            {
+                "sendMessage": httpx.Response(
+                    502, content="null", headers={"content-type": "application/json"}
+                )
+            }
+        )
+    )
+    try:
+        await adapter.send(IDENTITY, OutboundBlock(kind="text", text="oi"))
+    except TelegramTransportError as error:
+        from fittrack.channels.base import ErrorClass
+
+        assert adapter.classify_error(error).error_class is ErrorClass.RETRY_BACKOFF
+    else:  # pragma: no cover
+        pytest.fail("the send should not have succeeded")
+
+
 async def test_typing_is_an_action_and_not_a_bubble() -> None:
     """`sendChatAction` expires in about five seconds, so `deliver` repeats it."""
     adapter, recorder = build_adapter(Recorder({"sendChatAction": True}))

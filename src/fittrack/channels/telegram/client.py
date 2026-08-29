@@ -245,6 +245,15 @@ class TelegramClient:
                 f"{method} answered {response.status_code} with a body that is not JSON"
             ) from None
 
+        if not isinstance(body, dict):
+            # `null` or `[]` from an intermediary parses fine and then has no
+            # `.get`. Letting the `AttributeError` out would reach
+            # `classify_error` as BUG, and a transient gateway failure would be
+            # dead-lettered instead of retried (spec 18.4).
+            raise TelegramTransportError(
+                f"{method} answered {response.status_code} with a JSON body that is not an object"
+            )
+
         if response.status_code < httpx.codes.BAD_REQUEST and body.get("ok"):
             return body.get("result")
 

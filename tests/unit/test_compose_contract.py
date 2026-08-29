@@ -103,7 +103,12 @@ def mount_sources(service: dict[str, Any]) -> set[str]:
     """
     sources = set()
     for volume in service.get("volumes", []):
-        sources.add(volume["source"] if isinstance(volume, dict) else volume.split(":")[0])
+        if not isinstance(volume, dict):
+            sources.add(volume.split(":")[0])
+        elif "source" in volume:
+            sources.add(volume["source"])
+        # A tmpfs mount has a target and no source: there is no host path to
+        # name, which is the whole point of it.
     return sources
 
 
@@ -117,6 +122,42 @@ def test_stateful_services_keep_a_named_volume(base: dict[str, Any]) -> None:
 # `QDRANT__TLS__KEY: /certs/server.key` names a file, it does not embed one.
 NOT_A_SECRET = re.compile(r"^(/|\./|true$|false$|\d+$)", re.IGNORECASE)
 SECRET_NAME = re.compile(r"^-?\s*[A-Z0-9_]*(PASSWORD|SECRET|KEY|TOKEN|PEPPER)[A-Z0-9_]*[:=]")
+
+
+def scratch_mount(service: dict[str, Any]) -> dict[str, Any] | None:
+    """The tmpfs mount for `/tmp`, if the service declares one."""
+    for mount in service.get("volumes") or []:
+        if (
+            isinstance(mount, dict)
+            and mount.get("type") == "tmpfs"
+            and mount.get("target") == "/tmp"
+        ):
+            return mount
+    return None
+
+
+@pytest.mark.parametrize("service", sorted(APP_SERVICES))
+def test_the_application_writes_media_to_memory_and_not_to_disk(
+    base: dict[str, Any], service: str
+) -> None:
+    """Section 11.1: a voice recording lands in tmpfs, never on a volume.
+
+    Without the mount, `/tmp` is the container's writable layer — which is disk,
+    survives a restart, and holds the recordings 11.3 deliberately keeps for six
+    hours when transcription fails. The adapter cannot check this from inside
+    the container, so the topology is where it has to be true.
+    """
+    assert scratch_mount(base["services"][service]) is not None, (
+        f"{service} has no tmpfs for /tmp: downloaded audio would persist on host storage"
+    )
+
+
+@pytest.mark.parametrize("service", sorted(APP_SERVICES))
+def test_the_memory_backed_scratch_space_is_bounded(base: dict[str, Any], service: str) -> None:
+    """An unbounded tmpfs is host memory a malformed `file_id` can spend."""
+    mount = scratch_mount(base["services"][service])
+    assert mount is not None
+    assert (mount.get("tmpfs") or {}).get("size"), f"{service} mounts /tmp without a size"
 
 
 def test_no_literal_secret_lives_in_the_compose_file() -> None:
@@ -321,8 +362,9 @@ def test_no_container_receives_the_ca_signing_key(base: dict[str, Any], service:
     """`certs/ca/` holds `ca.key`. A container with it can mint a certificate
     that Postgres, Redis and Qdrant all trust, which is the entire boundary.
     """
-    for volume in base["services"][service].get("volumes", []):
-        source = volume["source"] if isinstance(volume, dict) else volume.split(":")[0]
+    # Through `mount_sources`, which is the one place that knows a mount may be
+    # a bind, a named volume or a tmpfs with no host path at all.
+    for source in mount_sources(base["services"][service]):
         assert source.rstrip("/") != "./certs/ca", (
             f"{service} mounts the CA directory, including its private key"
         )

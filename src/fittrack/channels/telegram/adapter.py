@@ -196,6 +196,22 @@ class TelegramAdapter:
             case _:  # pragma: no cover - the Literal is closed
                 raise ChannelError(f"telegram cannot send a {block.kind} block")
 
+    async def answer_callback(self, callback_query_id: str) -> None:
+        """Stop the button spinning, before anything is queued (spec 18.2).
+
+        Telegram leaves the client's progress indicator turning until the
+        callback is answered or it times out, whatever the pipeline does in the
+        meantime. `parse` is synchronous by the protocol of 18.1 and cannot make
+        the call, so the ingress makes it as soon as the update is verified.
+
+        Takes the id as it was parsed: the `press:` prefix is ours, and Telegram
+        wants the number it issued.
+        """
+        await self._client.call(
+            "answerCallbackQuery",
+            {"callback_query_id": callback_query_id.removeprefix(PRESS_PREFIX)},
+        )
+
     async def send_typing(self, identity: ChannelIdentity) -> None:
         """ "typing…", which expires after about five seconds and is repeated."""
         await self._client.call(
