@@ -91,6 +91,13 @@ def test_baseline_examples_are_unambiguous_for_numeric_fidelity(
     assert "meta de 4 dias por semana" in responses["base-015"]
     assert "2.9 sessões por semana" in responses["base-016"]
     assert "RPE médio de 7.0 para 7.1" in responses["base-022"]
+    assert "tendência registrada é de queda" in responses["base-003"]
+    assert "84.0 kg de e1RM" in responses["base-006"]
+    assert "faixa alta" not in responses["base-009"]
+    assert "meta de 3 sessões por semana" in responses["base-016"]
+    assert "densidade é alta" not in responses["base-017"]
+    assert "85.0 kg × 6 repetições" in responses["base-025"]
+    assert "3 dias por semana" in responses["base-033"]
 
 
 def test_ids_are_unique(calibration: list[JudgeCase], baseline: list[JudgeCase]) -> None:
