@@ -11,17 +11,24 @@ class MemoryCache:
         self.values: dict[str, str] = {}
         self.writes: list[tuple[str, str, int]] = []
 
-    async def get(self, key: str) -> str | None:
-        return self.values.get(key)
-
-    async def set(self, key: str, value: str, *, ex: int) -> None:
-        self.values[key] = value
-        self.writes.append((key, value, ex))
-
-    async def delete(self, *names: str) -> int:
-        for name in names:
-            self.values.pop(name, None)
-        return len(names)
+    async def eval(self, script: str, numkeys: int, *args: str | int) -> object:
+        assert numkeys == 2
+        key, generation_key, *values = args
+        assert isinstance(key, str) and isinstance(generation_key, str)
+        if "INCR" in script:
+            generation = int(self.values.get(generation_key, "0")) + 1
+            self.values[generation_key] = str(generation)
+            self.values.pop(key, None)
+            return 1
+        if "ARGV[1]" in script:
+            expected, value, ttl = values
+            assert isinstance(expected, str) and isinstance(value, str) and isinstance(ttl, int)
+            if self.values.get(generation_key, "0") != expected:
+                return 0
+            self.values[key] = value
+            self.writes.append((key, value, ttl))
+            return 1
+        return [self.values.get(generation_key, "0"), self.values.get(key, "")]
 
 
 class RecordingResolver:
@@ -56,7 +63,7 @@ async def test_identity_cache_uses_only_the_hash_and_avoids_a_second_lookup() ->
     assert cache.writes == [
         (
             "identity:telegram:63616368652d736166652d68617368",
-            '{"identity_id":29,"tenant_id":19}',
+            '{"generation":"0","identity_id":29,"tenant_id":19}',
             300,
         )
     ]
@@ -74,4 +81,7 @@ async def test_identity_invalidation_uses_the_same_hashed_cache_key() -> None:
 
     await resolver.invalidate(channel="telegram", external_id="private-chat-id")
 
-    assert cache.values == {}
+    assert not any(
+        name.startswith("identity:telegram:") and not name.endswith(":generation")
+        for name in cache.values
+    )

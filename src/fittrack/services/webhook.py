@@ -87,14 +87,8 @@ class IngressIdentityResolver(Protocol):
 class IdentityCache(Protocol):
     """The small Redis surface used by the pre-tenant identity cache."""
 
-    async def get(self, key: str) -> str | bytes | None:
-        """Return the cached value when it has not expired."""
-
-    async def set(self, key: str, value: str, *, ex: int) -> None:
-        """Store a value with its mandatory expiry."""
-
-    async def delete(self, *names: str) -> int:
-        """Remove a mapping after its channel identity is revoked."""
+    async def eval(self, script: str, numkeys: int, *keys_and_args: str | int) -> object:
+        """Execute the generation-guarded identity-cache scripts."""
 
 
 class RawMessageStore(Protocol):
@@ -237,9 +231,10 @@ class CachedIdentityResolver:
 
     async def resolve_or_create(self, *, channel: ChannelKind, external_id: str) -> IngressIdentity:
         digest = self._hash_identity(channel, external_id)
-        key = f"identity:{channel}:{digest.hex()}"
-        cached = await self._cache.get(key)
-        if cached is not None:
+        key, generation_key = _identity_cache_keys(channel, digest)
+        snapshot = await self._cache.eval(_IDENTITY_CACHE_SNAPSHOT, 2, key, generation_key)
+        generation, cached = _identity_snapshot(snapshot)
+        if generation is not None and cached is not None:
             identity = _cached_identity(cached, digest)
             if identity is not None:
                 return identity
@@ -254,17 +249,34 @@ class CachedIdentityResolver:
             external_id_hash=digest,
         )
         value = json.dumps(
-            {"identity_id": identity.identity_id, "tenant_id": identity.tenant_id},
+            {
+                "generation": generation,
+                "identity_id": identity.identity_id,
+                "tenant_id": identity.tenant_id,
+            },
             separators=(",", ":"),
             sort_keys=True,
         )
-        await self._cache.set(key, value, ex=self._ttl_s)
-        return identity
+        filled = await self._cache.eval(
+            _IDENTITY_CACHE_FILL,
+            2,
+            key,
+            generation_key,
+            generation or "0",
+            value,
+            self._ttl_s,
+        )
+        if filled:
+            return identity
+        # Revocation won the race while the authorized lookup was in flight;
+        # start again, so no stale tenant/id pair becomes observable.
+        return await self.resolve_or_create(channel=channel, external_id=external_id)
 
     async def invalidate(self, *, channel: ChannelKind, external_id: str) -> None:
         """Drop the exact mapping the authorized revocation path changed."""
         digest = self._hash_identity(channel, external_id)
-        await self._cache.delete(f"identity:{channel}:{digest.hex()}")
+        key, generation_key = _identity_cache_keys(channel, digest)
+        await self._cache.eval(_IDENTITY_CACHE_INVALIDATE, 2, key, generation_key)
 
 
 class RedisUpdateDeduplicator:
@@ -490,6 +502,21 @@ end
 redis.call('SET', KEYS[2], '1', 'EX', ARGV[3])
 return 1
 """
+_IDENTITY_CACHE_SNAPSHOT = """
+return {redis.call('GET', KEYS[2]) or '0', redis.call('GET', KEYS[1]) or ''}
+"""
+_IDENTITY_CACHE_FILL = """
+if (redis.call('GET', KEYS[2]) or '0') == ARGV[1] then
+  redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
+  return 1
+end
+return 0
+"""
+_IDENTITY_CACHE_INVALIDATE = """
+redis.call('INCR', KEYS[2])
+redis.call('DEL', KEYS[1])
+return 1
+"""
 
 
 def _parse_update(body: bytes) -> Mapping[str, Any]:
@@ -520,6 +547,22 @@ def _cached_identity(value: str | bytes, digest: bytes) -> IngressIdentity | Non
     ):
         return None
     return IngressIdentity(tenant_id=tenant_id, identity_id=identity_id, external_id_hash=digest)
+
+
+def _identity_cache_keys(channel: ChannelKind, digest: bytes) -> tuple[str, str]:
+    stem = f"identity:{channel}:{digest.hex()}"
+    return stem, f"{stem}:generation"
+
+
+def _identity_snapshot(value: object) -> tuple[str | None, str | bytes | None]:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return None, None
+    generation, cached = value
+    if isinstance(generation, bytes):
+        generation = generation.decode()
+    if not isinstance(generation, str) or not isinstance(cached, (str, bytes)):
+        return None, None
+    return generation, cached or None
 
 
 def _update_id(payload: Mapping[str, Any]) -> int | None:
