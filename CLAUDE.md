@@ -33,6 +33,22 @@ de baixar outro por conta própria. Se ele reclamar de versão de Python, o prob
 
 Sem `direnv` instalado, o equivalente manual é `nix develop`.
 
+### Executando ruff e mypy
+
+O `ruff` instalado no `.venv` é um binário dinamicamente linkado que **não roda diretamente no
+NixOS**. Para executá-lo, entre primeiro no devshell (`direnv allow .` ou `nix develop`) e use
+`uv run`:
+
+```bash
+uv run ruff format .                          # formatar
+uv run ruff check .                           # lint
+uv run ruff check --fix .                     # lint com auto-fix
+uv run mypy                                   # typecheck
+```
+
+**Nunca** chame `ruff` ou `mypy` diretamente (sem `uv run`) — o executável do `.venv` falha com
+"Could not start dynamically linked executable" no NixOS.
+
 ### 2. Docker
 
 Quando o devshell não estiver disponível, ou para rodar o que precisa de Postgres, Redis e Qdrant
