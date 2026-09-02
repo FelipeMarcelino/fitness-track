@@ -92,7 +92,7 @@ class FakeBatchStore:
 
     def __init__(self) -> None:
         self._next_id = 1
-        self._rows: dict[int, dict[str, object]] = {}
+        self._rows: dict[int, StoredBatch] = {}
 
     async def reserve_id(self) -> int:
         row_id = self._next_id
@@ -108,45 +108,68 @@ class FakeBatchStore:
         combined_text: bytes,
         key_version: int,
     ) -> None:
-        self._rows[row_id] = {
-            "id": row_id,
-            "tenant_id": tenant_id,
-            "message_ids": message_ids,
-            "combined_text": combined_text,
-            "key_version": key_version,
-            "status": "pending",
-            "attempts": 0,
-        }
+        self._rows[row_id] = StoredBatch(
+            id=row_id,
+            tenant_id=tenant_id,
+            message_ids=message_ids,
+            combined_text=combined_text,
+            key_version=key_version,
+        )
+
+    async def find_by_message_ids(
+        self, *, tenant_id: int, message_ids: list[str]
+    ) -> BatchRow | None:
+        for row in self._rows.values():
+            if row.tenant_id == tenant_id and row.message_ids == message_ids:
+                return self._as_batch_row(row)
+        return None
 
     async def get(self, *, batch_id: int, tenant_id: int) -> BatchRow | None:
         row = self._rows.get(batch_id)
-        if row is None or row["tenant_id"] != tenant_id:
+        if row is None or row.tenant_id != tenant_id:
             return None
+        return self._as_batch_row(row)
+
+    @staticmethod
+    def _as_batch_row(row: StoredBatch) -> BatchRow:
         return BatchRow(
-            id=row["id"],  # type: ignore[arg-type]
-            tenant_id=row["tenant_id"],  # type: ignore[arg-type]
-            message_ids=row["message_ids"],  # type: ignore[arg-type]
-            combined_text=row["combined_text"],  # type: ignore[arg-type]
-            key_version=row["key_version"],  # type: ignore[arg-type]
-            status=row["status"],  # type: ignore[arg-type]
-            attempts=row["attempts"],  # type: ignore[arg-type]
+            id=row.id,
+            tenant_id=row.tenant_id,
+            message_ids=row.message_ids,
+            combined_text=row.combined_text,
+            key_version=row.key_version,
+            status=row.status,
+            attempts=row.attempts,
         )
 
     async def mark_done(self, *, batch_id: int, tenant_id: int) -> None:
         row = self._rows.get(batch_id)
-        if row is not None and row["tenant_id"] == tenant_id:
-            row["status"] = "done"
-            row["attempts"] = row["attempts"] + 1  # type: ignore[operator]
+        if row is not None and row.tenant_id == tenant_id:
+            row.status = "done"
+            row.attempts += 1
+
+
+@dataclass
+class StoredBatch:
+    id: int
+    tenant_id: int
+    message_ids: list[str]
+    combined_text: bytes
+    key_version: int
+    status: str = "pending"
+    attempts: int = 0
 
 
 @dataclass
 class FakeBatchEnqueuer:
     """Records enqueue_process_batch calls."""
 
-    calls: list[tuple[int, int]] = field(default_factory=list)
+    calls: list[tuple[int, int, int]] = field(default_factory=list)
 
-    async def enqueue_process_batch(self, *, tenant_id: int, batch_id: int) -> None:
-        self.calls.append((tenant_id, batch_id))
+    async def enqueue_process_batch(
+        self, *, tenant_id: int, batch_id: int, delay_s: int = 0
+    ) -> None:
+        self.calls.append((tenant_id, batch_id, delay_s))
 
 
 # ─── Fixtures ──────────────────────────────────────────────────────────────
@@ -183,8 +206,18 @@ def _make_drain(
 ) -> DrainResult:
     if items is None:
         items = [
-            {"message_id": "m1", "text": "supino 10kg 8 reps", "kind": "text"},
-            {"message_id": "m2", "text": "foi facil", "kind": "text"},
+            {
+                "channel_message_id": "m1",
+                "raw_message_id": 101,
+                "text": "supino 10kg 8 reps",
+                "kind": "text",
+            },
+            {
+                "channel_message_id": "m2",
+                "raw_message_id": 102,
+                "text": "foi facil",
+                "kind": "text",
+            },
         ]
     return DrainResult(batch_id="abc123", items=items)
 
@@ -195,8 +228,8 @@ def _make_drain(
 class TestPrepareItems:
     def test_marks_voice_items(self) -> None:
         items: list[dict[str, object]] = [
-            {"message_id": "m1", "text": "oi", "kind": "text"},
-            {"message_id": "m2", "kind": "voice"},
+            {"channel_message_id": "m1", "raw_message_id": 101, "text": "oi", "kind": "text"},
+            {"channel_message_id": "m2", "raw_message_id": 102, "kind": "voice"},
         ]
         result, _ = prepare_items(items)
         assert result[0].get("was_audio") is None
@@ -204,34 +237,39 @@ class TestPrepareItems:
 
     def test_preserves_arrival_order(self) -> None:
         items: list[dict[str, object]] = [
-            {"message_id": "m3", "text": "c"},
-            {"message_id": "m1", "text": "a"},
-            {"message_id": "m2", "text": "b"},
+            {"channel_message_id": "m3", "raw_message_id": 103, "text": "c"},
+            {"channel_message_id": "m1", "raw_message_id": 101, "text": "a"},
+            {"channel_message_id": "m2", "raw_message_id": 102, "text": "b"},
         ]
         _, message_ids = prepare_items(items)
-        assert message_ids == ["m3", "m1", "m2"]
+        assert message_ids == ["103", "101", "102"]
 
     def test_extracts_message_ids(self) -> None:
         items: list[dict[str, object]] = [
-            {"message_id": "m1", "text": "hello"},
-            {"message_id": "m2", "text": "world"},
+            {"channel_message_id": "m1", "raw_message_id": 101, "text": "hello"},
+            {"channel_message_id": "m2", "raw_message_id": 102, "text": "world"},
         ]
         _, message_ids = prepare_items(items)
-        assert message_ids == ["m1", "m2"]
+        assert message_ids == ["101", "102"]
 
     def test_handles_missing_message_id(self) -> None:
         items: list[dict[str, object]] = [
             {"text": "hello"},
-            {"message_id": "m2", "text": "world"},
+            {"channel_message_id": "m2", "raw_message_id": 102, "text": "world"},
         ]
         _, message_ids = prepare_items(items)
-        assert message_ids == ["m2"]
+        assert message_ids == ["102"]
 
     def test_voice_and_text_mixed(self) -> None:
         items: list[dict[str, object]] = [
-            {"message_id": "m1", "kind": "voice"},
-            {"message_id": "m2", "kind": "text", "text": "hello"},
-            {"message_id": "m3", "kind": "voice"},
+            {"channel_message_id": "m1", "raw_message_id": 101, "kind": "voice"},
+            {
+                "channel_message_id": "m2",
+                "raw_message_id": 102,
+                "kind": "text",
+                "text": "hello",
+            },
+            {"channel_message_id": "m3", "raw_message_id": 103, "kind": "voice"},
         ]
         result, _ = prepare_items(items)
         assert result[0]["was_audio"] is True
@@ -299,7 +337,19 @@ class TestPersistBatch:
         row_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
         row = await fake_store.get(batch_id=row_id, tenant_id=1)
         assert row is not None
-        assert row.message_ids == ["m1", "m2"]
+        assert row.message_ids == ["101", "102"]
+
+    @pytest.mark.asyncio
+    async def test_retry_reuses_batch_for_same_drain(
+        self, cipher: ColumnCipher, fake_store: FakeBatchStore
+    ) -> None:
+        drain = _make_drain()
+
+        first_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
+        retry_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
+
+        assert retry_id == first_id
+        assert len(fake_store._rows) == 1
 
     @pytest.mark.asyncio
     async def test_key_version_matches_cipher(
@@ -316,8 +366,13 @@ class TestPersistBatch:
         self, cipher: ColumnCipher, fake_store: FakeBatchStore
     ) -> None:
         items: list[dict[str, object]] = [
-            {"message_id": "m1", "kind": "voice"},
-            {"message_id": "m2", "kind": "text", "text": "hello"},
+            {"channel_message_id": "m1", "raw_message_id": 101, "kind": "voice"},
+            {
+                "channel_message_id": "m2",
+                "raw_message_id": 102,
+                "kind": "text",
+                "text": "hello",
+            },
         ]
         drain = _make_drain(items)
         row_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
@@ -356,6 +411,7 @@ class TestProcessBatch:
         cipher: ColumnCipher,
         fake_redis: FakeRedis,
         fake_store: FakeBatchStore,
+        fake_enqueuer: FakeBatchEnqueuer,
     ) -> None:
         drain = _make_drain()
         row_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
@@ -363,8 +419,9 @@ class TestProcessBatch:
         await process_batch(
             tenant_id=1,
             batch_id=row_id,
-            redis=fake_redis,  # type: ignore[arg-type]
-            store=fake_store,  # type: ignore[arg-type]
+            redis=fake_redis,
+            store=fake_store,
+            enqueuer=fake_enqueuer,
         )
 
         row = await fake_store.get(batch_id=row_id, tenant_id=1)
@@ -381,6 +438,7 @@ class TestProcessBatch:
         cipher: ColumnCipher,
         fake_redis: FakeRedis,
         fake_store: FakeBatchStore,
+        fake_enqueuer: FakeBatchEnqueuer,
     ) -> None:
         drain = _make_drain()
         row_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
@@ -389,15 +447,17 @@ class TestProcessBatch:
         await process_batch(
             tenant_id=1,
             batch_id=row_id,
-            redis=fake_redis,  # type: ignore[arg-type]
-            store=fake_store,  # type: ignore[arg-type]
+            redis=fake_redis,
+            store=fake_store,
+            enqueuer=fake_enqueuer,
         )
         # Process again — idempotent
         await process_batch(
             tenant_id=1,
             batch_id=row_id,
-            redis=fake_redis,  # type: ignore[arg-type]
-            store=fake_store,  # type: ignore[arg-type]
+            redis=fake_redis,
+            store=fake_store,
+            enqueuer=fake_enqueuer,
         )
 
         row = await fake_store.get(batch_id=row_id, tenant_id=1)
@@ -407,11 +467,12 @@ class TestProcessBatch:
         assert row.attempts == 1
 
     @pytest.mark.asyncio
-    async def test_raises_on_lock_contention(
+    async def test_defers_on_lock_contention(
         self,
         cipher: ColumnCipher,
         fake_redis: FakeRedis,
         fake_store: FakeBatchStore,
+        fake_enqueuer: FakeBatchEnqueuer,
     ) -> None:
         drain = _make_drain()
         row_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
@@ -419,31 +480,60 @@ class TestProcessBatch:
         # Pre-acquire the lock to simulate contention
         await fake_redis.set("lock:1", "other-worker", ex=120, nx=True)
 
-        with pytest.raises(RuntimeError, match="could not acquire lock"):
-            await process_batch(
-                tenant_id=1,
-                batch_id=row_id,
-                redis=fake_redis,  # type: ignore[arg-type]
-                store=fake_store,  # type: ignore[arg-type]
-            )
+        await process_batch(
+            tenant_id=1,
+            batch_id=row_id,
+            redis=fake_redis,
+            store=fake_store,
+            enqueuer=fake_enqueuer,
+        )
 
         # Batch status unchanged
         row = await fake_store.get(batch_id=row_id, tenant_id=1)
         assert row is not None
         assert row.status == "pending"
+        assert fake_enqueuer.calls == [(1, row_id, 5)]
+
+    @pytest.mark.asyncio
+    async def test_skips_failed_batch(
+        self,
+        cipher: ColumnCipher,
+        fake_redis: FakeRedis,
+        fake_store: FakeBatchStore,
+        fake_enqueuer: FakeBatchEnqueuer,
+    ) -> None:
+        row_id = await persist_batch(
+            drain=_make_drain(), tenant_id=1, cipher=cipher, store=fake_store
+        )
+        fake_store._rows[row_id].status = "failed"
+
+        await process_batch(
+            tenant_id=1,
+            batch_id=row_id,
+            redis=fake_redis,
+            store=fake_store,
+            enqueuer=fake_enqueuer,
+        )
+
+        row = await fake_store.get(batch_id=row_id, tenant_id=1)
+        assert row is not None
+        assert row.status == "failed"
+        assert row.attempts == 0
 
     @pytest.mark.asyncio
     async def test_missing_batch_returns_without_error(
         self,
         fake_redis: FakeRedis,
         fake_store: FakeBatchStore,
+        fake_enqueuer: FakeBatchEnqueuer,
     ) -> None:
         # No batch exists, should return without error
         await process_batch(
             tenant_id=1,
             batch_id=999,
-            redis=fake_redis,  # type: ignore[arg-type]
-            store=fake_store,  # type: ignore[arg-type]
+            redis=fake_redis,
+            store=fake_store,
+            enqueuer=fake_enqueuer,
         )
 
     @pytest.mark.asyncio
@@ -452,6 +542,7 @@ class TestProcessBatch:
         cipher: ColumnCipher,
         fake_redis: FakeRedis,
         fake_store: FakeBatchStore,
+        fake_enqueuer: FakeBatchEnqueuer,
     ) -> None:
         drain = _make_drain()
         row_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
@@ -460,8 +551,9 @@ class TestProcessBatch:
         await process_batch(
             tenant_id=999,
             batch_id=row_id,
-            redis=fake_redis,  # type: ignore[arg-type]
-            store=fake_store,  # type: ignore[arg-type]
+            redis=fake_redis,
+            store=fake_store,
+            enqueuer=fake_enqueuer,
         )
 
         # Original batch unchanged
@@ -490,14 +582,15 @@ class TestEndToEnd:
 
         # Step 2: enqueue (simulated)
         await fake_enqueuer.enqueue_process_batch(tenant_id=1, batch_id=row_id)
-        assert fake_enqueuer.calls == [(1, row_id)]
+        assert fake_enqueuer.calls == [(1, row_id, 0)]
 
         # Step 3: process batch
         await process_batch(
             tenant_id=1,
             batch_id=row_id,
-            redis=fake_redis,  # type: ignore[arg-type]
-            store=fake_store,  # type: ignore[arg-type]
+            redis=fake_redis,
+            store=fake_store,
+            enqueuer=fake_enqueuer,
         )
 
         row = await fake_store.get(batch_id=row_id, tenant_id=1)
@@ -510,6 +603,7 @@ class TestEndToEnd:
         cipher: ColumnCipher,
         fake_redis: FakeRedis,
         fake_store: FakeBatchStore,
+        fake_enqueuer: FakeBatchEnqueuer,
     ) -> None:
         """Re-processing the same batch_id does not duplicate work."""
         drain = _make_drain()
@@ -519,15 +613,17 @@ class TestEndToEnd:
         await process_batch(
             tenant_id=1,
             batch_id=row_id,
-            redis=fake_redis,  # type: ignore[arg-type]
-            store=fake_store,  # type: ignore[arg-type]
+            redis=fake_redis,
+            store=fake_store,
+            enqueuer=fake_enqueuer,
         )
         # Retry — should be idempotent
         await process_batch(
             tenant_id=1,
             batch_id=row_id,
-            redis=fake_redis,  # type: ignore[arg-type]
-            store=fake_store,  # type: ignore[arg-type]
+            redis=fake_redis,
+            store=fake_store,
+            enqueuer=fake_enqueuer,
         )
 
         row = await fake_store.get(batch_id=row_id, tenant_id=1)

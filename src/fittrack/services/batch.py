@@ -25,7 +25,12 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from fittrack.security.crypto import ColumnCipher, column_aad
-from fittrack.services.debounce import DrainResult, RedisWorkerClient, tenant_lock
+from fittrack.services.debounce import (
+    LOCK_RETRY_DELAY_S,
+    DrainResult,
+    RedisWorkerClient,
+    tenant_lock,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +81,12 @@ class BatchStore(Protocol):
         """Insert a ``processing_batch`` row with the reserved id."""
         ...
 
+    async def find_by_message_ids(
+        self, *, tenant_id: int, message_ids: list[str]
+    ) -> BatchRow | None:
+        """Find the batch already persisted for the same Redis drain."""
+        ...
+
     async def get(self, *, batch_id: int, tenant_id: int) -> BatchRow | None:
         """Load a batch row, or ``None`` if not found."""
         ...
@@ -88,7 +99,9 @@ class BatchStore(Protocol):
 class BatchEnqueuer(Protocol):
     """Enqueue a ``process_batch`` job without exposing ARQ."""
 
-    async def enqueue_process_batch(self, *, tenant_id: int, batch_id: int) -> None: ...
+    async def enqueue_process_batch(
+        self, *, tenant_id: int, batch_id: int, delay_s: int = 0
+    ) -> None: ...
 
 
 # ─── Pure helpers ──────────────────────────────────────────────────────────
@@ -99,14 +112,16 @@ def prepare_items(
 ) -> tuple[list[dict[str, object]], list[str]]:
     """Mark voice items ``was_audio=True`` and extract message ids.
 
-    Preserves arrival order (§4.1).  Items without ``message_id`` are
+    Preserves arrival order (§4.1).  Items without ``raw_message_id`` are
     kept in the list but excluded from ``message_ids``.
     """
     message_ids: list[str] = []
     for item in items:
         if item.get("kind") == "voice":
             item["was_audio"] = True
-        msg_id = item.get("message_id")
+        # This is globally unique across channels and remains stable when an
+        # orphaned Redis drain is retried.
+        msg_id = item.get("raw_message_id")
         if msg_id is not None:
             message_ids.append(str(msg_id))
     return items, message_ids
@@ -128,6 +143,21 @@ async def persist_batch(
     before the combined text is encrypted (acceptance criterion T05).
     """
     items, message_ids = prepare_items(drain.items)
+
+    # The drain is acknowledged only after enqueue succeeds. If enqueue failed
+    # after the insert, the next flush retry repairs the handoff by reusing the
+    # row identified by the same ordered raw-message ids.
+    if message_ids:
+        existing = await store.find_by_message_ids(
+            tenant_id=tenant_id,
+            message_ids=message_ids,
+        )
+        if existing is not None:
+            logger.info(
+                "batch already persisted, reusing",
+                extra={"tenant_id": tenant_id, "batch_id": existing.id},
+            )
+            return existing.id
 
     # JSON-encode items in arrival order — no concatenation (§9.3)
     combined_bytes = json.dumps(items, ensure_ascii=False).encode()
@@ -166,6 +196,7 @@ async def process_batch(
     batch_id: int,
     redis: RedisWorkerClient,
     store: BatchStore,
+    enqueuer: BatchEnqueuer,
 ) -> None:
     """Process a persisted batch.
 
@@ -180,7 +211,12 @@ async def process_batch(
     """
     async with tenant_lock(redis, tenant_id) as token:
         if token is None:
-            raise RuntimeError(f"could not acquire lock for tenant {tenant_id}")
+            await enqueuer.enqueue_process_batch(
+                tenant_id=tenant_id,
+                batch_id=batch_id,
+                delay_s=LOCK_RETRY_DELAY_S,
+            )
+            return
 
         row = await store.get(batch_id=batch_id, tenant_id=tenant_id)
         if row is None:
@@ -190,10 +226,14 @@ async def process_batch(
             )
             return
 
-        if row.status == "done":
+        if row.status != "pending":
             logger.info(
-                "batch already done, skipping",
-                extra={"tenant_id": tenant_id, "batch_id": batch_id},
+                "batch is terminal, skipping",
+                extra={
+                    "tenant_id": tenant_id,
+                    "batch_id": batch_id,
+                    "batch_status": row.status,
+                },
             )
             return
 

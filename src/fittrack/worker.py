@@ -25,6 +25,7 @@ from arq import ArqRedis
 from fittrack.runtime import DEFAULT_INTERVAL_S, heartbeat_loop, run_until_signalled
 from fittrack.services.batch import persist_batch as _persist_batch
 from fittrack.services.batch import process_batch as _process_batch
+from fittrack.services.debounce import DrainResult
 from fittrack.services.debounce import flush_check as _flush_check
 from fittrack.startup import startup
 
@@ -74,12 +75,18 @@ class ArqBatchEnqueuer:
     def __init__(self, pool: ArqRedis) -> None:
         self._pool = pool
 
-    async def enqueue_process_batch(self, *, tenant_id: int, batch_id: int) -> None:
+    async def enqueue_process_batch(
+        self, *, tenant_id: int, batch_id: int, delay_s: int = 0
+    ) -> None:
+        job_id = f"batch:{batch_id}"
+        queue = self._pool.default_queue_name
+        await self._pool.delete(f"{queue}:{job_id}", f"{queue}:result:{job_id}")
         await self._pool.enqueue_job(
             "process_batch",
             tenant_id,
             batch_id,
-            _job_id=f"batch:{batch_id}",
+            _job_id=job_id,
+            _defer_by=timedelta(seconds=delay_s) if delay_s else None,
         )
 
 
@@ -99,24 +106,26 @@ async def flush_check(ctx: dict[str, Any], tenant_id: int) -> None:
     settings = get_settings()
     redis: ArqRedis = ctx["redis"]
     scheduler = ArqFlushScheduler(redis)
-    result = await _flush_check(
-        tenant_id=tenant_id,
-        redis=redis,  # type: ignore[arg-type]  # ArqRedis vs Protocol impedance
-        scheduler=scheduler,
-        debounce_window_s=settings.debounce_window_s,
-    )
+    cipher = ColumnCipher(Keyring.from_settings(settings))
+    store = ctx["batch_store"]
+    enqueuer = ArqBatchEnqueuer(redis)
 
-    if result is not None:
-        cipher = ColumnCipher(Keyring.from_settings(settings))
-        store = ctx["batch_store"]
+    async def persist_and_enqueue(result: DrainResult) -> None:
         batch_id = await _persist_batch(
             drain=result,
             tenant_id=tenant_id,
             cipher=cipher,
             store=store,
         )
-        enqueuer = ArqBatchEnqueuer(redis)
         await enqueuer.enqueue_process_batch(tenant_id=tenant_id, batch_id=batch_id)
+
+    await _flush_check(
+        tenant_id=tenant_id,
+        redis=redis,  # type: ignore[arg-type]  # ArqRedis vs Protocol impedance
+        scheduler=scheduler,
+        debounce_window_s=settings.debounce_window_s,
+        drain_handler=persist_and_enqueue,
+    )
 
 
 async def process_batch(ctx: dict[str, Any], tenant_id: int, batch_id: int) -> None:
@@ -130,11 +139,13 @@ async def process_batch(ctx: dict[str, Any], tenant_id: int, batch_id: int) -> N
     """
     redis: ArqRedis = ctx["redis"]
     store = ctx["batch_store"]
+    enqueuer = ArqBatchEnqueuer(redis)
     await _process_batch(
         tenant_id=tenant_id,
         batch_id=batch_id,
         redis=redis,  # type: ignore[arg-type]  # ArqRedis vs Protocol impedance
         store=store,
+        enqueuer=enqueuer,
     )
 
 

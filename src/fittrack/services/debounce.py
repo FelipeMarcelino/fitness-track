@@ -15,7 +15,7 @@ import contextlib
 import json
 import logging
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Protocol
@@ -67,6 +67,9 @@ class DrainResult:
 
     batch_id: str
     items: list[dict[str, object]]
+
+
+DrainHandler = Callable[[DrainResult], Awaitable[None]]
 
 
 # ─── Lua scripts ────────────────────────────────────────────────────────────
@@ -178,11 +181,24 @@ async def drain_buffer(
     drain_key = f"drain:{tenant_id}"
 
     items_raw = await redis.lrange(drain_key, 0, -1)
-    await redis.delete(drain_key)
-
     if not items_raw:
         return None  # pragma: no cover — caller ensures drain key exists
 
+    items: list[dict[str, object]] = [json.loads(item) for item in items_raw]
+    result = DrainResult(batch_id=uuid.uuid4().hex, items=items)
+    await redis.delete(drain_key)
+    return result
+
+
+async def _read_drain(redis: RedisWorkerClient, tenant_id: int) -> DrainResult | None:
+    """Read a drain without acknowledging it.
+
+    The worker uses this lease-like operation so a database or queue failure
+    leaves ``drain:{tenant_id}`` available to the next ``flush_check`` retry.
+    """
+    items_raw = await redis.lrange(f"drain:{tenant_id}", 0, -1)
+    if not items_raw:
+        return None
     items: list[dict[str, object]] = [json.loads(item) for item in items_raw]
     return DrainResult(batch_id=uuid.uuid4().hex, items=items)
 
@@ -196,6 +212,7 @@ async def flush_check(
     redis: RedisWorkerClient,
     scheduler: FlushScheduler,
     debounce_window_s: int,
+    drain_handler: DrainHandler | None = None,
 ) -> DrainResult | None:
     """The debounce gate: re-enqueue while the tenant types, drain when silent.
 
@@ -243,5 +260,13 @@ async def flush_check(
         if status == _DRAIN_EMPTY:
             return None
 
-        # status == _DRAIN_RENAMED or _DRAIN_ORPHAN → read and clean
-        return await drain_buffer(redis, tenant_id)
+        # Keep the drain until persistence and enqueue both succeed. An
+        # exception deliberately leaves it behind for the next retry.
+        result = await _read_drain(redis, tenant_id)
+        if result is None:  # pragma: no cover — the key is expected to contain items
+            await redis.delete(drain_key)
+            return None
+        if drain_handler is not None:
+            await drain_handler(result)
+        await redis.delete(drain_key)
+        return result

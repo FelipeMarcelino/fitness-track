@@ -9,11 +9,14 @@ import asyncio
 import json
 from dataclasses import dataclass, field
 
+import pytest
+
 from fittrack.services.debounce import (
     _EXTEND_LOCK,
     _GATED_DRAIN,
     _RELEASE_LOCK,
     LOCK_RETRY_DELAY_S,
+    DrainResult,
     drain_buffer,
     flush_check,
     tenant_lock,
@@ -227,6 +230,49 @@ async def test_drain_key_is_cleaned_up_after_reading() -> None:
     assert result is not None
     drain_keys = [k for k in redis._data if k.startswith("drain:")]
     assert drain_keys == []
+
+
+async def test_drain_is_acknowledged_only_after_handler_succeeds() -> None:
+    """A failed persistence/enqueue handoff must leave the drain recoverable."""
+    redis = FakeRedis()
+    scheduler = FakeScheduler()
+    await redis.rpush("buffer:1", _buffer_item(1), _buffer_item(2))
+    handled: list[list[int]] = []
+
+    async def fail_handoff(result: DrainResult) -> None:
+        del result
+        assert len(await redis.lrange("drain:1", 0, -1)) == 2
+        raise ConnectionError("database unavailable")
+
+    with pytest.raises(ConnectionError, match="database unavailable"):
+        await flush_check(
+            tenant_id=1,
+            redis=redis,
+            scheduler=scheduler,
+            debounce_window_s=10,
+            drain_handler=fail_handoff,
+        )
+
+    assert len(await redis.lrange("drain:1", 0, -1)) == 2
+
+    async def complete_handoff(result: DrainResult) -> None:
+        raw_ids: list[int] = []
+        for item in result.items:
+            raw_message_id = item["raw_message_id"]
+            assert isinstance(raw_message_id, int)
+            raw_ids.append(raw_message_id)
+        handled.append(raw_ids)
+
+    await flush_check(
+        tenant_id=1,
+        redis=redis,
+        scheduler=scheduler,
+        debounce_window_s=10,
+        drain_handler=complete_handoff,
+    )
+
+    assert handled == [[1, 2]]
+    assert await redis.lrange("drain:1", 0, -1) == []
 
 
 # ═══════════════════════════════════════════════════════════════════════════
