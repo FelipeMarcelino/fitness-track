@@ -280,6 +280,50 @@ async def test_retry_after_is_persisted_as_the_literal_next_retry_time() -> None
 
 
 @pytest.mark.parametrize(
+    ("accumulated_attempts", "expected_status"),
+    [(4, DeliveryStatus.RETRY), (5, DeliveryStatus.DEAD)],
+)
+async def test_deliver_enforces_the_retry_cap_from_accumulated_attempts(
+    accumulated_attempts: int,
+    expected_status: DeliveryStatus,
+) -> None:
+    store = FakeStore()
+    result = await service(store).deliver(
+        item=item(attempts=accumulated_attempts),
+        identity=IDENTITY,
+        channel=StubChannel(ClassifiedError(ErrorClass.RETRY_BACKOFF, code="503")),
+    )
+
+    assert result.status is expected_status
+    assert result.attempts == accumulated_attempts + 1
+    assert bool(store.retried) is (expected_status is DeliveryStatus.RETRY)
+    assert bool(store.dead) is (expected_status is DeliveryStatus.DEAD)
+
+
+async def test_deliver_acquires_the_identity_rate_limit_before_sending() -> None:
+    events: list[tuple[str, int]] = []
+
+    class OrderedLimiter:
+        async def acquire(self, identity_id: int) -> None:
+            events.append(("acquire", identity_id))
+
+    class OrderedChannel(StubChannel):
+        async def send(self, identity: ChannelIdentity, block: OutboundBlock) -> SendReceipt:
+            events.append(("send", identity.identity_id))
+            return await super().send(identity, block)
+
+    outbound = OutboundService(
+        store=FakeStore(),
+        rate_limiter=OrderedLimiter(),
+        now=lambda: NOW,
+        jitter=lambda: 0.0,
+    )
+    await outbound.deliver(item=item(), identity=IDENTITY, channel=OrderedChannel())
+
+    assert events == [("acquire", 41), ("send", 41)]
+
+
+@pytest.mark.parametrize(
     ("verdict", "expected_code"),
     [
         (ClassifiedError(ErrorClass.UNDELIVERABLE, code="403"), "403"),
