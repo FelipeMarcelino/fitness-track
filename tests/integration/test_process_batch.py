@@ -10,11 +10,13 @@ import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import asyncpg
 import pytest
 from arq import ArqRedis, Retry
+from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -38,6 +40,7 @@ from fittrack.services.debounce import (
     _RELEASE_LOCK,
     DrainResult,
 )
+from fittrack.settings import Settings
 from tests.conftest import CA_FILE
 
 # ─── Fakes ──────────────────────────────────────────────────────────────────
@@ -683,16 +686,49 @@ async def test_worker_startup_injects_postgres_batch_store(
 ) -> None:
     engine = cast(AsyncEngine, object())
     sessions = cast(async_sessionmaker[AsyncSession], object())
-    monkeypatch.setattr(worker_module, "get_engine", lambda: engine)
+    settings = cast(Settings, object())
+    startup_calls: list[str] = []
+
+    def validated_startup(service: str) -> tuple[Settings, object]:
+        startup_calls.append(service)
+        return settings, object()
+
+    monkeypatch.setattr(worker_module, "startup", validated_startup)
+    monkeypatch.setattr(
+        worker_module,
+        "get_engine",
+        lambda received: engine if received is settings else pytest.fail("wrong settings"),
+    )
     monkeypatch.setattr(worker_module, "session_factory", lambda _: sessions)
     ctx: dict[str, object] = {}
 
     await worker_module.worker_startup(ctx)
 
+    assert startup_calls == ["worker"]
     assert ctx["db_engine"] is engine
     store = ctx["batch_store"]
     assert isinstance(store, PostgresBatchStore)
     assert store._sessions is sessions
+
+
+def test_arq_redis_settings_use_validated_url_and_ca() -> None:
+    settings = cast(
+        Settings,
+        SimpleNamespace(
+            redis_url=SecretStr("rediss://:secret@redis.internal:6380/3"),
+            fittrack_tls_ca_file="/certs/ca.crt",
+        ),
+    )
+
+    redis = worker_module.build_redis_settings(settings)
+
+    assert redis.host == "redis.internal"
+    assert redis.port == 6380
+    assert redis.database == 3
+    assert redis.password == "secret"
+    assert redis.ssl is True
+    assert redis.ssl_ca_certs == "/certs/ca.crt"
+    assert redis.ssl_check_hostname is True
 
 
 def test_worker_settings_register_batch_retry_policy() -> None:
@@ -701,6 +737,8 @@ def test_worker_settings_register_batch_retry_policy() -> None:
     assert registered["process_batch"].max_tries == 3
     assert registered["process_batch"].keep_result_s == 0
     assert worker_module.WorkerSettings.on_startup is worker_module.worker_startup
+    assert worker_module.WorkerSettings.redis_settings.ssl is True
+    assert worker_module.WorkerSettings.redis_settings.ssl_check_hostname is True
 
 
 @pytest.mark.asyncio

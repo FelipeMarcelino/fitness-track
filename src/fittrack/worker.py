@@ -16,11 +16,13 @@ to ``arq fittrack.worker.WorkerSettings`` during bootstrap integration.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, ClassVar
 
 from arq import ArqRedis, Retry, func
+from arq.connections import RedisSettings
 from arq.worker import Function
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -31,9 +33,21 @@ from fittrack.services.batch import persist_batch as _persist_batch
 from fittrack.services.batch import process_batch as _process_batch
 from fittrack.services.debounce import LOCK_RETRY_DELAY_S, DrainResult
 from fittrack.services.debounce import flush_check as _flush_check
+from fittrack.settings import Settings, get_settings
 from fittrack.startup import startup
 
 HEARTBEAT = Path("/tmp/fittrack-worker.hb")
+
+
+def build_redis_settings(settings: Settings | None = None) -> RedisSettings:
+    """Translate the validated Redis URL and trust root into ARQ settings."""
+    config = settings or get_settings()
+    redis = RedisSettings.from_dsn(config.redis_url.get_secret_value())
+    return replace(
+        redis,
+        ssl_ca_certs=config.fittrack_tls_ca_file,
+        ssl_check_hostname=True,
+    )
 
 
 class ArqFlushScheduler:
@@ -91,8 +105,9 @@ class ArqBatchEnqueuer:
 
 
 async def worker_startup(ctx: dict[str, Any]) -> None:
-    """Inject durable database dependencies into the ARQ worker context."""
-    engine = get_engine()
+    """Validate configuration and inject durable ARQ worker dependencies."""
+    settings, _ = startup("worker")
+    engine = get_engine(settings)
     ctx["db_engine"] = engine
     ctx["batch_store"] = PostgresBatchStore(session_factory(engine))
 
@@ -177,6 +192,7 @@ class WorkerSettings:
         func(flush_check, keep_result=0),
         func(process_batch, keep_result=0, max_tries=3),
     ]
+    redis_settings = build_redis_settings()
     queue_name = "arq:queue"
     max_jobs = 10
     job_timeout = 90
