@@ -9,12 +9,15 @@ import asyncio
 import json
 from dataclasses import dataclass, field
 
+import pytest
+
 from fittrack.services.debounce import (
     _EXTEND_LOCK,
     _GATED_DRAIN,
     _RELEASE_LOCK,
     LOCK_RETRY_DELAY_S,
-    drain_buffer,
+    DrainResult,
+    _read_drain,
     flush_check,
     tenant_lock,
 )
@@ -229,6 +232,49 @@ async def test_drain_key_is_cleaned_up_after_reading() -> None:
     assert drain_keys == []
 
 
+async def test_drain_is_acknowledged_only_after_handler_succeeds() -> None:
+    """A failed persistence/enqueue handoff must leave the drain recoverable."""
+    redis = FakeRedis()
+    scheduler = FakeScheduler()
+    await redis.rpush("buffer:1", _buffer_item(1), _buffer_item(2))
+    handled: list[list[int]] = []
+
+    async def fail_handoff(result: DrainResult) -> None:
+        del result
+        assert len(await redis.lrange("drain:1", 0, -1)) == 2
+        raise ConnectionError("database unavailable")
+
+    with pytest.raises(ConnectionError, match="database unavailable"):
+        await flush_check(
+            tenant_id=1,
+            redis=redis,
+            scheduler=scheduler,
+            debounce_window_s=10,
+            drain_handler=fail_handoff,
+        )
+
+    assert len(await redis.lrange("drain:1", 0, -1)) == 2
+
+    async def complete_handoff(result: DrainResult) -> None:
+        raw_ids: list[int] = []
+        for item in result.items:
+            raw_message_id = item["raw_message_id"]
+            assert isinstance(raw_message_id, int)
+            raw_ids.append(raw_message_id)
+        handled.append(raw_ids)
+
+    await flush_check(
+        tenant_id=1,
+        redis=redis,
+        scheduler=scheduler,
+        debounce_window_s=10,
+        drain_handler=complete_handoff,
+    )
+
+    assert handled == [[1, 2]]
+    assert await redis.lrange("drain:1", 0, -1) == []
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Orphan recovery — drain key survives crash (§17.3)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -358,36 +404,44 @@ async def test_new_messages_after_rename_go_to_fresh_buffer() -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# drain_buffer — isolated tests
+# _read_drain — isolated tests
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-async def test_drain_buffer_returns_items_in_order() -> None:
+async def test_read_drain_returns_items_in_order() -> None:
     redis = FakeRedis()
-    # drain_buffer reads from drain:{tenant_id} (populated by _GATED_DRAIN)
+    # _read_drain reads from drain:{tenant_id} (populated by _GATED_DRAIN)
     await redis.rpush("drain:42", _buffer_item(10), _buffer_item(20), _buffer_item(30))
 
-    result = await drain_buffer(redis, tenant_id=42)
+    result = await _read_drain(redis, tenant_id=42)
 
     assert result is not None
     assert [item["raw_message_id"] for item in result.items] == [10, 20, 30]
 
 
-async def test_drain_buffer_returns_none_when_drain_absent() -> None:
+async def test_read_drain_leaves_the_key_for_the_caller_to_acknowledge() -> None:
+    redis = FakeRedis()
+    await redis.rpush("drain:42", _buffer_item(10))
+
+    assert await _read_drain(redis, tenant_id=42) is not None
+
+    assert len(await redis.lrange("drain:42", 0, -1)) == 1
+
+
+async def test_read_drain_returns_none_when_drain_absent() -> None:
     redis = FakeRedis()
 
-    result = await drain_buffer(redis, tenant_id=42)
+    result = await _read_drain(redis, tenant_id=42)
 
     assert result is None
 
 
-async def test_drain_buffer_generates_unique_batch_id() -> None:
+async def test_read_drain_generates_unique_batch_id() -> None:
     redis = FakeRedis()
     await redis.rpush("drain:1", _buffer_item(1))
-    result_a = await drain_buffer(redis, tenant_id=1)
 
-    await redis.rpush("drain:1", _buffer_item(2))
-    result_b = await drain_buffer(redis, tenant_id=1)
+    result_a = await _read_drain(redis, tenant_id=1)
+    result_b = await _read_drain(redis, tenant_id=1)
 
     assert result_a is not None and result_b is not None
     assert result_a.batch_id != result_b.batch_id
