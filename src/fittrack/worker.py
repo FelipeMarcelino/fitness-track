@@ -1,17 +1,80 @@
-"""Worker (spec 3.1): runs the LangGraph graph, once there is one.
+"""Worker (spec 3.1): ARQ consumer for flush_check and future process_batch.
 
-Today it only proves it is alive. Workers are stateless by contract, so the
-heartbeat lives in the container's own filesystem and means nothing outside it.
+Workers are stateless by contract (CLAUDE.md, invariant 5). State lives in
+Postgres, Redis and Qdrant; any worker processes any job.
+
+The heartbeat proves liveness to the container runtime. The ARQ functions
+are the actual work: flush_check drains tenant buffers after the debounce
+window closes (S02-T04), and process_batch will drive the LangGraph graph
+(S02-T05, Sprint 03).
+
+NOTE: The production entry point (main → run_until_signalled) does not yet
+start an ARQ consumer. WorkerSettings and ``arq fittrack.worker.WorkerSettings``
+wiring is completed in S02-T08 (bootstrap and pipeline integration).
 """
 
 from __future__ import annotations
 
+from datetime import timedelta
 from pathlib import Path
+from typing import Any
+
+from arq import ArqRedis
 
 from fittrack.runtime import DEFAULT_INTERVAL_S, heartbeat_loop, run_until_signalled
+from fittrack.services.debounce import flush_check as _flush_check
 from fittrack.startup import startup
 
 HEARTBEAT = Path("/tmp/fittrack-worker.hb")
+
+
+class ArqFlushScheduler:
+    """``FlushScheduler`` backed by ARQ's job queue.
+
+    Uses a stable ``_job_id`` of ``flush:{tenant_id}`` so that renewals
+    from the ingress replace instead of accumulating jobs (spec §17.1).
+
+    Before enqueueing, existing job/result keys are deleted so that
+    re-enqueue from within the running handler succeeds — ARQ 0.26
+    silently drops ``enqueue_job`` when the ``_job_id`` key already exists.
+    """
+
+    def __init__(self, pool: ArqRedis) -> None:
+        self._pool = pool
+
+    async def schedule_flush_check(self, *, tenant_id: int, delay_s: int) -> None:
+        job_id = f"flush:{tenant_id}"
+        # ARQ 0.26 blocks enqueue_job when the job or result key exists.
+        # When called from inside the running handler, the current job key
+        # blocks re-enqueue.  Deleting it allows the deferred replacement.
+        # This is safe: the worker has already loaded the job payload.
+        queue = self._pool.default_queue_name
+        await self._pool.delete(f"{queue}:{job_id}", f"{queue}:result:{job_id}")
+        await self._pool.enqueue_job(
+            "flush_check",
+            tenant_id,
+            _job_id=job_id,
+            _defer_by=timedelta(seconds=delay_s),
+        )
+
+
+async def flush_check(ctx: dict[str, Any], tenant_id: int) -> None:
+    """ARQ entry point for the debounce gate (S02-T04).
+
+    Registered with ``keep_result=0`` so the stable job id is immediately
+    reusable after the function completes.
+    """
+    from fittrack.settings import get_settings
+
+    settings = get_settings()
+    redis: ArqRedis = ctx["redis"]
+    scheduler = ArqFlushScheduler(redis)
+    await _flush_check(
+        tenant_id=tenant_id,
+        redis=redis,  # type: ignore[arg-type]  # ArqRedis vs Protocol impedance
+        scheduler=scheduler,
+        debounce_window_s=settings.debounce_window_s,
+    )
 
 
 async def run(heartbeat: Path = HEARTBEAT, interval_s: float = DEFAULT_INTERVAL_S) -> None:
