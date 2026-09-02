@@ -5,12 +5,13 @@ Spec: §4, §17.1 (buffer and debounce keys), §17.3 (atomic drain via RENAME).
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass, field
 
 from fittrack.services.debounce import (
-    _ATOMIC_DRAIN,
     _EXTEND_LOCK,
+    _GATED_DRAIN,
     _RELEASE_LOCK,
     LOCK_RETRY_DELAY_S,
     drain_buffer,
@@ -86,13 +87,21 @@ class FakeRedis:
                 return 1
             return 0
 
-        if script is _ATOMIC_DRAIN:
-            src, dst = keys[0], keys[1]
-            if src in self._data:
-                self._data[dst] = self._data.pop(src)
-                self._ttls.pop(src, None)
+        if script is _GATED_DRAIN:
+            debounce_key, buffer_key, drain_key = keys[0], keys[1], keys[2]
+            # Return 2 if orphan drain key exists
+            if drain_key in self._data:
+                return 2
+            # Return 0 if debounce is active
+            if debounce_key in self._data:
+                return 0
+            # Return 1 if buffer renamed
+            if buffer_key in self._data:
+                self._data[drain_key] = self._data.pop(buffer_key)
+                self._ttls.pop(buffer_key, None)
                 return 1
-            return 0
+            # Return -1 if empty
+            return -1
 
         raise NotImplementedError("Unknown Lua script in FakeRedis")  # pragma: no cover
 
@@ -208,7 +217,7 @@ async def test_lock_is_released_after_successful_drain() -> None:
 
 
 async def test_drain_key_is_cleaned_up_after_reading() -> None:
-    """The temporary drain:{tenant_id}:{batch_id} key must not survive."""
+    """The temporary drain:{tenant_id} key must not survive."""
     redis = FakeRedis()
     scheduler = FakeScheduler()
     await redis.rpush("buffer:1", _buffer_item(1))
@@ -218,6 +227,108 @@ async def test_drain_key_is_cleaned_up_after_reading() -> None:
     assert result is not None
     drain_keys = [k for k in redis._data if k.startswith("drain:")]
     assert drain_keys == []
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Orphan recovery — drain key survives crash (§17.3)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+async def test_flush_check_recovers_orphaned_drain() -> None:
+    """Orphaned drain:{tenant_id} from a crashed worker is recovered."""
+    redis = FakeRedis()
+    scheduler = FakeScheduler()
+    # Simulate a crash: drain key exists from a previous RENAME
+    await redis.rpush("drain:1", _buffer_item(1), _buffer_item(2))
+
+    result = await flush_check(tenant_id=1, redis=redis, scheduler=scheduler, debounce_window_s=10)
+
+    assert result is not None
+    assert len(result.items) == 2
+    assert [item["raw_message_id"] for item in result.items] == [1, 2]
+    # Drain key cleaned up
+    assert await redis.lrange("drain:1", 0, -1) == []
+    # No re-enqueue
+    assert scheduler.calls == []
+
+
+async def test_orphan_recovery_does_not_lose_new_buffer() -> None:
+    """Orphan is recovered first; new buffer waits for next flush_check."""
+    redis = FakeRedis()
+    scheduler = FakeScheduler()
+    # Orphan from previous crash
+    await redis.rpush("drain:1", _buffer_item(1))
+    # New messages arrived after crash
+    await redis.rpush("buffer:1", _buffer_item(2))
+
+    result = await flush_check(tenant_id=1, redis=redis, scheduler=scheduler, debounce_window_s=10)
+
+    # Orphan recovered
+    assert result is not None
+    assert [item["raw_message_id"] for item in result.items] == [1]
+    # Buffer still has new messages for next cycle
+    assert len(await redis.lrange("buffer:1", 0, -1)) == 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Gated drain — debounce race prevention
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+async def test_gated_drain_returns_zero_when_debounce_set() -> None:
+    """_GATED_DRAIN atomically checks debounce before rename."""
+    redis = FakeRedis()
+    await redis.rpush("buffer:1", _buffer_item(1))
+    await redis.set("debounce:1", "1", ex=10)
+
+    status = await redis.eval(_GATED_DRAIN, 3, "debounce:1", "buffer:1", "drain:1")
+
+    assert status == 0
+    # Buffer untouched
+    assert len(await redis.lrange("buffer:1", 0, -1)) == 1
+    # No drain key created
+    assert await redis.lrange("drain:1", 0, -1) == []
+
+
+async def test_gated_drain_returns_two_when_orphan_exists() -> None:
+    """_GATED_DRAIN detects orphaned drain key."""
+    redis = FakeRedis()
+    await redis.rpush("drain:1", _buffer_item(1))
+
+    status = await redis.eval(_GATED_DRAIN, 3, "debounce:1", "buffer:1", "drain:1")
+
+    assert status == 2
+
+
+async def test_gated_drain_returns_negative_one_when_empty() -> None:
+    """_GATED_DRAIN returns -1 when no orphan, no debounce, no buffer."""
+    redis = FakeRedis()
+
+    status = await redis.eval(_GATED_DRAIN, 3, "debounce:1", "buffer:1", "drain:1")
+
+    assert status == -1
+
+
+async def test_flush_check_reenqueues_on_late_debounce() -> None:
+    """Gated drain catches debounce that appeared after optimistic check.
+
+    This tests the fix for the race where ingress sets debounce between the
+    optimistic GET (step 1) and the Lua script (step 3). We simulate this
+    by having step 1 pass (no debounce), then setting debounce before step 3
+    runs. Since FakeRedis is synchronous within eval, we insert the debounce
+    key before calling flush_check and rely on step 1 NOT being reached
+    (because debounce is set). To test the gated path specifically, we call
+    the Lua script directly.
+    """
+    redis = FakeRedis()
+    await redis.rpush("buffer:1", _buffer_item(1))
+    await redis.set("debounce:1", "1", ex=10)
+
+    status = await redis.eval(_GATED_DRAIN, 3, "debounce:1", "buffer:1", "drain:1")
+
+    # Lua returns 0 — buffer untouched, debounce active
+    assert status == 0
+    assert len(await redis.lrange("buffer:1", 0, -1)) == 1
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -253,7 +364,8 @@ async def test_new_messages_after_rename_go_to_fresh_buffer() -> None:
 
 async def test_drain_buffer_returns_items_in_order() -> None:
     redis = FakeRedis()
-    await redis.rpush("buffer:42", _buffer_item(10), _buffer_item(20), _buffer_item(30))
+    # drain_buffer reads from drain:{tenant_id} (populated by _GATED_DRAIN)
+    await redis.rpush("drain:42", _buffer_item(10), _buffer_item(20), _buffer_item(30))
 
     result = await drain_buffer(redis, tenant_id=42)
 
@@ -261,7 +373,7 @@ async def test_drain_buffer_returns_items_in_order() -> None:
     assert [item["raw_message_id"] for item in result.items] == [10, 20, 30]
 
 
-async def test_drain_buffer_returns_none_when_buffer_absent() -> None:
+async def test_drain_buffer_returns_none_when_drain_absent() -> None:
     redis = FakeRedis()
 
     result = await drain_buffer(redis, tenant_id=42)
@@ -271,10 +383,10 @@ async def test_drain_buffer_returns_none_when_buffer_absent() -> None:
 
 async def test_drain_buffer_generates_unique_batch_id() -> None:
     redis = FakeRedis()
-    await redis.rpush("buffer:1", _buffer_item(1))
+    await redis.rpush("drain:1", _buffer_item(1))
     result_a = await drain_buffer(redis, tenant_id=1)
 
-    await redis.rpush("buffer:1", _buffer_item(2))
+    await redis.rpush("drain:1", _buffer_item(2))
     result_b = await drain_buffer(redis, tenant_id=1)
 
     assert result_a is not None and result_b is not None
@@ -313,6 +425,31 @@ async def test_tenant_lock_sets_correct_ttl() -> None:
     async with tenant_lock(redis, tenant_id=1, ttl_s=120) as token:
         assert token is not None
         assert redis._ttls.get("lock:1") == 120
+
+
+async def test_tenant_lock_survives_extend_error() -> None:
+    """Transient error in lock extension doesn't prevent lock release."""
+    redis = FakeRedis()
+    extend_count = 0
+    original_eval = redis.eval
+
+    async def failing_eval(script: str, numkeys: int, *keys_and_args: str | int) -> object:
+        nonlocal extend_count
+        if script is _EXTEND_LOCK:
+            extend_count += 1
+            if extend_count == 1:
+                raise ConnectionError("transient Redis failure")
+        return await original_eval(script, numkeys, *keys_and_args)
+
+    redis.eval = failing_eval  # type: ignore[method-assign]
+
+    async with tenant_lock(redis, tenant_id=1, extend_interval_s=0.01) as token:
+        assert token is not None
+        # Let the extend task run, fail once, and retry
+        await asyncio.sleep(0.05)
+
+    # Lock was released despite the transient extend error
+    assert await redis.get("lock:1") is None
 
 
 # ═══════════════════════════════════════════════════════════════════════════

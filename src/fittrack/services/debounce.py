@@ -13,11 +13,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Protocol
+
+logger = logging.getLogger(__name__)
 
 LOCK_TTL_S = 120
 LOCK_EXTEND_INTERVAL_S = 30
@@ -82,13 +85,29 @@ end
 return 0
 """
 
-_ATOMIC_DRAIN = """\
+_GATED_DRAIN = """\
+-- KEYS[1] = debounce:{tenant_id}
+-- KEYS[2] = buffer:{tenant_id}
+-- KEYS[3] = drain:{tenant_id}
+-- Returns: 2 = orphan exists, 1 = renamed, 0 = debounce active, -1 = empty
+if redis.call('EXISTS', KEYS[3]) == 1 then
+  return 2
+end
 if redis.call('EXISTS', KEYS[1]) == 1 then
-  redis.call('RENAME', KEYS[1], KEYS[2])
+  return 0
+end
+if redis.call('EXISTS', KEYS[2]) == 1 then
+  redis.call('RENAME', KEYS[2], KEYS[3])
   return 1
 end
-return 0
+return -1
 """
+
+# Return codes from _GATED_DRAIN
+_DRAIN_ORPHAN = 2
+_DRAIN_RENAMED = 1
+_DRAIN_DEBOUNCE = 0
+_DRAIN_EMPTY = -1
 
 
 # ─── Lock ───────────────────────────────────────────────────────────────────
@@ -100,7 +119,7 @@ async def tenant_lock(
     tenant_id: int,
     *,
     ttl_s: int = LOCK_TTL_S,
-    extend_interval_s: int = LOCK_EXTEND_INTERVAL_S,
+    extend_interval_s: float = LOCK_EXTEND_INTERVAL_S,
 ) -> AsyncIterator[str | None]:
     """Acquire a per-tenant lock with auto-extend (spec §17.3).
 
@@ -118,16 +137,26 @@ async def tenant_lock(
     async def _extend() -> None:
         while True:
             await asyncio.sleep(extend_interval_s)
-            extended = await redis.eval(_EXTEND_LOCK, 1, lock_key, token, str(ttl_s))
-            if not extended:
-                break  # pragma: no cover — lost ownership, stop extending
+            try:
+                extended = await redis.eval(_EXTEND_LOCK, 1, lock_key, token, str(ttl_s))
+                if not extended:
+                    break  # lost ownership, stop extending
+            except Exception:
+                # Transient Redis error — the lock TTL is still counting down.
+                # Retry on next interval; if TTL expires the lock is released
+                # naturally and another worker can take over (correct by design).
+                logger.warning(
+                    "lock extend failed for tenant %s, will retry",
+                    tenant_id,
+                    exc_info=True,
+                )
 
     extend_task = asyncio.create_task(_extend())
     try:
         yield token
     finally:
         extend_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
+        with contextlib.suppress(BaseException):
             await extend_task
         await redis.eval(_RELEASE_LOCK, 1, lock_key, token)
 
@@ -139,28 +168,23 @@ async def drain_buffer(
     redis: RedisWorkerClient,
     tenant_id: int,
 ) -> DrainResult | None:
-    """Atomically drain the tenant buffer via RENAME (spec §17.3).
+    """Read and delete the ``drain:{tenant_id}`` key.
 
-    Never ``LRANGE+DEL`` on ``buffer:`` — the ingress writes without a lock
-    and a message that arrives between the two commands would be deleted
-    without entering the batch.
+    Called after ``_GATED_DRAIN`` has renamed the buffer or found an orphan.
+    Uses a deterministic key ``drain:{tenant_id}`` (no batch_id suffix) so
+    that a crash between RENAME and DELETE leaves a recoverable orphan that
+    ``_GATED_DRAIN`` detects on the next run (spec §17.3).
     """
-    batch_id = uuid.uuid4().hex
-    buffer_key = f"buffer:{tenant_id}"
-    drain_key = f"drain:{tenant_id}:{batch_id}"
-
-    renamed = await redis.eval(_ATOMIC_DRAIN, 2, buffer_key, drain_key)
-    if not renamed:
-        return None
+    drain_key = f"drain:{tenant_id}"
 
     items_raw = await redis.lrange(drain_key, 0, -1)
     await redis.delete(drain_key)
 
     if not items_raw:
-        return None  # pragma: no cover — RENAME succeeded so the list is non-empty
+        return None  # pragma: no cover — caller ensures drain key exists
 
     items: list[dict[str, object]] = [json.loads(item) for item in items_raw]
-    return DrainResult(batch_id=batch_id, items=items)
+    return DrainResult(batch_id=uuid.uuid4().hex, items=items)
 
 
 # ─── Flush check ────────────────────────────────────────────────────────────
@@ -183,7 +207,7 @@ async def flush_check(
 
     §17.3 lock: ``lock:{tenant_id}`` with TTL 120s and auto-extend.
     """
-    # Step 1: debounce still active → user is still typing
+    # Step 1: optimistic debounce check — fast path, avoids lock acquisition
     if await redis.get(f"debounce:{tenant_id}") is not None:
         await scheduler.schedule_flush_check(
             tenant_id=tenant_id,
@@ -200,5 +224,24 @@ async def flush_check(
             )
             return None
 
-        # Step 3: atomic drain
+        # Step 3: gated drain — atomically re-checks debounce, detects
+        # orphans from a previous crash, and renames the buffer.
+        debounce_key = f"debounce:{tenant_id}"
+        buffer_key = f"buffer:{tenant_id}"
+        drain_key = f"drain:{tenant_id}"
+
+        status = await redis.eval(_GATED_DRAIN, 3, debounce_key, buffer_key, drain_key)
+
+        if status == _DRAIN_DEBOUNCE:
+            # Debounce became active between step 1 and step 3 (race closed)
+            await scheduler.schedule_flush_check(
+                tenant_id=tenant_id,
+                delay_s=debounce_window_s,
+            )
+            return None
+
+        if status == _DRAIN_EMPTY:
+            return None
+
+        # status == _DRAIN_RENAMED or _DRAIN_ORPHAN → read and clean
         return await drain_buffer(redis, tenant_id)
