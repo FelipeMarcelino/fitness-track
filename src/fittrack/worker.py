@@ -211,27 +211,34 @@ async def process_batch(ctx: dict[str, Any], tenant_id: int, batch_id: int) -> N
     Spending an attempt on it would let a graph run that holds the lock for
     its full TTL exhaust the three tries of §4.1 without the batch ever being
     processed, leaving the row ``pending`` with nothing left to pick it up.
-    Real failures do consume the budget, with exponential backoff.
+    Real failures do consume the budget, with exponential backoff — and a
+    deferral that never reaches Redis is one of them, so the enqueue sits
+    inside the retried block rather than beside it.
     """
     redis: ArqRedis = ctx["redis"]
     store = ctx["batch_store"]
     try:
-        await _process_batch(
-            tenant_id=tenant_id,
-            batch_id=batch_id,
-            redis=redis,  # type: ignore[arg-type]  # ArqRedis vs Protocol impedance
-            store=store,
-        )
-    except BatchLockContentionError:
-        await ArqBatchEnqueuer(redis).defer_process_batch(
-            tenant_id=tenant_id,
-            batch_id=batch_id,
-            delay_s=LOCK_RETRY_DELAY_S,
-        )
-        logger.info(
-            "tenant lock busy, batch deferred",
-            extra={"tenant_id": tenant_id, "batch_id": batch_id, "delay_s": LOCK_RETRY_DELAY_S},
-        )
+        try:
+            await _process_batch(
+                tenant_id=tenant_id,
+                batch_id=batch_id,
+                redis=redis,  # type: ignore[arg-type]  # ArqRedis vs Protocol impedance
+                store=store,
+            )
+        except BatchLockContentionError:
+            await ArqBatchEnqueuer(redis).defer_process_batch(
+                tenant_id=tenant_id,
+                batch_id=batch_id,
+                delay_s=LOCK_RETRY_DELAY_S,
+            )
+            logger.info(
+                "tenant lock busy, batch deferred",
+                extra={
+                    "tenant_id": tenant_id,
+                    "batch_id": batch_id,
+                    "delay_s": LOCK_RETRY_DELAY_S,
+                },
+            )
     except Exception as error:
         raise Retry(defer=_backoff_s(ctx)) from error
 

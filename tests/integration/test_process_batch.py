@@ -203,9 +203,10 @@ class RecordedJob:
 class FakeArqPool:
     """Records what the schedulers ask of the ARQ pool."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, unreachable: bool = False) -> None:
         self.jobs: list[RecordedJob] = []
         self.deleted: list[str] = []
+        self._unreachable = unreachable
 
     async def enqueue_job(
         self,
@@ -214,6 +215,8 @@ class FakeArqPool:
         _job_id: str | None = None,
         _defer_by: timedelta | None = None,
     ) -> None:
+        if self._unreachable:
+            raise ConnectionError("redis unavailable")
         self.jobs.append(RecordedJob(function, args, _job_id, _defer_by))
 
     async def delete(self, *names: str) -> int:
@@ -703,6 +706,33 @@ async def test_worker_defers_lock_contention_without_spending_an_attempt(
             timedelta(seconds=LOCK_RETRY_DELAY_S),
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_worker_retries_when_the_deferral_cannot_be_queued(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_store: FakeBatchStore,
+) -> None:
+    """Returning after a deferral that never reached Redis would strand the row.
+
+    ARQ reads a normal return as success and drops the job, so the batch would
+    stay `pending` with nothing left to pick it up.
+    """
+
+    async def contended(**_: object) -> None:
+        raise BatchLockContentionError
+
+    monkeypatch.setattr(worker_module, "_process_batch", contended)
+    ctx = {
+        "redis": cast(ArqRedis, FakeArqPool(unreachable=True)),
+        "batch_store": fake_store,
+        "job_try": 1,
+    }
+
+    with pytest.raises(Retry) as caught:
+        await worker_module.process_batch(ctx, tenant_id=1, batch_id=42)
+
+    assert caught.value.defer_score == 1_000
 
 
 @pytest.mark.asyncio
