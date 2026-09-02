@@ -8,6 +8,9 @@ do not become public.
 from __future__ import annotations
 
 import asyncio
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -66,3 +69,26 @@ async def test_the_scheduler_beats_while_it_runs(tmp_path: Path) -> None:
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
     assert beat.exists()
+
+
+@pytest.mark.parametrize("module", ["fittrack.main", "fittrack.scheduler", "fittrack.worker"])
+def test_the_entrypoints_import_without_an_environment(module: str, tmp_path: Path) -> None:
+    """Importing a service reads no configuration; only starting one does.
+
+    `startup()` is where a missing DATABASE_URL or a malformed keyring must
+    surface, and it runs when the process starts.  A module that resolves
+    settings while it is being imported fails everywhere the environment is
+    absent — including the collection of this suite, which is how the
+    regression this test guards was found.
+    """
+    result = subprocess.run(
+        [sys.executable, "-c", f"import {module}"],
+        # An empty directory: no `.env` under the interpreter's feet.
+        cwd=tmp_path,
+        env={"PATH": os.environ["PATH"], "PYTHONPATH": str(Path(__file__).parents[2] / "src")},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr

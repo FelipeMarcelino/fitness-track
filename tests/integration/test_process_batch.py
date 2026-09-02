@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -38,6 +39,7 @@ from fittrack.services.batch import (
 from fittrack.services.debounce import (
     _EXTEND_LOCK,
     _RELEASE_LOCK,
+    LOCK_RETRY_DELAY_S,
     DrainResult,
 )
 from fittrack.settings import Settings
@@ -182,12 +184,41 @@ class StoredBatch:
 class FakeBatchEnqueuer:
     """Records enqueue_process_batch calls."""
 
-    calls: list[tuple[int, int, int]] = field(default_factory=list)
+    calls: list[tuple[int, int]] = field(default_factory=list)
 
-    async def enqueue_process_batch(
-        self, *, tenant_id: int, batch_id: int, delay_s: int = 0
+    async def enqueue_process_batch(self, *, tenant_id: int, batch_id: int) -> None:
+        self.calls.append((tenant_id, batch_id))
+
+
+@dataclass(frozen=True)
+class RecordedJob:
+    """One `enqueue_job` call, as ARQ would have received it."""
+
+    function: str
+    args: tuple[object, ...]
+    job_id: str | None
+    defer_by: timedelta | None
+
+
+class FakeArqPool:
+    """Records what the schedulers ask of the ARQ pool."""
+
+    def __init__(self) -> None:
+        self.jobs: list[RecordedJob] = []
+        self.deleted: list[str] = []
+
+    async def enqueue_job(
+        self,
+        function: str,
+        *args: object,
+        _job_id: str | None = None,
+        _defer_by: timedelta | None = None,
     ) -> None:
-        self.calls.append((tenant_id, batch_id, delay_s))
+        self.jobs.append(RecordedJob(function, args, _job_id, _defer_by))
+
+    async def delete(self, *names: str) -> int:
+        self.deleted.extend(names)
+        return len(names)
 
 
 # ─── Fixtures ──────────────────────────────────────────────────────────────
@@ -587,7 +618,7 @@ class TestEndToEnd:
 
         # Step 2: enqueue (simulated)
         await fake_enqueuer.enqueue_process_batch(tenant_id=1, batch_id=row_id)
-        assert fake_enqueuer.calls == [(1, row_id, 0)]
+        assert fake_enqueuer.calls == [(1, row_id)]
 
         # Step 3: process batch
         await process_batch(
@@ -640,23 +671,38 @@ class TestEndToEnd:
 
 
 @pytest.mark.asyncio
-async def test_worker_uses_arq_retry_for_lock_contention(
+async def test_worker_defers_lock_contention_without_spending_an_attempt(
     monkeypatch: pytest.MonkeyPatch,
     fake_store: FakeBatchStore,
 ) -> None:
+    """Contention is the expected case of section 17.3, not a failure.
+
+    Three attempts are the budget section 4.1 reserves for real failures. A
+    graph run holding `lock:{tenant_id}` for its full TTL would exhaust that
+    budget in deferrals alone and strand the batch `pending` forever, so the
+    deferral goes back on the queue as a new job instead of a retry.
+    """
+
     async def contended(**_: object) -> None:
         raise BatchLockContentionError
 
+    pool = FakeArqPool()
     monkeypatch.setattr(worker_module, "_process_batch", contended)
     ctx = {
-        "redis": cast(ArqRedis, object()),
+        "redis": cast(ArqRedis, pool),
         "batch_store": fake_store,
     }
 
-    with pytest.raises(Retry) as caught:
-        await worker_module.process_batch(ctx, tenant_id=1, batch_id=42)
+    await worker_module.process_batch(ctx, tenant_id=1, batch_id=42)
 
-    assert caught.value.defer_score == 5_000
+    assert pool.jobs == [
+        RecordedJob(
+            "process_batch",
+            (1, 42),
+            None,
+            timedelta(seconds=LOCK_RETRY_DELAY_S),
+        )
+    ]
 
 
 @pytest.mark.asyncio
@@ -729,6 +775,104 @@ def test_arq_redis_settings_use_validated_url_and_ca() -> None:
     assert redis.ssl is True
     assert redis.ssl_ca_certs == "/certs/ca.crt"
     assert redis.ssl_check_hostname is True
+
+
+# ─── ARQ job identity (what the queue actually sees) ───────────────────────
+
+
+@pytest.mark.asyncio
+async def test_the_ingress_schedules_one_check_per_tenant() -> None:
+    """A burst of messages costs one flush check, not one per message."""
+    pool = FakeArqPool()
+
+    await worker_module.ArqFlushScheduler(cast(ArqRedis, pool)).schedule_flush_check(
+        tenant_id=7, delay_s=10
+    )
+
+    assert pool.jobs == [RecordedJob("flush_check", (7,), "flush:7", timedelta(seconds=10))]
+    assert pool.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_the_worker_chains_the_next_check_under_a_new_job_id() -> None:
+    """`flush:{tenant_id}` is unusable from inside the job it names.
+
+    ARQ refuses `enqueue_job` while the job key exists, and `finish_job`
+    deletes that key and the queue entry when the current job returns — a
+    check re-enqueued under its own id would be erased on the way out and no
+    further check would ever run.
+    """
+    pool = FakeArqPool()
+
+    await worker_module.ArqFlushScheduler(cast(ArqRedis, pool), chained=True).schedule_flush_check(
+        tenant_id=7, delay_s=5
+    )
+
+    assert pool.jobs[0].function == "flush_check"
+    assert pool.jobs[0].args == (7,)
+    assert pool.jobs[0].job_id is None
+    assert pool.jobs[0].defer_by == timedelta(seconds=5)
+
+
+@pytest.mark.asyncio
+async def test_a_batch_is_enqueued_under_its_stable_id() -> None:
+    """A repeated flush must not create a second job for one persisted row."""
+    pool = FakeArqPool()
+
+    await worker_module.ArqBatchEnqueuer(cast(ArqRedis, pool)).enqueue_process_batch(
+        tenant_id=1, batch_id=42
+    )
+
+    assert pool.jobs == [RecordedJob("process_batch", (1, 42), "batch:42", None)]
+
+
+@pytest.mark.asyncio
+async def test_a_deferred_batch_does_not_reuse_its_own_job_id() -> None:
+    """The deferral is scheduled from inside `batch:42`, so it needs a new id."""
+    pool = FakeArqPool()
+
+    await worker_module.ArqBatchEnqueuer(cast(ArqRedis, pool)).defer_process_batch(
+        tenant_id=1, batch_id=42, delay_s=LOCK_RETRY_DELAY_S
+    )
+
+    assert pool.jobs == [
+        RecordedJob("process_batch", (1, 42), None, timedelta(seconds=LOCK_RETRY_DELAY_S))
+    ]
+
+
+@pytest.mark.asyncio
+async def test_worker_retries_a_failed_flush_so_the_kept_drain_comes_back(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_store: FakeBatchStore,
+) -> None:
+    """Keeping `drain:{tenant_id}` is only half of the recovery.
+
+    ARQ reruns a job that raises `Retry` and nothing else, so a persistence
+    failure that escaped as an ordinary error would leave the drain sitting
+    in Redis until another message happened to schedule a new check.
+    """
+
+    async def unavailable(**_: object) -> None:
+        raise ConnectionError("database unavailable")
+
+    monkeypatch.setattr(worker_module, "_flush_check", unavailable)
+    monkeypatch.setattr(
+        worker_module,
+        "get_settings",
+        lambda: SimpleNamespace(debounce_window_s=10),
+    )
+    monkeypatch.setattr(worker_module, "Keyring", SimpleNamespace(from_settings=lambda _: object()))
+    monkeypatch.setattr(worker_module, "ColumnCipher", lambda _: object())
+    ctx = {
+        "redis": cast(ArqRedis, FakeArqPool()),
+        "batch_store": fake_store,
+        "job_try": 1,
+    }
+
+    with pytest.raises(Retry) as caught:
+        await worker_module.flush_check(ctx, tenant_id=1)
+
+    assert caught.value.defer_score == 1_000
 
 
 def test_worker_settings_register_batch_retry_policy() -> None:

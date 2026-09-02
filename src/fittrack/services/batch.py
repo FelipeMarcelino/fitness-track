@@ -189,11 +189,14 @@ class PostgresBatchStore:
 
 
 class BatchEnqueuer(Protocol):
-    """Enqueue a ``process_batch`` job without exposing ARQ."""
+    """Enqueue a ``process_batch`` job without exposing ARQ.
 
-    async def enqueue_process_batch(
-        self, *, tenant_id: int, batch_id: int, delay_s: int = 0
-    ) -> None: ...
+    Deferring a batch is deliberately not part of this surface: it happens
+    from inside the batch job itself, where the job identity ARQ allows is a
+    different one, and that is a queue concern (``worker.py``).
+    """
+
+    async def enqueue_process_batch(self, *, tenant_id: int, batch_id: int) -> None: ...
 
 
 # ─── Pure helpers ──────────────────────────────────────────────────────────
