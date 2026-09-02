@@ -1,12 +1,13 @@
-"""Worker (spec 3.1): ARQ consumer for flush_check and future process_batch.
+"""Worker (spec 3.1): ARQ consumer for flush_check and process_batch.
 
 Workers are stateless by contract (CLAUDE.md, invariant 5). State lives in
 Postgres, Redis and Qdrant; any worker processes any job.
 
 The heartbeat proves liveness to the container runtime. The ARQ functions
 are the actual work: flush_check drains tenant buffers after the debounce
-window closes (S02-T04), and process_batch will drive the LangGraph graph
-(S02-T05, Sprint 03).
+window closes (S02-T04), and process_batch persists and marks batches done
+(S02-T05). Sprint 03 adds the LangGraph graph execution inside
+process_batch.
 
 NOTE: The production entry point (main → run_until_signalled) does not yet
 start an ARQ consumer. WorkerSettings and ``arq fittrack.worker.WorkerSettings``
@@ -22,6 +23,8 @@ from typing import Any
 from arq import ArqRedis
 
 from fittrack.runtime import DEFAULT_INTERVAL_S, heartbeat_loop, run_until_signalled
+from fittrack.services.batch import persist_batch as _persist_batch
+from fittrack.services.batch import process_batch as _process_batch
 from fittrack.services.debounce import flush_check as _flush_check
 from fittrack.startup import startup
 
@@ -58,22 +61,80 @@ class ArqFlushScheduler:
         )
 
 
+class ArqBatchEnqueuer:
+    """``BatchEnqueuer`` backed by ARQ's job queue.
+
+    Uses a stable ``_job_id`` of ``batch:{batch_id}`` so that
+    re-enqueueing the same batch (e.g. on retry) is idempotent.
+
+    Configured with ``max_tries=3`` and exponential backoff in
+    S02-T08 (WorkerSettings).
+    """
+
+    def __init__(self, pool: ArqRedis) -> None:
+        self._pool = pool
+
+    async def enqueue_process_batch(self, *, tenant_id: int, batch_id: int) -> None:
+        await self._pool.enqueue_job(
+            "process_batch",
+            tenant_id,
+            batch_id,
+            _job_id=f"batch:{batch_id}",
+        )
+
+
 async def flush_check(ctx: dict[str, Any], tenant_id: int) -> None:
     """ARQ entry point for the debounce gate (S02-T04).
+
+    When the debounce window closes and a buffer is drained, persists
+    the ``processing_batch`` with encrypted ``combined_text`` and
+    enqueues the ``process_batch`` job (S02-T05).
 
     Registered with ``keep_result=0`` so the stable job id is immediately
     reusable after the function completes.
     """
+    from fittrack.security.crypto import ColumnCipher, Keyring
     from fittrack.settings import get_settings
 
     settings = get_settings()
     redis: ArqRedis = ctx["redis"]
     scheduler = ArqFlushScheduler(redis)
-    await _flush_check(
+    result = await _flush_check(
         tenant_id=tenant_id,
         redis=redis,  # type: ignore[arg-type]  # ArqRedis vs Protocol impedance
         scheduler=scheduler,
         debounce_window_s=settings.debounce_window_s,
+    )
+
+    if result is not None:
+        cipher = ColumnCipher(Keyring.from_settings(settings))
+        store = ctx["batch_store"]
+        batch_id = await _persist_batch(
+            drain=result,
+            tenant_id=tenant_id,
+            cipher=cipher,
+            store=store,
+        )
+        enqueuer = ArqBatchEnqueuer(redis)
+        await enqueuer.enqueue_process_batch(tenant_id=tenant_id, batch_id=batch_id)
+
+
+async def process_batch(ctx: dict[str, Any], tenant_id: int, batch_id: int) -> None:
+    """ARQ entry point for batch processing (S02-T05).
+
+    Acquires the per-tenant lock and marks the batch ``done``.
+    Sprint 03 adds the LangGraph graph execution inside this handler.
+
+    Registered with ``max_tries=3``, exponential backoff and
+    ``keep_result=0`` in S02-T08 (WorkerSettings).
+    """
+    redis: ArqRedis = ctx["redis"]
+    store = ctx["batch_store"]
+    await _process_batch(
+        tenant_id=tenant_id,
+        batch_id=batch_id,
+        redis=redis,  # type: ignore[arg-type]  # ArqRedis vs Protocol impedance
+        store=store,
     )
 
 
