@@ -167,34 +167,17 @@ async def tenant_lock(
 # ─── Drain ──────────────────────────────────────────────────────────────────
 
 
-async def drain_buffer(
-    redis: RedisWorkerClient,
-    tenant_id: int,
-) -> DrainResult | None:
-    """Read and delete the ``drain:{tenant_id}`` key.
+async def _read_drain(redis: RedisWorkerClient, tenant_id: int) -> DrainResult | None:
+    """Read the ``drain:{tenant_id}`` key without acknowledging it.
 
     Called after ``_GATED_DRAIN`` has renamed the buffer or found an orphan.
-    Uses a deterministic key ``drain:{tenant_id}`` (no batch_id suffix) so
-    that a crash between RENAME and DELETE leaves a recoverable orphan that
-    ``_GATED_DRAIN`` detects on the next run (spec §17.3).
-    """
-    drain_key = f"drain:{tenant_id}"
+    The key is deterministic (no batch_id suffix) so that a crash between
+    RENAME and DELETE leaves a recoverable orphan that ``_GATED_DRAIN``
+    detects on the next run (spec §17.3).
 
-    items_raw = await redis.lrange(drain_key, 0, -1)
-    if not items_raw:
-        return None  # pragma: no cover — caller ensures drain key exists
-
-    items: list[dict[str, object]] = [json.loads(item) for item in items_raw]
-    result = DrainResult(batch_id=uuid.uuid4().hex, items=items)
-    await redis.delete(drain_key)
-    return result
-
-
-async def _read_drain(redis: RedisWorkerClient, tenant_id: int) -> DrainResult | None:
-    """Read a drain without acknowledging it.
-
-    The worker uses this lease-like operation so a database or queue failure
-    leaves ``drain:{tenant_id}`` available to the next ``flush_check`` retry.
+    Reading and acknowledging are separate on purpose: the caller deletes the
+    key only once the batch is persisted and enqueued, so a database or queue
+    failure leaves the drain for the next ``flush_check``.
     """
     items_raw = await redis.lrange(f"drain:{tenant_id}", 0, -1)
     if not items_raw:

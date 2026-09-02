@@ -17,7 +17,7 @@ from fittrack.services.debounce import (
     _RELEASE_LOCK,
     LOCK_RETRY_DELAY_S,
     DrainResult,
-    drain_buffer,
+    _read_drain,
     flush_check,
     tenant_lock,
 )
@@ -404,36 +404,44 @@ async def test_new_messages_after_rename_go_to_fresh_buffer() -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# drain_buffer — isolated tests
+# _read_drain — isolated tests
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-async def test_drain_buffer_returns_items_in_order() -> None:
+async def test_read_drain_returns_items_in_order() -> None:
     redis = FakeRedis()
-    # drain_buffer reads from drain:{tenant_id} (populated by _GATED_DRAIN)
+    # _read_drain reads from drain:{tenant_id} (populated by _GATED_DRAIN)
     await redis.rpush("drain:42", _buffer_item(10), _buffer_item(20), _buffer_item(30))
 
-    result = await drain_buffer(redis, tenant_id=42)
+    result = await _read_drain(redis, tenant_id=42)
 
     assert result is not None
     assert [item["raw_message_id"] for item in result.items] == [10, 20, 30]
 
 
-async def test_drain_buffer_returns_none_when_drain_absent() -> None:
+async def test_read_drain_leaves_the_key_for_the_caller_to_acknowledge() -> None:
+    redis = FakeRedis()
+    await redis.rpush("drain:42", _buffer_item(10))
+
+    assert await _read_drain(redis, tenant_id=42) is not None
+
+    assert len(await redis.lrange("drain:42", 0, -1)) == 1
+
+
+async def test_read_drain_returns_none_when_drain_absent() -> None:
     redis = FakeRedis()
 
-    result = await drain_buffer(redis, tenant_id=42)
+    result = await _read_drain(redis, tenant_id=42)
 
     assert result is None
 
 
-async def test_drain_buffer_generates_unique_batch_id() -> None:
+async def test_read_drain_generates_unique_batch_id() -> None:
     redis = FakeRedis()
     await redis.rpush("drain:1", _buffer_item(1))
-    result_a = await drain_buffer(redis, tenant_id=1)
 
-    await redis.rpush("drain:1", _buffer_item(2))
-    result_b = await drain_buffer(redis, tenant_id=1)
+    result_a = await _read_drain(redis, tenant_id=1)
+    result_b = await _read_drain(redis, tenant_id=1)
 
     assert result_a is not None and result_b is not None
     assert result_a.batch_id != result_b.batch_id
