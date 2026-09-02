@@ -9,12 +9,26 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import cast
 
+import asyncpg
 import pytest
+from arq import ArqRedis, Retry
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
+import fittrack.worker as worker_module
+from fittrack.db.engine import session_factory, split_ssl_arguments
 from fittrack.security.crypto import ColumnCipher, Keyring, column_aad
 from fittrack.services.batch import (
+    BatchLockContentionError,
     BatchRow,
+    PostgresBatchStore,
     persist_batch,
     prepare_items,
     process_batch,
@@ -24,6 +38,7 @@ from fittrack.services.debounce import (
     _RELEASE_LOCK,
     DrainResult,
 )
+from tests.conftest import CA_FILE
 
 # ─── Fakes ──────────────────────────────────────────────────────────────────
 
@@ -411,7 +426,6 @@ class TestProcessBatch:
         cipher: ColumnCipher,
         fake_redis: FakeRedis,
         fake_store: FakeBatchStore,
-        fake_enqueuer: FakeBatchEnqueuer,
     ) -> None:
         drain = _make_drain()
         row_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
@@ -421,7 +435,6 @@ class TestProcessBatch:
             batch_id=row_id,
             redis=fake_redis,
             store=fake_store,
-            enqueuer=fake_enqueuer,
         )
 
         row = await fake_store.get(batch_id=row_id, tenant_id=1)
@@ -438,7 +451,6 @@ class TestProcessBatch:
         cipher: ColumnCipher,
         fake_redis: FakeRedis,
         fake_store: FakeBatchStore,
-        fake_enqueuer: FakeBatchEnqueuer,
     ) -> None:
         drain = _make_drain()
         row_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
@@ -449,7 +461,6 @@ class TestProcessBatch:
             batch_id=row_id,
             redis=fake_redis,
             store=fake_store,
-            enqueuer=fake_enqueuer,
         )
         # Process again — idempotent
         await process_batch(
@@ -457,7 +468,6 @@ class TestProcessBatch:
             batch_id=row_id,
             redis=fake_redis,
             store=fake_store,
-            enqueuer=fake_enqueuer,
         )
 
         row = await fake_store.get(batch_id=row_id, tenant_id=1)
@@ -472,7 +482,6 @@ class TestProcessBatch:
         cipher: ColumnCipher,
         fake_redis: FakeRedis,
         fake_store: FakeBatchStore,
-        fake_enqueuer: FakeBatchEnqueuer,
     ) -> None:
         drain = _make_drain()
         row_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
@@ -480,19 +489,18 @@ class TestProcessBatch:
         # Pre-acquire the lock to simulate contention
         await fake_redis.set("lock:1", "other-worker", ex=120, nx=True)
 
-        await process_batch(
-            tenant_id=1,
-            batch_id=row_id,
-            redis=fake_redis,
-            store=fake_store,
-            enqueuer=fake_enqueuer,
-        )
+        with pytest.raises(BatchLockContentionError):
+            await process_batch(
+                tenant_id=1,
+                batch_id=row_id,
+                redis=fake_redis,
+                store=fake_store,
+            )
 
         # Batch status unchanged
         row = await fake_store.get(batch_id=row_id, tenant_id=1)
         assert row is not None
         assert row.status == "pending"
-        assert fake_enqueuer.calls == [(1, row_id, 5)]
 
     @pytest.mark.asyncio
     async def test_skips_failed_batch(
@@ -500,7 +508,6 @@ class TestProcessBatch:
         cipher: ColumnCipher,
         fake_redis: FakeRedis,
         fake_store: FakeBatchStore,
-        fake_enqueuer: FakeBatchEnqueuer,
     ) -> None:
         row_id = await persist_batch(
             drain=_make_drain(), tenant_id=1, cipher=cipher, store=fake_store
@@ -512,7 +519,6 @@ class TestProcessBatch:
             batch_id=row_id,
             redis=fake_redis,
             store=fake_store,
-            enqueuer=fake_enqueuer,
         )
 
         row = await fake_store.get(batch_id=row_id, tenant_id=1)
@@ -525,7 +531,6 @@ class TestProcessBatch:
         self,
         fake_redis: FakeRedis,
         fake_store: FakeBatchStore,
-        fake_enqueuer: FakeBatchEnqueuer,
     ) -> None:
         # No batch exists, should return without error
         await process_batch(
@@ -533,7 +538,6 @@ class TestProcessBatch:
             batch_id=999,
             redis=fake_redis,
             store=fake_store,
-            enqueuer=fake_enqueuer,
         )
 
     @pytest.mark.asyncio
@@ -542,7 +546,6 @@ class TestProcessBatch:
         cipher: ColumnCipher,
         fake_redis: FakeRedis,
         fake_store: FakeBatchStore,
-        fake_enqueuer: FakeBatchEnqueuer,
     ) -> None:
         drain = _make_drain()
         row_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
@@ -553,7 +556,6 @@ class TestProcessBatch:
             batch_id=row_id,
             redis=fake_redis,
             store=fake_store,
-            enqueuer=fake_enqueuer,
         )
 
         # Original batch unchanged
@@ -590,12 +592,12 @@ class TestEndToEnd:
             batch_id=row_id,
             redis=fake_redis,
             store=fake_store,
-            enqueuer=fake_enqueuer,
         )
 
         row = await fake_store.get(batch_id=row_id, tenant_id=1)
         assert row is not None
         assert row.status == "done"
+        assert row.attempts == 1
 
     @pytest.mark.asyncio
     async def test_retry_idempotency(
@@ -603,7 +605,6 @@ class TestEndToEnd:
         cipher: ColumnCipher,
         fake_redis: FakeRedis,
         fake_store: FakeBatchStore,
-        fake_enqueuer: FakeBatchEnqueuer,
     ) -> None:
         """Re-processing the same batch_id does not duplicate work."""
         drain = _make_drain()
@@ -615,18 +616,129 @@ class TestEndToEnd:
             batch_id=row_id,
             redis=fake_redis,
             store=fake_store,
-            enqueuer=fake_enqueuer,
         )
+
+        row = await fake_store.get(batch_id=row_id, tenant_id=1)
+        assert row is not None
+        assert row.status == "done"
+        assert row.attempts == 1
         # Retry — should be idempotent
         await process_batch(
             tenant_id=1,
             batch_id=row_id,
             redis=fake_redis,
             store=fake_store,
-            enqueuer=fake_enqueuer,
         )
 
         row = await fake_store.get(batch_id=row_id, tenant_id=1)
         assert row is not None
         assert row.status == "done"
-        assert row.attempts == 1  # not incremented on skip
+        assert row.attempts == 1  # retry skipped the terminal batch
+
+
+@pytest.mark.asyncio
+async def test_worker_uses_arq_retry_for_lock_contention(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_store: FakeBatchStore,
+) -> None:
+    async def contended(**_: object) -> None:
+        raise BatchLockContentionError
+
+    monkeypatch.setattr(worker_module, "_process_batch", contended)
+    ctx = {
+        "redis": cast(ArqRedis, object()),
+        "batch_store": fake_store,
+    }
+
+    with pytest.raises(Retry) as caught:
+        await worker_module.process_batch(ctx, tenant_id=1, batch_id=42)
+
+    assert caught.value.defer_score == 5_000
+
+
+@pytest.mark.asyncio
+async def test_worker_retries_processing_failures_with_exponential_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_store: FakeBatchStore,
+) -> None:
+    async def unavailable(**_: object) -> None:
+        raise ConnectionError("database unavailable")
+
+    monkeypatch.setattr(worker_module, "_process_batch", unavailable)
+    ctx = {
+        "redis": cast(ArqRedis, object()),
+        "batch_store": fake_store,
+        "job_try": 2,
+    }
+
+    with pytest.raises(Retry) as caught:
+        await worker_module.process_batch(ctx, tenant_id=1, batch_id=42)
+
+    assert caught.value.defer_score == 2_000
+
+
+@pytest.mark.asyncio
+async def test_worker_startup_injects_postgres_batch_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = cast(AsyncEngine, object())
+    sessions = cast(async_sessionmaker[AsyncSession], object())
+    monkeypatch.setattr(worker_module, "get_engine", lambda: engine)
+    monkeypatch.setattr(worker_module, "session_factory", lambda _: sessions)
+    ctx: dict[str, object] = {}
+
+    await worker_module.worker_startup(ctx)
+
+    assert ctx["db_engine"] is engine
+    store = ctx["batch_store"]
+    assert isinstance(store, PostgresBatchStore)
+    assert store._sessions is sessions
+
+
+def test_worker_settings_register_batch_retry_policy() -> None:
+    registered = {function.name: function for function in worker_module.WorkerSettings.functions}
+
+    assert registered["process_batch"].max_tries == 3
+    assert registered["process_batch"].keep_result_s == 0
+    assert worker_module.WorkerSettings.on_startup is worker_module.worker_startup
+
+
+@pytest.mark.asyncio
+async def test_postgres_batch_store_round_trip(
+    app_dsn: str,
+    migrated: None,
+    owner: asyncpg.Connection,
+    cipher: ColumnCipher,
+) -> None:
+    tenant_id: int = await owner.fetchval(
+        "INSERT INTO tenant (display_name) VALUES ('batch-store') RETURNING id"
+    )
+    url, ssl_args = split_ssl_arguments(
+        app_dsn.replace("postgresql://", "postgresql+asyncpg://")
+        + f"?sslmode=verify-full&sslrootcert={Path(CA_FILE)}"
+    )
+    engine = create_async_engine(url, connect_args=ssl_args)
+    store = PostgresBatchStore(session_factory(engine))
+    try:
+        row_id = await persist_batch(
+            drain=_make_drain(),
+            tenant_id=tenant_id,
+            cipher=cipher,
+            store=store,
+        )
+
+        row = await store.get(batch_id=row_id, tenant_id=tenant_id)
+        assert row is not None
+        assert row.message_ids == ["101", "102"]
+        assert row.status == "pending"
+        assert (
+            await store.find_by_message_ids(tenant_id=tenant_id, message_ids=["101", "102"]) == row
+        )
+
+        await store.mark_done(batch_id=row_id, tenant_id=tenant_id)
+        completed = await store.get(batch_id=row_id, tenant_id=tenant_id)
+        assert completed is not None
+        assert completed.status == "done"
+        assert completed.attempts == 1
+    finally:
+        await engine.dispose()

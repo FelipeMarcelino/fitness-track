@@ -10,22 +10,26 @@ window closes (S02-T04), and process_batch persists and marks batches done
 process_batch.
 
 NOTE: The production entry point (main → run_until_signalled) does not yet
-start an ARQ consumer. WorkerSettings and ``arq fittrack.worker.WorkerSettings``
-wiring is completed in S02-T08 (bootstrap and pipeline integration).
+start the registered ARQ consumer. S02-T08 switches the container entry point
+to ``arq fittrack.worker.WorkerSettings`` during bootstrap integration.
 """
 
 from __future__ import annotations
 
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
-from arq import ArqRedis
+from arq import ArqRedis, Retry, func
+from arq.worker import Function
+from sqlalchemy.ext.asyncio import AsyncEngine
 
+from fittrack.db.engine import get_engine, session_factory
 from fittrack.runtime import DEFAULT_INTERVAL_S, heartbeat_loop, run_until_signalled
+from fittrack.services.batch import BatchLockContentionError, PostgresBatchStore
 from fittrack.services.batch import persist_batch as _persist_batch
 from fittrack.services.batch import process_batch as _process_batch
-from fittrack.services.debounce import DrainResult
+from fittrack.services.debounce import LOCK_RETRY_DELAY_S, DrainResult
 from fittrack.services.debounce import flush_check as _flush_check
 from fittrack.startup import startup
 
@@ -68,8 +72,7 @@ class ArqBatchEnqueuer:
     Uses a stable ``_job_id`` of ``batch:{batch_id}`` so that
     re-enqueueing the same batch (e.g. on retry) is idempotent.
 
-    Configured with ``max_tries=3`` and exponential backoff in
-    S02-T08 (WorkerSettings).
+    ``WorkerSettings`` registers the handler with ``max_tries=3``.
     """
 
     def __init__(self, pool: ArqRedis) -> None:
@@ -78,16 +81,28 @@ class ArqBatchEnqueuer:
     async def enqueue_process_batch(
         self, *, tenant_id: int, batch_id: int, delay_s: int = 0
     ) -> None:
-        job_id = f"batch:{batch_id}"
-        queue = self._pool.default_queue_name
-        await self._pool.delete(f"{queue}:{job_id}", f"{queue}:result:{job_id}")
         await self._pool.enqueue_job(
             "process_batch",
             tenant_id,
             batch_id,
-            _job_id=job_id,
+            _job_id=f"batch:{batch_id}",
             _defer_by=timedelta(seconds=delay_s) if delay_s else None,
         )
+
+
+async def worker_startup(ctx: dict[str, Any]) -> None:
+    """Inject durable database dependencies into the ARQ worker context."""
+    engine = get_engine()
+    ctx["db_engine"] = engine
+    ctx["batch_store"] = PostgresBatchStore(session_factory(engine))
+
+
+async def worker_shutdown(ctx: dict[str, Any]) -> None:
+    """Dispose the worker's database pool cleanly."""
+    engine = ctx.pop("db_engine", None)
+    ctx.pop("batch_store", None)
+    if isinstance(engine, AsyncEngine):
+        await engine.dispose()
 
 
 async def flush_check(ctx: dict[str, Any], tenant_id: int) -> None:
@@ -134,19 +149,39 @@ async def process_batch(ctx: dict[str, Any], tenant_id: int, batch_id: int) -> N
     Acquires the per-tenant lock and marks the batch ``done``.
     Sprint 03 adds the LangGraph graph execution inside this handler.
 
-    Registered with ``max_tries=3``, exponential backoff and
-    ``keep_result=0`` in S02-T08 (WorkerSettings).
+    Registered with ``max_tries=3`` and ``keep_result=0`` in
+    ``WorkerSettings``. Lock contention is an explicit five-second ARQ retry.
     """
     redis: ArqRedis = ctx["redis"]
     store = ctx["batch_store"]
-    enqueuer = ArqBatchEnqueuer(redis)
-    await _process_batch(
-        tenant_id=tenant_id,
-        batch_id=batch_id,
-        redis=redis,  # type: ignore[arg-type]  # ArqRedis vs Protocol impedance
-        store=store,
-        enqueuer=enqueuer,
-    )
+    try:
+        await _process_batch(
+            tenant_id=tenant_id,
+            batch_id=batch_id,
+            redis=redis,  # type: ignore[arg-type]  # ArqRedis vs Protocol impedance
+            store=store,
+        )
+    except BatchLockContentionError as error:
+        raise Retry(defer=LOCK_RETRY_DELAY_S) from error
+    except Exception as error:
+        job_try = ctx.get("job_try", 1)
+        attempt = job_try if isinstance(job_try, int) and not isinstance(job_try, bool) else 1
+        backoff_s = 2 ** min(max(attempt - 1, 0), 2)
+        raise Retry(defer=backoff_s) from error
+
+
+class WorkerSettings:
+    """ARQ registration for the S02-T04/T05 default queue handlers."""
+
+    functions: ClassVar[list[Function]] = [
+        func(flush_check, keep_result=0),
+        func(process_batch, keep_result=0, max_tries=3),
+    ]
+    queue_name = "arq:queue"
+    max_jobs = 10
+    job_timeout = 90
+    on_startup = worker_startup
+    on_shutdown = worker_shutdown
 
 
 async def run(heartbeat: Path = HEARTBEAT, interval_s: float = DEFAULT_INTERVAL_S) -> None:

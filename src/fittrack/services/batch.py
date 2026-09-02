@@ -12,9 +12,8 @@ the batch, so that Sprint 03's graph execution remains serialised per
 tenant (§4.1).  In this sprint it is a placeholder: it marks the batch
 ``done`` and logs the handoff.
 
-NOTE: The ARQ entry points (enqueue and handler) live in ``worker.py``.
-The ``max_tries=3`` and exponential backoff configuration is completed
-in S02-T08 (WorkerSettings wiring).
+NOTE: The ARQ entry points and ``max_tries=3`` registration live in
+``worker.py``.
 """
 
 from __future__ import annotations
@@ -24,13 +23,12 @@ import logging
 from dataclasses import dataclass
 from typing import Protocol
 
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from fittrack.db.engine import tenant_session
 from fittrack.security.crypto import ColumnCipher, column_aad
-from fittrack.services.debounce import (
-    LOCK_RETRY_DELAY_S,
-    DrainResult,
-    RedisWorkerClient,
-    tenant_lock,
-)
+from fittrack.services.debounce import DrainResult, RedisWorkerClient, tenant_lock
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +55,7 @@ class BatchRow:
 class BatchStore(Protocol):
     """The database surface for ``processing_batch`` operations.
 
-    At the wiring boundary (worker.py), a ``PgBatchStore`` backed by
+    At the wiring boundary (worker.py), a ``PostgresBatchStore`` backed by
     ``tenant_session`` is passed.  Tests use a ``FakeBatchStore``.
     """
 
@@ -94,6 +92,100 @@ class BatchStore(Protocol):
     async def mark_done(self, *, batch_id: int, tenant_id: int) -> None:
         """Set ``status='done'``, ``finished_at=now()``, ``attempts += 1``."""
         ...
+
+
+class PostgresBatchStore:
+    """Tenant-scoped PostgreSQL implementation of :class:`BatchStore`."""
+
+    _SELECT_COLUMNS = "id, tenant_id, message_ids, combined_text, key_version, status, attempts"
+
+    def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
+        self._sessions = sessions
+
+    async def reserve_id(self) -> int:
+        async with self._sessions() as session, session.begin():
+            row_id = await session.scalar(text("SELECT nextval('processing_batch_id_seq')"))
+        if row_id is None:  # pragma: no cover - PostgreSQL sequences never return NULL
+            raise RuntimeError("processing_batch_id_seq returned no id")
+        return int(row_id)
+
+    async def insert(
+        self,
+        *,
+        row_id: int,
+        tenant_id: int,
+        message_ids: list[str],
+        combined_text: bytes,
+        key_version: int,
+    ) -> None:
+        async with tenant_session(self._sessions, tenant_id) as session:
+            await session.execute(
+                text(
+                    "INSERT INTO processing_batch ("
+                    "id, tenant_id, message_ids, combined_text, key_version"
+                    ") VALUES ("
+                    ":id, :tenant_id, CAST(:message_ids AS TEXT[]), :combined_text, :key_version"
+                    ")"
+                ),
+                {
+                    "id": row_id,
+                    "tenant_id": tenant_id,
+                    "message_ids": message_ids,
+                    "combined_text": combined_text,
+                    "key_version": key_version,
+                },
+            )
+
+    async def find_by_message_ids(
+        self, *, tenant_id: int, message_ids: list[str]
+    ) -> BatchRow | None:
+        async with tenant_session(self._sessions, tenant_id) as session:
+            result = await session.execute(
+                text(
+                    f"SELECT {self._SELECT_COLUMNS} FROM processing_batch "
+                    "WHERE message_ids = CAST(:message_ids AS TEXT[]) "
+                    "ORDER BY id DESC LIMIT 1"
+                ),
+                {"message_ids": message_ids},
+            )
+            row = result.mappings().one_or_none()
+        return self._to_batch_row(row) if row is not None else None
+
+    async def get(self, *, batch_id: int, tenant_id: int) -> BatchRow | None:
+        async with tenant_session(self._sessions, tenant_id) as session:
+            result = await session.execute(
+                text(f"SELECT {self._SELECT_COLUMNS} FROM processing_batch WHERE id = :batch_id"),
+                {"batch_id": batch_id},
+            )
+            row = result.mappings().one_or_none()
+        return self._to_batch_row(row) if row is not None else None
+
+    async def mark_done(self, *, batch_id: int, tenant_id: int) -> None:
+        async with tenant_session(self._sessions, tenant_id) as session:
+            await session.execute(
+                text(
+                    "UPDATE processing_batch "
+                    "SET status = 'done', finished_at = now(), attempts = attempts + 1 "
+                    "WHERE id = :batch_id AND status = 'pending'"
+                ),
+                {"batch_id": batch_id},
+            )
+
+    @staticmethod
+    def _to_batch_row(row: object) -> BatchRow:
+        from collections.abc import Mapping
+
+        if not isinstance(row, Mapping):  # pragma: no cover - SQLAlchemy contract
+            raise TypeError("processing_batch query did not return a mapping")
+        return BatchRow(
+            id=int(row["id"]),
+            tenant_id=int(row["tenant_id"]),
+            message_ids=[str(value) for value in row["message_ids"]],
+            combined_text=bytes(row["combined_text"]),
+            key_version=int(row["key_version"]),
+            status=str(row["status"]),
+            attempts=int(row["attempts"]),
+        )
 
 
 class BatchEnqueuer(Protocol):
@@ -190,13 +282,16 @@ async def persist_batch(
 # ─── Process ───────────────────────────────────────────────────────────────
 
 
+class BatchLockContentionError(RuntimeError):
+    """The tenant lock is busy and ARQ should defer this batch job."""
+
+
 async def process_batch(
     *,
     tenant_id: int,
     batch_id: int,
     redis: RedisWorkerClient,
     store: BatchStore,
-    enqueuer: BatchEnqueuer,
 ) -> None:
     """Process a persisted batch.
 
@@ -207,16 +302,11 @@ async def process_batch(
 
     Registered with ``max_tries=3`` and exponential backoff (§4.1) so
     that a lock contention or a transient DB error is retried by ARQ.
-    The ``keep_result=0`` setting is completed in S02-T08.
+    ``WorkerSettings`` configures ``keep_result=0``.
     """
     async with tenant_lock(redis, tenant_id) as token:
         if token is None:
-            await enqueuer.enqueue_process_batch(
-                tenant_id=tenant_id,
-                batch_id=batch_id,
-                delay_s=LOCK_RETRY_DELAY_S,
-            )
-            return
+            raise BatchLockContentionError
 
         row = await store.get(batch_id=batch_id, tenant_id=tenant_id)
         if row is None:
