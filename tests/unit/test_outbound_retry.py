@@ -5,6 +5,9 @@ Spec: sections 17.4, 18.2 (sending), and 18.4.
 
 from __future__ import annotations
 
+import base64
+import json
+import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -108,7 +111,25 @@ def test_the_media_degradation_prompt_honours_the_configured_directory(
     prompt = configured / "prompts" / "unsupported_media.md"
     prompt.parent.mkdir(parents=True)
     prompt.write_text("Mensagem configurada pelo operador.\n", encoding="utf-8")
-    monkeypatch.setenv("FITTRACK_CONFIG_DIR", str(configured))
+
+    for name in list(os.environ):
+        if name.startswith(("FITTRACK_", "DATABASE_", "REDIS_", "QDRANT_", "TELEGRAM_", "WABA_")):
+            monkeypatch.delenv(name, raising=False)
+    monkeypatch.chdir(tmp_path)
+    settings_environment = {
+        "DATABASE_URL": (
+            "postgresql+asyncpg://fittrack_runtime:p@postgres:5432/f?sslmode=verify-full"
+        ),
+        "REDIS_URL": "rediss://:p@redis:6379/0",
+        "QDRANT_URL": "https://qdrant:6333",
+        "FITTRACK_CHANNELS": "",
+        "FITTRACK_ENCRYPTION_KEYS": json.dumps({"1": base64.b64encode(b"A" * 32).decode()}),
+        "FITTRACK_ACTIVE_KEY_VERSION": "1",
+        "FITTRACK_IDENTITY_PEPPER": "an-independent-test-pepper-long-enough",
+        "FITTRACK_CONFIG_DIR": str(configured),
+    }
+    for name, value in settings_environment.items():
+        monkeypatch.setenv(name, value)
     get_settings.cache_clear()
     try:
         assert unsupported_media_block().text == "Mensagem configurada pelo operador."
