@@ -404,6 +404,12 @@ Todo PR novo, sem exceção, deve receber o comentário `@codex review` logo dep
 Não presuma que o comentário significa aprovação: aguarde a revisão terminar, leia os apontamentos
 e enderece cada um antes do merge.
 
+**Todo apontamento do Codex resolvido vira um comentário de explicação.** Depois de endereçar um
+comentário da revisão — com código novo, correção ou refutação — responda no próprio thread
+explicando o que foi feito e por quê. O comentário fecha o loop de rastreabilidade: quem ler o PR
+depois precisa entender, sem abrir o diff, por que cada apontamento virou (ou não virou) mudança.
+Um apontamento sem resposta conta como não endereçado.
+
 ### 5. Checklist antes de mergear
 
 Verificar os cinco, sempre, nesta ordem:
@@ -411,7 +417,8 @@ Verificar os cinco, sempre, nesta ordem:
 1. **Revisão do Codex concluída** — o PR recebeu `@codex review` e a revisão terminou. Não mergeie
    enquanto a revisão estiver pendente.
 2. **Comentários lidos e endereçados** — confirme com `gh pr view --comments` e
-   `gh pr view <n> --json reviews,comments`. Não mergeie por cima de comentário não respondido.
+   `gh pr view <n> --json reviews,comments`. Não mergeie por cima de comentário não respondido —
+   endereçado significa com comentário de explicação no thread.
 3. **CI verde** — `gh pr checks`. Se retornar "no checks reported", isso não é aprovação: significa
    que não há workflow configurado para a mudança.
 4. **Testes passando localmente.**
