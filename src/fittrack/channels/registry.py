@@ -33,7 +33,7 @@ protocol code out of the import graph of anything that merely wants the type.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from fittrack.channels.base import Channel
 from fittrack.settings import (
@@ -57,6 +57,7 @@ __all__ = [
     "ChannelRegistryError",
     "ChannelUnavailableError",
     "MissingCredentialError",
+    "build_telegram_poller",
 ]
 
 
@@ -219,6 +220,34 @@ def _build_telegram(config: ChannelConfig) -> Channel:
         webhook_secret=(
             config.telegram_webhook_secret if config.telegram_mode == "webhook" else None
         ),
+    )
+
+
+def build_telegram_poller(config: ChannelConfig, *, redis: Any) -> Any:
+    """The dev-only `getUpdates` transport of S02-T08, wired the way `_build_telegram` is.
+
+    Imported lazily for the same reason: the ingress wiring that calls this
+    lives outside `channels/`, and this is the one door it may use to reach a
+    Telegram type without naming it (`tests/unit/test_channel_contract.py`).
+
+    `redis` is the raw client the offset store reads and writes; the caller
+    owns its connection. Nothing here does I/O — `httpx.AsyncClient()` and
+    `RedisOffsetStore` are both lazy, so this is as safe to unit test as
+    `_build_telegram` is.
+    """
+    import httpx
+
+    from fittrack.channels.telegram.client import DEFAULT_TIMEOUT_SECONDS, TelegramClient
+    from fittrack.channels.telegram.polling import RedisOffsetStore, TelegramPoller
+
+    token = config.telegram_bot_token
+    if token is None:
+        raise MissingCredentialError("telegram polling needs TELEGRAM_BOT_TOKEN")
+
+    http = httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_SECONDS)
+    return TelegramPoller(
+        client=TelegramClient(token, http=http),
+        offsets=RedisOffsetStore(redis),
     )
 
 

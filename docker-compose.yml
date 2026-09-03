@@ -38,7 +38,11 @@ x-app-env: &app-env
   # that receives the selector has to receive what backs it, or it refuses to
   # boot. Unset variables resolve to empty, which settings read as absent.
   TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
-  TELEGRAM_MODE: ${TELEGRAM_MODE}
+  # Hardcoded, not interpolated: polling is explicitly a development choice
+  # (S02-T08, spec 18.2), and an operator's `.env` carrying TELEGRAM_MODE=polling
+  # into this file — the production topology — must not be able to turn it on.
+  # `docker-compose.dev.yml` is the only file that lets `${TELEGRAM_MODE}` through.
+  TELEGRAM_MODE: webhook
   TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET}
   TELEGRAM_WEBHOOK_URL: ${TELEGRAM_WEBHOOK_URL}
   WABA_PHONE_NUMBER_ID: ${WABA_PHONE_NUMBER_ID}

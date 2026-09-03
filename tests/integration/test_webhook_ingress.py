@@ -201,3 +201,33 @@ async def test_an_inflight_duplicate_is_not_acknowledged() -> None:
     assert identities.external_ids == []
     assert persisted.messages == []
     assert buffer.envelopes == []
+
+
+async def test_accept_runs_the_same_sequence_as_receive_without_verifying() -> None:
+    """The poller (S02-T08) hands over an already-decoded update, not bytes.
+
+    Polling authenticates by holding the bot token, not a per-request secret
+    (spec 18.2), so `accept` skips `verify` and `_parse_update` and starts
+    straight from the payload — everything after that is identical to `receive`.
+    `FakeChannel.parse` asserts `verified`, so this constructs the channel
+    already marked as such: polling's authentication happened one layer down,
+    at the client that holds the token, not per update.
+    """
+    seen = FakeDeduplicator()
+    identities = FakeIdentityResolver()
+    persisted = FakeRawMessages()
+    buffer = FakeBuffer()
+    service = TelegramWebhookIngress(
+        channel=FakeChannel([inbound()], verified=True),
+        deduplicator=seen,
+        identities=identities,
+        raw_messages=persisted,
+        buffer=buffer,
+    )
+
+    await service.accept({"update_id": 906})
+
+    assert seen.reserved == [906]
+    assert len(identities.external_ids) == 1
+    assert len(persisted.messages) == 1
+    assert len(buffer.envelopes) == 1

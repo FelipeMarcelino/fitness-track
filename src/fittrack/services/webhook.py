@@ -166,7 +166,16 @@ class TelegramWebhookIngress:
         must neither consume compute in the adapter nor reveal any tenant state.
         """
         self.verify(headers)
-        payload = _parse_update(body)
+        await self.accept(_parse_update(body))
+
+    async def accept(self, payload: Mapping[str, Any]) -> None:
+        """Deduplicate and durably accept an already-decoded update.
+
+        `receive` is `verify` plus this. Polling (S02-T08) has no per-request
+        secret to verify — `getUpdates` authenticates by holding the bot token,
+        once, at the client — so it calls this directly with the JSON object
+        Telegram already handed it, skipping both `verify` and `_parse_update`.
+        """
         update_id = _update_id(payload)
         if update_id is None:
             return

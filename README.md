@@ -13,9 +13,12 @@ covers only how to run the thing.
 
 ## What exists today
 
-Phase 1.0's foundation: the environment, the schema, the cryptographic boundary and the isolation
-guarantees. There is no Telegram adapter, no LLM gateway and no graph yet — those are the sprints
-that follow, and the pieces here are the contract they will be built against.
+Phase 1.0's foundation, plus sprint 2's Telegram pipeline end to end: a verified webhook (or, in
+dev, `getUpdates` polling) lands an update, deduplicates it, persists it encrypted, buffers it
+through the debounce window, and drains it into a `processing_batch`. `make bootstrap` reconciles
+`TELEGRAM_MODE` against Telegram's own webhook registration, so the two never fight over the same
+update stream. There is no LLM gateway and no graph yet — those are the sprints that follow, and a
+batch marked `done` today has no reply, only a persisted record.
 
 ## Setting up
 
@@ -68,6 +71,14 @@ CI" mean the same thing.
 **`docker-compose.yml` alone is the production topology** — Postgres, Redis, Qdrant and Langfuse
 publish no ports; only Caddy does (spec §3.1). `docker-compose.dev.yml` is the only file that opens
 anything to the host, which is why every command above passes both.
+
+**Telegram runs one of two ways, and the base file only allows one of them.** `TELEGRAM_MODE`
+defaults to `webhook`, and `docker-compose.yml` hardcodes it regardless of `.env` — `setWebhook`,
+behind Caddy, across as many `ingress` replicas as you like. `polling` is explicitly a development
+choice: `docker-compose.dev.yml` is the only file that lets the operator's `.env` choose it, the dev
+override runs a single `ingress` replica on purpose (two pollers on one bot collide, spec §18.2),
+and `make bootstrap` calls `deleteWebhook` before the poller starts so the two mechanisms are never
+both registered at once.
 
 ## Database
 

@@ -504,7 +504,7 @@ def test_an_empty_optional_variable_falls_back_to_its_default(variable: str) -> 
     every numeric setting `""`, and none of the services boot.
     """
     settings = build(**{variable: ""})
-    assert settings.telegram_mode == "polling"
+    assert settings.telegram_mode == "webhook"
     assert settings.debounce_window_s == 10
     assert settings.ack_confidence_threshold == 0.85
 

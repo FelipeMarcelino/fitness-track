@@ -101,7 +101,10 @@ class Settings(BaseSettings):
     fittrack_channels: str = ""
     telegram_bot_token: SecretStr | None = None
     telegram_webhook_secret: SecretStr | None = None
-    telegram_mode: TelegramMode = "polling"
+    # Webhook by default (S02-T08, spec 18.2): polling is explicitly a
+    # development choice, made by setting the variable, never inherited from
+    # an absent one.
+    telegram_mode: TelegramMode = "webhook"
     telegram_webhook_url: str | None = None
     waba_phone_number_id: SecretStr | None = None
     waba_token: SecretStr | None = None
