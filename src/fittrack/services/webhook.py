@@ -592,6 +592,9 @@ def _envelope(
         "kind": message.kind,
         "text": message.text,
         "media_ref": message.media_ref,
+        # The transcription service refuses a recording past the ceiling of
+        # 11.3 with a fixed reply, and it needs the number to do so.
+        "duration_s": message.media_duration_s,
         "button_payload": message.button_payload,
         "sent_at": message.sent_at.isoformat(),
         "raw_message_id": raw_message_id,

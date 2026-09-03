@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 from fittrack.channels.base import ChannelError
+from fittrack.security.tmpfile import create_private
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -194,7 +195,10 @@ class TelegramClient:
                 if response.status_code >= httpx.codes.BAD_REQUEST:
                     await response.aread()
                     raise self._download_refused(response)
-                with destination.open("wb") as sink:
+                # `O_NOFOLLOW | O_EXCL`, not `Path.open`: the container's
+                # `/tmp` is shared, and a planted symlink at a guessable name
+                # would redirect somebody's voice note (spec 11.1).
+                with create_private(destination) as sink:
                     async for chunk in response.aiter_bytes():
                         written += len(chunk)
                         if written > MAX_DOWNLOAD_BYTES:

@@ -283,7 +283,7 @@ class TelegramAdapter:
     def _from_message(
         self, payload: Mapping[str, Any], message: Mapping[str, Any]
     ) -> InboundMessage:
-        kind, text, media_ref = _classify_message(message)
+        kind, text, media_ref, duration_s = _classify_message(message)
         return InboundMessage(
             channel=self.kind,
             external_id=str(message["chat"]["id"]),
@@ -294,6 +294,7 @@ class TelegramAdapter:
             button_payload=None,
             sent_at=datetime.fromtimestamp(int(message["date"]), tz=UTC),
             raw=payload,
+            media_duration_s=duration_s,
         )
 
     def _from_callback(
@@ -477,32 +478,33 @@ def _is_private(chat: Mapping[str, Any] | None) -> bool:
 
 def _classify_message(
     message: Mapping[str, Any],
-) -> tuple[InboundKind, str | None, str | None]:
+) -> tuple[InboundKind, str | None, str | None, int | None]:
     """What a `message` update is, of the kinds 18.2 handles."""
     if text := message.get("text"):
-        return "text", str(text), None
+        return "text", str(text), None, None
 
     # Voice, and the two containers that are voice when they are short enough
-    # (spec 11). Past the ceiling it is still recorded, but with no `media_ref`:
-    # nothing downstream should fetch what will not be transcribed.
+    # (spec 11). Past the ceiling it stays a recording and keeps its duration,
+    # but loses its `media_ref`: nothing downstream can fetch what will not be
+    # transcribed, and the transcription service still has something it can
+    # answer — 11.3 asks the user to split it, and 18.4 says never silence.
     #
-    # `other` is the only truthful value the closed Literal of 18.1 offers, and
-    # it is doing three jobs at once — this, a reaction update to discard, and a
-    # membership change to act on. The ingress has to tell them apart from the
-    # payload, because 11.3 asks the user to split the recording and 18.4 says
-    # never silence. Noted for S02-T03; giving 18.1 a field instead is an ADR.
+    # It used to come back as `other`, which is the label for a reaction to
+    # discard and a membership change to act on, so nothing could tell the
+    # three apart from the kind alone. ADR-0006 records the change.
     for field in ("voice", "audio", "video_note"):
         if media := message.get(field):
-            if int(media.get("duration", 0)) > MAX_AUDIO_SECONDS:
-                return "other", None, None
-            return "voice", None, str(media["file_id"])
+            duration_s = int(media.get("duration", 0))
+            if duration_s > MAX_AUDIO_SECONDS:
+                return "voice", None, None, duration_s
+            return "voice", None, str(media["file_id"]), duration_s
 
     if photo := message.get("photo"):
         # Telegram sends a ladder of thumbnails; the last is the original.
-        return "image", None, str(photo[-1]["file_id"])
+        return "image", None, str(photo[-1]["file_id"]), None
     if document := message.get("document"):
-        return "document", None, str(document["file_id"])
-    return "other", None, None
+        return "document", None, str(document["file_id"]), None
+    return "other", None, None, None
 
 
 def _addressable(channel_message_id: str) -> int:

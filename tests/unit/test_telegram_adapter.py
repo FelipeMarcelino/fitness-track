@@ -26,6 +26,7 @@ tests hand it a `MockTransport`.
 from __future__ import annotations
 
 import json
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -309,12 +310,34 @@ def test_audio_past_the_limit_is_not_transcribed(adapter: TelegramAdapter, field
 
     It is still parsed and still recorded — `raw_message` keeps everything —
     but it carries no `media_ref`, so nothing downstream tries to fetch it.
+
+    It stays a recording all the same, and keeps its duration. `other` is also
+    the label for a reaction to discard and a membership change to act on, so
+    nothing downstream could tell the three apart and answer the one that 11.3
+    says to answer (ADR-0006).
     """
     [parsed] = adapter.parse(
         message(**{field: {"file_id": "AwADBA", "duration": MAX_AUDIO_SECONDS + 1}})
     )
-    assert parsed.kind == "other"
+    assert parsed.kind == "voice"
     assert parsed.media_ref is None
+    assert parsed.media_duration_s == MAX_AUDIO_SECONDS + 1
+
+
+@pytest.mark.parametrize("field", ["audio", "video_note", "voice"])
+def test_a_recording_within_the_limit_declares_its_duration(
+    adapter: TelegramAdapter, field: str
+) -> None:
+    """The number the transcription service enforces the ceiling with (11.3)."""
+    [parsed] = adapter.parse(message(**{field: {"file_id": "AwADBA", "duration": 42}}))
+    assert parsed.media_duration_s == 42
+
+
+def test_nothing_but_a_recording_declares_a_duration(adapter: TelegramAdapter) -> None:
+    [text_message] = adapter.parse(message(text="oi"))
+    [photo] = adapter.parse(message(photo=[{"file_id": "p", "width": 1, "height": 1}]))
+    assert text_message.media_duration_s is None
+    assert photo.media_duration_s is None
 
 
 def test_a_photo_takes_the_largest_size(adapter: TelegramAdapter) -> None:
@@ -1079,12 +1102,12 @@ async def test_a_write_that_fails_midway_leaves_no_recording_behind(
     never sees the path — so if this method does not clean up, nobody can. What
     would be left is half of somebody's voice message, sitting in tmpfs.
     """
-    real_open = Path.open
-    written: list[Path] = []
+    real_fdopen = os.fdopen
+    written: list[int] = []
 
-    def failing_open(self: Path, *args: Any, **kwargs: Any) -> Any:
-        handle = real_open(self, *args, **kwargs)
-        written.append(self)
+    def failing_fdopen(descriptor: int, *args: Any, **kwargs: Any) -> Any:
+        handle = real_fdopen(descriptor, *args, **kwargs)
+        written.append(descriptor)
         original = handle.write
 
         def write(data: Any) -> int:
@@ -1094,7 +1117,9 @@ async def test_a_write_that_fails_midway_leaves_no_recording_behind(
         handle.write = write
         return handle
 
-    monkeypatch.setattr(Path, "open", failing_open)
+    # `create_private` opens with `os.open` and wraps the descriptor, because
+    # `Path.open` cannot ask for `O_NOFOLLOW | O_EXCL` (spec 11.1).
+    monkeypatch.setattr(os, "fdopen", failing_fdopen)
     adapter, _ = build_adapter(downloading(), download_dir=tmp_path)
 
     with pytest.raises(OSError, match="No space left"):

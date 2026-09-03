@@ -188,6 +188,21 @@ class PostgresBatchStore:
         )
 
 
+class VoiceResolver(Protocol):
+    """The transcription step of the drain (S02-T07).
+
+    Declared as a port rather than imported concretely so that a drain with no
+    voice in it — which is most of them — costs nothing and needs no provider
+    credential. `VoiceIngestion` in ``services/stt.py`` is the implementation.
+    """
+
+    async def resolve(
+        self, items: list[dict[str, object]], *, tenant_id: int
+    ) -> list[dict[str, object]]:
+        """Return the burst with its voice items turned into text."""
+        ...
+
+
 class BatchEnqueuer(Protocol):
     """Enqueue a ``process_batch`` job without exposing ARQ.
 
@@ -231,13 +246,24 @@ async def persist_batch(
     tenant_id: int,
     cipher: ColumnCipher,
     store: BatchStore,
-) -> int:
+    voice: VoiceResolver | None = None,
+) -> int | None:
     """Persist a ``processing_batch`` with encrypted ``combined_text``.
 
-    Returns the batch row id.  Voice items are marked ``was_audio=True``
-    before the combined text is encrypted (acceptance criterion T05).
+    Returns the batch row id, or ``None`` when the drain left nothing to
+    process.  Voice items are transcribed and marked ``was_audio=True``
+    before the combined text is encrypted (S02-T05 and S02-T07): the batch the
+    graph receives holds text, never a media reference.
+
+    A burst can empty here, and legitimately: a lone voice note that was
+    inaudible, too long or unconsented was answered with the fixed reply of
+    §11.3, and an empty batch would only give the graph a turn with no content
+    in it.
     """
-    items, message_ids = prepare_items(drain.items)
+    items = drain.items
+    if voice is not None:
+        items = await voice.resolve(items, tenant_id=tenant_id)
+    items, message_ids = prepare_items(items)
 
     # The drain is acknowledged only after enqueue succeeds. If enqueue failed
     # after the insert, the next flush retry repairs the handoff by reusing the
@@ -253,6 +279,13 @@ async def persist_batch(
                 extra={"tenant_id": tenant_id, "batch_id": existing.id},
             )
             return existing.id
+
+    if not items:
+        logger.info(
+            "drain left no item to process",
+            extra={"tenant_id": tenant_id},
+        )
+        return None
 
     # JSON-encode items in arrival order — no concatenation (§9.3)
     combined_bytes = json.dumps(items, ensure_ascii=False).encode()

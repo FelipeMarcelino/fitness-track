@@ -70,3 +70,23 @@ roles:
 # onde a exceção se paga. Um agente com override sai do guarda-chuva do papel
 # também na avaliação e precisa da própria linha no golden set.
 agents: {}
+
+# --------------------------------------------------------------------------- #
+# Transcrição de áudio (§11.1). Não é um papel de LLM, e por isso não está em
+# `roles:` — não tem prompt de sistema, não tem tier de raciocínio e não tem
+# fallback de provider. O que ele compartilha com os papéis é o motivo de estar
+# aqui: **nome de modelo não aparece em código** (invariante 4). Ver ADR-0007.
+# --------------------------------------------------------------------------- #
+stt:
+  provider: groq
+  model: whisper-large-v3
+  language: pt
+  # `verbose_json` não é preferência: `no_speech_prob` e os segmentos não vêm
+  # em nenhum outro formato de resposta (§11.1).
+  response_format: verbose_json
+  prompt_file: stt_vocabulary.md
+  timeout_s: 120
+  # As três regras da tabela da §11.3, no único lugar onde são configuráveis.
+  max_audio_seconds: 300
+  no_speech_threshold: 0.6
+  retry_retention_hours: 6

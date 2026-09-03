@@ -32,11 +32,14 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any, ClassVar
 
+import httpx
 from arq import ArqRedis, Retry, func
 from arq.connections import RedisSettings
 from arq.worker import Function
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from fittrack.channels.registry import ChannelRegistry, ChannelRegistryError
+from fittrack.config import Config, ConfigError
 from fittrack.db.engine import get_engine, session_factory
 from fittrack.runtime import DEFAULT_INTERVAL_S, heartbeat_loop, run_until_signalled
 from fittrack.security.crypto import ColumnCipher, Keyring
@@ -44,12 +47,24 @@ from fittrack.services.batch import (
     BatchEnqueuer,
     BatchLockContentionError,
     PostgresBatchStore,
+    VoiceResolver,
 )
 from fittrack.services.batch import persist_batch as _persist_batch
 from fittrack.services.batch import process_batch as _process_batch
 from fittrack.services.debounce import LOCK_RETRY_DELAY_S, DrainResult
 from fittrack.services.debounce import flush_check as _flush_check
-from fittrack.settings import Settings, get_settings
+from fittrack.services.outbound import (
+    OutboundService,
+    PostgresOutboundQueueStore,
+    RedisRateLimiter,
+)
+from fittrack.services.stt import (
+    GroqTranscriber,
+    SqlConsentGate,
+    SqlTranscriptStore,
+    VoiceIngestion,
+)
+from fittrack.settings import ChannelKind, Settings, get_settings
 from fittrack.startup import startup
 
 logger = logging.getLogger(__name__)
@@ -140,18 +155,97 @@ class ArqBatchEnqueuer:
         )
 
 
+# The channel whose voice notes this worker can fetch. Phase 1.0 is Telegram
+# only (spec 24), and `download_media` takes a reference without saying which
+# channel issued it — so the wiring names the channel once, here, and
+# `VoiceIngestion` refuses an item from any other.
+VOICE_CHANNEL: ChannelKind = "telegram"
+
+
+def build_voice_ingestion(
+    ctx: dict[str, Any],
+    settings: Settings,
+    config: Config,
+) -> VoiceIngestion | None:
+    """The transcription step of the drain, or ``None`` when it cannot run.
+
+    Three things have to be true: `models.yaml` declares the `stt:` section,
+    the transcription provider has a credential, and the channel that carries
+    voice is enabled with an adapter that builds. Any of them missing is a
+    deployment that cannot transcribe, and it says so once here — a voice item
+    then reaches the batch with empty text and ``status='incomplete'`` rather
+    than failing the whole drain (invariant 6).
+
+    The reasons are enumerated rather than caught wholesale: those four are the
+    states a deployment can legitimately be in, and anything else is a bug in
+    this wiring, which should stop the worker instead of quietly turning voice
+    off for a release.
+    """
+    try:
+        stt = config.models.require_stt()
+    except ConfigError as error:
+        logger.warning("voice is disabled: %s", error)
+        return None
+
+    credential = getattr(settings, f"{stt.provider}_api_key", None)
+    if credential is None:
+        logger.warning(
+            "voice is disabled: the transcription provider has no credential",
+            extra={"provider": stt.provider},
+        )
+        return None
+
+    if VOICE_CHANNEL not in settings.channels:
+        logger.warning("voice is disabled: the channel that carries it is not enabled")
+        return None
+    try:
+        channel = ChannelRegistry.from_config(settings).get(VOICE_CHANNEL)
+    except ChannelRegistryError as error:
+        logger.warning("voice is disabled: %s", error)
+        return None
+
+    sessions = session_factory(ctx["db_engine"])
+    cipher = ColumnCipher(Keyring.from_settings(settings))
+    # One pool for the worker, closed at shutdown. The adapter's own client is
+    # separate and owned by the registry.
+    http = httpx.AsyncClient(timeout=stt.timeout_s)
+    ctx["stt_http"] = http
+    return VoiceIngestion(
+        channel=VOICE_CHANNEL,
+        downloader=channel,
+        transcriber=GroqTranscriber(http=http, api_key=credential, config=stt),
+        consent=SqlConsentGate(sessions),
+        transcripts=SqlTranscriptStore(sessions, cipher),
+        config=stt,
+        prompt_dir=Path(settings.fittrack_config_dir) / "prompts",
+        # The fixed replies of §11.3 leave through the single output path of
+        # invariant 2, as ordinary queued responses (S02-T06). ARQ has put the
+        # pool in `ctx` before `on_startup` runs, so the limiter is the shared
+        # one every worker observes rather than a per-process semaphore.
+        replies=OutboundService(
+            store=PostgresOutboundQueueStore(sessions, cipher),
+            rate_limiter=RedisRateLimiter(ctx["redis"]),
+        ),
+    )
+
+
 async def worker_startup(ctx: dict[str, Any]) -> None:
     """Validate configuration and inject durable ARQ worker dependencies."""
-    settings, _ = startup("worker")
+    settings, config = startup("worker")
     engine = get_engine(settings)
     ctx["db_engine"] = engine
     ctx["batch_store"] = PostgresBatchStore(session_factory(engine))
+    ctx["voice"] = build_voice_ingestion(ctx, settings, config)
 
 
 async def worker_shutdown(ctx: dict[str, Any]) -> None:
-    """Dispose the worker's database pool cleanly."""
+    """Dispose the worker's database pool and HTTP client cleanly."""
     engine = ctx.pop("db_engine", None)
     ctx.pop("batch_store", None)
+    ctx.pop("voice", None)
+    http = ctx.pop("stt_http", None)
+    if isinstance(http, httpx.AsyncClient):
+        await http.aclose()
     if isinstance(engine, AsyncEngine):
         await engine.dispose()
 
@@ -179,13 +273,21 @@ async def flush_check(ctx: dict[str, Any], tenant_id: int) -> None:
     store = ctx["batch_store"]
     enqueuer: BatchEnqueuer = ArqBatchEnqueuer(redis)
 
+    voice: VoiceResolver | None = ctx.get("voice")
+
     async def persist_and_enqueue(result: DrainResult) -> None:
         batch_id = await _persist_batch(
             drain=result,
             tenant_id=tenant_id,
             cipher=cipher,
             store=store,
+            voice=voice,
         )
+        if batch_id is None:
+            # Every item was answered on its own — an inaudible or over-long
+            # voice note, say (§11.3). There is no batch to hand to the graph,
+            # and the drain is acknowledged either way.
+            return
         await enqueuer.enqueue_process_batch(tenant_id=tenant_id, batch_id=batch_id)
 
     try:

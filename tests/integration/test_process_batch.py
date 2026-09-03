@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from typing import cast
 
 import asyncpg
+import httpx
 import pytest
 from arq import ArqRedis, Retry
 from pydantic import SecretStr
@@ -26,6 +27,7 @@ from sqlalchemy.ext.asyncio import (
 )
 
 import fittrack.worker as worker_module
+from fittrack.config import Config, ConfigError, load_models
 from fittrack.db.engine import session_factory, split_ssl_arguments
 from fittrack.security.crypto import ColumnCipher, Keyring, column_aad
 from fittrack.services.batch import (
@@ -345,6 +347,7 @@ class TestPersistBatch:
     ) -> None:
         drain = _make_drain()
         row_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
+        assert row_id is not None
         row = await fake_store.get(batch_id=row_id, tenant_id=1)
         assert row is not None
 
@@ -368,6 +371,7 @@ class TestPersistBatch:
 
         drain = _make_drain()
         row_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
+        assert row_id is not None
         row = await fake_store.get(batch_id=row_id, tenant_id=1)
         assert row is not None
 
@@ -387,6 +391,7 @@ class TestPersistBatch:
     ) -> None:
         drain = _make_drain()
         row_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
+        assert row_id is not None
         row = await fake_store.get(batch_id=row_id, tenant_id=1)
         assert row is not None
         assert row.message_ids == ["101", "102"]
@@ -398,7 +403,9 @@ class TestPersistBatch:
         drain = _make_drain()
 
         first_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
+        assert first_id is not None
         retry_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
+        assert retry_id is not None
 
         assert retry_id == first_id
         assert len(fake_store._rows) == 1
@@ -409,9 +416,65 @@ class TestPersistBatch:
     ) -> None:
         drain = _make_drain()
         row_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
+        assert row_id is not None
         row = await fake_store.get(batch_id=row_id, tenant_id=1)
         assert row is not None
         assert row.key_version == cipher.active_version
+
+    @pytest.mark.asyncio
+    async def test_voice_is_transcribed_before_the_combined_text_is_encrypted(
+        self, cipher: ColumnCipher, fake_store: FakeBatchStore
+    ) -> None:
+        """S02-T07: the batch the graph receives holds text, never a media ref."""
+
+        class Resolver:
+            async def resolve(
+                self, items: list[dict[str, object]], *, tenant_id: int
+            ) -> list[dict[str, object]]:
+                for item in items:
+                    if item.get("kind") == "voice":
+                        item["text"] = "transcrito"
+                        item["was_audio"] = True
+                return items
+
+        drain = _make_drain([{"channel_message_id": "m1", "raw_message_id": 101, "kind": "voice"}])
+        row_id = await persist_batch(
+            drain=drain, tenant_id=1, cipher=cipher, store=fake_store, voice=Resolver()
+        )
+        assert row_id is not None
+        row = await fake_store.get(batch_id=row_id, tenant_id=1)
+        assert row is not None
+
+        plaintext = cipher.decrypt(
+            row.combined_text,
+            column_aad(
+                tenant_id=1, table="processing_batch", column="combined_text", row_id=row_id
+            ),
+            declared_version=1,
+        )
+        [item] = json.loads(plaintext)
+        assert item["text"] == "transcrito"
+        assert item["was_audio"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_burst_the_voice_step_emptied_persists_no_batch(
+        self, cipher: ColumnCipher, fake_store: FakeBatchStore
+    ) -> None:
+        """An inaudible lone voice note was answered on its own (§11.3)."""
+
+        class DroppingResolver:
+            async def resolve(
+                self, items: list[dict[str, object]], *, tenant_id: int
+            ) -> list[dict[str, object]]:
+                return [item for item in items if item.get("kind") != "voice"]
+
+        drain = _make_drain([{"channel_message_id": "m1", "raw_message_id": 101, "kind": "voice"}])
+        row_id = await persist_batch(
+            drain=drain, tenant_id=1, cipher=cipher, store=fake_store, voice=DroppingResolver()
+        )
+
+        assert row_id is None
+        assert fake_store._rows == {}
 
     @pytest.mark.asyncio
     async def test_voice_items_marked_before_persist(
@@ -428,6 +491,7 @@ class TestPersistBatch:
         ]
         drain = _make_drain(items)
         row_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
+        assert row_id is not None
         row = await fake_store.get(batch_id=row_id, tenant_id=1)
         assert row is not None
 
@@ -448,6 +512,7 @@ class TestPersistBatch:
     ) -> None:
         drain = _make_drain()
         row_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
+        assert row_id is not None
         row = await fake_store.get(batch_id=row_id, tenant_id=1)
         assert row is not None
         assert row.status == "pending"
@@ -466,6 +531,7 @@ class TestProcessBatch:
     ) -> None:
         drain = _make_drain()
         row_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
+        assert row_id is not None
 
         await process_batch(
             tenant_id=1,
@@ -491,6 +557,7 @@ class TestProcessBatch:
     ) -> None:
         drain = _make_drain()
         row_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
+        assert row_id is not None
 
         # Process once
         await process_batch(
@@ -522,6 +589,7 @@ class TestProcessBatch:
     ) -> None:
         drain = _make_drain()
         row_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
+        assert row_id is not None
 
         # Pre-acquire the lock to simulate contention
         await fake_redis.set("lock:1", "other-worker", ex=120, nx=True)
@@ -549,6 +617,7 @@ class TestProcessBatch:
         row_id = await persist_batch(
             drain=_make_drain(), tenant_id=1, cipher=cipher, store=fake_store
         )
+        assert row_id is not None
         fake_store._rows[row_id].status = "failed"
 
         await process_batch(
@@ -586,6 +655,7 @@ class TestProcessBatch:
     ) -> None:
         drain = _make_drain()
         row_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
+        assert row_id is not None
 
         # Try to process with wrong tenant
         await process_batch(
@@ -618,6 +688,7 @@ class TestEndToEnd:
 
         # Step 1: persist batch
         row_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
+        assert row_id is not None
 
         # Step 2: enqueue (simulated)
         await fake_enqueuer.enqueue_process_batch(tenant_id=1, batch_id=row_id)
@@ -646,6 +717,7 @@ class TestEndToEnd:
         """Re-processing the same batch_id does not duplicate work."""
         drain = _make_drain()
         row_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
+        assert row_id is not None
 
         # First processing
         await process_batch(
@@ -756,6 +828,15 @@ async def test_worker_retries_processing_failures_with_exponential_backoff(
     assert caught.value.defer_score == 2_000
 
 
+def _voiceless_config() -> object:
+    """A configuration with no `stt:` section, which disables voice (S02-T07)."""
+
+    def require_stt() -> object:
+        raise ConfigError("models.yaml: no stt section (spec 11.1)")
+
+    return SimpleNamespace(models=SimpleNamespace(require_stt=require_stt))
+
+
 @pytest.mark.asyncio
 async def test_worker_startup_injects_postgres_batch_store(
     monkeypatch: pytest.MonkeyPatch,
@@ -763,11 +844,12 @@ async def test_worker_startup_injects_postgres_batch_store(
     engine = cast(AsyncEngine, object())
     sessions = cast(async_sessionmaker[AsyncSession], object())
     settings = cast(Settings, object())
+    config = _voiceless_config()
     startup_calls: list[str] = []
 
     def validated_startup(service: str) -> tuple[Settings, object]:
         startup_calls.append(service)
-        return settings, object()
+        return settings, config
 
     monkeypatch.setattr(worker_module, "startup", validated_startup)
     monkeypatch.setattr(
@@ -785,6 +867,85 @@ async def test_worker_startup_injects_postgres_batch_store(
     store = ctx["batch_store"]
     assert isinstance(store, PostgresBatchStore)
     assert store._sessions is sessions
+    # No `stt:` section: the worker still starts and still drains text (S02-T07).
+    assert ctx["voice"] is None
+
+
+# ─── The voice wiring of S02-T07 ───────────────────────────────────────────
+
+
+def _stt_settings(**overrides: object) -> Settings:
+    """The slice of the environment the voice wiring reads."""
+    return cast(
+        Settings,
+        SimpleNamespace(
+            **{
+                "channels": ("telegram",),
+                "groq_api_key": SecretStr("gsk-not-a-real-key"),
+                "telegram_bot_token": SecretStr("1234:token"),
+                "telegram_mode": "polling",
+                "telegram_webhook_secret": None,
+                "fittrack_config_dir": "config",
+                "encryption_keys": {1: bytes(range(32))},
+                "active_key_version": 1,
+                **overrides,
+            }
+        ),
+    )
+
+
+def _stt_config() -> object:
+    return SimpleNamespace(
+        models=SimpleNamespace(
+            require_stt=lambda: load_models(Path("config") / "models.yaml").require_stt()
+        )
+    )
+
+
+def test_voice_is_wired_when_the_channel_and_the_credential_are_there() -> None:
+    ctx: dict[str, object] = {
+        "db_engine": cast(AsyncEngine, object()),
+        "redis": cast(ArqRedis, object()),
+    }
+
+    voice = worker_module.build_voice_ingestion(ctx, _stt_settings(), cast(Config, _stt_config()))
+
+    assert voice is not None
+    assert isinstance(ctx["stt_http"], httpx.AsyncClient)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reason"),
+    [
+        pytest.param({"groq_api_key": None}, "no credential", id="credential"),
+        pytest.param({"channels": ()}, "channel not enabled", id="channel"),
+    ],
+)
+def test_voice_is_disabled_rather_than_fatal(overrides: dict[str, object], reason: str) -> None:
+    """A deployment that cannot transcribe still drains text (invariant 6)."""
+    ctx: dict[str, object] = {
+        "db_engine": cast(AsyncEngine, object()),
+        "redis": cast(ArqRedis, object()),
+    }
+
+    voice = worker_module.build_voice_ingestion(
+        ctx, _stt_settings(**overrides), cast(Config, _stt_config())
+    )
+
+    assert voice is None, reason
+    assert "stt_http" not in ctx
+
+
+@pytest.mark.asyncio
+async def test_worker_shutdown_closes_the_transcription_client() -> None:
+    http = httpx.AsyncClient()
+    ctx: dict[str, object] = {"stt_http": http, "voice": object()}
+
+    await worker_module.worker_shutdown(ctx)
+
+    assert http.is_closed
+    assert "stt_http" not in ctx
+    assert "voice" not in ctx
 
 
 def test_arq_redis_settings_use_validated_url_and_ca() -> None:
@@ -938,6 +1099,7 @@ async def test_postgres_batch_store_round_trip(
             cipher=cipher,
             store=store,
         )
+        assert row_id is not None
 
         row = await store.get(batch_id=row_id, tenant_id=tenant_id)
         assert row is not None

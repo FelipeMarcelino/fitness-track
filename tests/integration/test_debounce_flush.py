@@ -129,6 +129,7 @@ def _buffer_item(raw_message_id: int, text: str = "treino feito") -> bytes:
             "button_payload": None,
             "channel": "telegram",
             "channel_message_id": f"msg-{raw_message_id}",
+            "duration_s": None,
             "external_id_hash": "abc123",
             "kind": "text",
             "media_ref": None,
