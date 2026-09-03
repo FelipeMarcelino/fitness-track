@@ -8,6 +8,7 @@ can be developed independently (Sprint 02 tasks S02-T02 and S02-T03).
 from __future__ import annotations
 
 import json
+import logging
 import secrets
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -21,6 +22,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from fittrack.channels.base import InboundMessage
 from fittrack.security.crypto import ColumnCipher
 from fittrack.settings import ChannelKind
+
+logger = logging.getLogger(__name__)
 
 DEDUP_TTL_S = 24 * 60 * 60
 PROCESSING_TTL_S = 60
@@ -202,6 +205,18 @@ class TelegramWebhookIngress:
 
         try:
             for message in self._channel.parse(payload):
+                if message.kind == "button_reply":
+                    # Before anything else, and best-effort: Telegram leaves
+                    # the client's progress indicator spinning until this is
+                    # answered or it times out on its own, and a raised error
+                    # here must not cost the button press its durable record
+                    # (spec 18.2 review).
+                    answer_callback = getattr(self._channel, "answer_callback", None)
+                    if callable(answer_callback):
+                        try:
+                            await answer_callback(message.channel_message_id)
+                        except Exception:
+                            logger.exception("answerCallbackQuery failed")
                 identity = await self._identities.resolve_or_create(
                     channel=message.channel, external_id=message.external_id
                 )
@@ -220,6 +235,17 @@ class TelegramWebhookIngress:
                         tenant_id=identity.tenant_id,
                         revoked_at=datetime.now(UTC),
                     )
+                    # The cache can still be holding the pre-revocation
+                    # identity for up to its TTL; without invalidating it, a
+                    # user who unblocks and messages again during that window
+                    # would resolve straight back to it (spec 18.2 review).
+                    # `CachedIdentityResolver.invalidate` bumps a generation
+                    # counter an in-flight fill also checks, so this closes
+                    # the race with a concurrent resolve too, not just the
+                    # stale-read case.
+                    invalidate = getattr(self._identities, "invalidate", None)
+                    if callable(invalidate):
+                        await invalidate(channel=message.channel, external_id=message.external_id)
                 if not _is_processable(message):
                     continue
                 await self._buffer.append(

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, ClassVar
 
@@ -26,6 +26,8 @@ class FakeChannel:
 
     messages: list[InboundMessage]
     verified: bool = False
+    fail_callback_ack: bool = False
+    callback_acks: list[str] = field(default_factory=list)
     kind: ClassVar[ChannelKind] = "telegram"
 
     def verify(self, headers: Mapping[str, str], raw_body: bytes) -> None:
@@ -36,6 +38,11 @@ class FakeChannel:
     def parse(self, payload: Mapping[str, Any]) -> list[InboundMessage]:
         assert self.verified
         return self.messages
+
+    async def answer_callback(self, callback_query_id: str) -> None:
+        self.callback_acks.append(callback_query_id)
+        if self.fail_callback_ack:
+            raise RuntimeError("telegram refused answerCallbackQuery")
 
 
 class FakeDeduplicator:
@@ -62,10 +69,14 @@ class FakeDeduplicator:
 class FakeIdentityResolver:
     def __init__(self) -> None:
         self.external_ids: list[str] = []
+        self.invalidated: list[tuple[str, str]] = []
 
     async def resolve_or_create(self, *, channel: str, external_id: str) -> IngressIdentity:
         self.external_ids.append(external_id)
         return IngressIdentity(tenant_id=31, identity_id=41, external_id_hash=b"hashed-chat")
+
+    async def invalidate(self, *, channel: str, external_id: str) -> None:
+        self.invalidated.append((channel, external_id))
 
 
 class FakeRawMessages:
@@ -352,3 +363,147 @@ async def test_without_a_revoker_a_block_event_is_still_persisted_but_not_acted_
 
     assert len(persisted.messages) == 1
     assert buffer.envelopes == []
+
+
+async def test_a_block_event_invalidates_the_cached_identity() -> None:
+    """Without this, a resolver caching for 5 minutes (spec: identity cache)
+    keeps handing out the now-revoked identity until the TTL expires — a
+    user who unblocks and messages again during that window would resolve
+    against a destination `revoked_at` already marks unreachable (S02-T08
+    review).
+    """
+    identities = FakeIdentityResolver()
+    revoker = FakeRevoker()
+    service = TelegramWebhookIngress(
+        channel=FakeChannel([membership_event(status="kicked", update_id=995)]),
+        deduplicator=FakeDeduplicator(),
+        identities=identities,
+        raw_messages=FakeRawMessages(),
+        buffer=FakeBuffer(),
+        revoker=revoker,
+    )
+
+    await service.receive({"x-secret": "valid"}, b'{"update_id": 995}')
+
+    assert identities.invalidated == [("telegram", "private-chat-id")]
+
+
+async def test_a_resolver_without_invalidate_does_not_break_revocation() -> None:
+    """Duck-typed on purpose: `IngressIdentityResolver` never promised it."""
+
+    class BareResolver:
+        async def resolve_or_create(self, *, channel: str, external_id: str) -> IngressIdentity:
+            return IngressIdentity(tenant_id=31, identity_id=41, external_id_hash=b"h")
+
+    revoker = FakeRevoker()
+    service = TelegramWebhookIngress(
+        channel=FakeChannel([membership_event(status="kicked", update_id=996)]),
+        deduplicator=FakeDeduplicator(),
+        identities=BareResolver(),
+        raw_messages=FakeRawMessages(),
+        buffer=FakeBuffer(),
+        revoker=revoker,
+    )
+
+    await service.receive({"x-secret": "valid"}, b'{"update_id": 996}')
+
+    assert revoker.revoked == [(41, 31)]
+
+
+# --------------------------------------------------------------------------- #
+# Callback acknowledgement (spec 18.2 review) — before anything is queued
+# --------------------------------------------------------------------------- #
+
+
+def button_press(*, channel_message_id: str = "press:123") -> InboundMessage:
+    return InboundMessage(
+        channel="telegram",
+        external_id="private-chat-id",
+        channel_message_id=channel_message_id,
+        kind="button_reply",
+        text=None,
+        media_ref=None,
+        button_payload="set_confirmed",
+        sent_at=datetime(2026, 1, 1, tzinfo=UTC),
+        raw={"callback_query": {"id": "123", "from": {"id": "private-chat-id"}}},
+    )
+
+
+async def test_a_button_reply_is_acknowledged_before_anything_else() -> None:
+    channel = FakeChannel([button_press()])
+    service = TelegramWebhookIngress(
+        channel=channel,
+        deduplicator=FakeDeduplicator(),
+        identities=FakeIdentityResolver(),
+        raw_messages=FakeRawMessages(),
+        buffer=FakeBuffer(),
+    )
+
+    await service.receive({"x-secret": "valid"}, b'{"update_id": 997}')
+
+    assert channel.callback_acks == ["press:123"]
+
+
+async def test_a_text_message_is_never_acknowledged_as_a_callback() -> None:
+    channel = FakeChannel([inbound()])
+    service = TelegramWebhookIngress(
+        channel=channel,
+        deduplicator=FakeDeduplicator(),
+        identities=FakeIdentityResolver(),
+        raw_messages=FakeRawMessages(),
+        buffer=FakeBuffer(),
+    )
+
+    await service.receive({"x-secret": "valid"}, b'{"update_id": 998}')
+
+    assert channel.callback_acks == []
+
+
+async def test_a_failed_acknowledgement_does_not_block_the_durable_path() -> None:
+    """The button press is still persisted and buffered — Telegram's spinner
+    times out on its own; a lost button press does not.
+    """
+    channel = FakeChannel([button_press()], fail_callback_ack=True)
+    persisted = FakeRawMessages()
+    buffer = FakeBuffer()
+    service = TelegramWebhookIngress(
+        channel=channel,
+        deduplicator=FakeDeduplicator(),
+        identities=FakeIdentityResolver(),
+        raw_messages=persisted,
+        buffer=buffer,
+    )
+
+    await service.receive({"x-secret": "valid"}, b'{"update_id": 999}')
+
+    assert channel.callback_acks == ["press:123"]
+    assert len(persisted.messages) == 1
+    assert len(buffer.envelopes) == 1
+
+
+async def test_a_channel_without_answer_callback_does_not_break_button_replies() -> None:
+    """Duck-typed on purpose: `InboundChannel` never promised it either."""
+
+    @dataclass
+    class BareChannel:
+        messages: list[InboundMessage]
+        kind: ClassVar[ChannelKind] = "telegram"
+
+        def verify(self, headers: Mapping[str, str], raw_body: bytes) -> None:
+            return None
+
+        def parse(self, payload: Mapping[str, Any]) -> list[InboundMessage]:
+            return self.messages
+
+    buffer = FakeBuffer()
+    service = TelegramWebhookIngress(
+        channel=BareChannel([button_press()]),
+        deduplicator=FakeDeduplicator(),
+        identities=FakeIdentityResolver(),
+        raw_messages=FakeRawMessages(),
+        buffer=buffer,
+    )
+
+    await service.receive({"x-secret": "valid"}, b'{"update_id": 1000}')
+
+    assert len(buffer.envelopes) == 1
