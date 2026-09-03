@@ -15,6 +15,7 @@ reach a log (10, spec 20.6).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -41,6 +42,7 @@ from fittrack.services.stt import (
     DEFAULT_RETRY_DIR,
     GROQ_TRANSCRIPTIONS_URL,
     INAUDIBLE_PROMPT,
+    MODEL_TRAINING_CONSENT,
     TOO_LONG_PROMPT,
     WORKOUT_DATA_CONSENT,
     AudioTranscriber,
@@ -126,13 +128,17 @@ class FakeTranscriber:
 
 
 class FakeConsent:
-    def __init__(self, *, granted: bool = True) -> None:
+    def __init__(self, *, granted: bool = True, retention: bool | None = None) -> None:
         self.granted = granted
+        # §11.3 keeps the two apart: `workout_data` covers *using* the
+        # recording, `model_training` covers keeping it. Defaults to the same
+        # answer so the tests that do not care are unaffected.
+        self.retention = granted if retention is None else retention
         self.calls: list[tuple[int, str]] = []
 
     async def has_consent(self, *, tenant_id: int, kind: str) -> bool:
         self.calls.append((tenant_id, kind))
-        return self.granted
+        return self.retention if kind == MODEL_TRAINING_CONSENT else self.granted
 
 
 class FakeTranscripts:
@@ -159,7 +165,10 @@ class FakeTranscripts:
                 answered=answered,
             )
         )
-        self.transcript = transcript
+        # Keyed by row, like `raw_message`: a single slot let one item's
+        # transcript answer for the next one's lookup.
+        self.transcripts: dict[int, str] = {}
+        self.default_transcript = transcript
         self.answered_flag = answered
         self.loaded: list[int] = []
         self.decrypted: list[int] = []
@@ -184,13 +193,15 @@ class FakeTranscripts:
         # Standing in for the decryption the SQL store does here (§22.2): what
         # the test asserts is that nothing calls this before the consent gate.
         self.decrypted.append(raw_message_id)
-        return None if self.unreadable else self.transcript
+        if self.unreadable:
+            return None
+        return self.transcripts.get(raw_message_id, self.default_transcript)
 
     async def save(self, *, tenant_id: int, raw_message_id: int, transcript: str) -> None:
         self.saved.append((tenant_id, raw_message_id, transcript))
         # Deliberately does not touch `answered_flag`: a transcription that
         # worked is not a fixed reply that was sent (D-3).
-        self.transcript = transcript
+        self.transcripts[raw_message_id] = transcript
         if self.watch is not None:
             self.audio_existed_on_save.append(self.watch.is_file())
 
@@ -201,6 +212,7 @@ class FakeTranscripts:
 
 class FakeReplies:
     def __init__(self) -> None:
+        self.groups: list[UUID] = []
         self.sent: list[tuple[int, int, ChannelKind, tuple[str | None, ...]]] = []
 
     async def enqueue_response(
@@ -210,13 +222,29 @@ class FakeReplies:
         identity_id: int,
         channel: ChannelKind,
         blocks: Sequence[OutboundBlock],
+        group_id: UUID | None = None,
     ) -> UUID:
         self.sent.append((tenant_id, identity_id, channel, tuple(b.text for b in blocks)))
-        return uuid4()
+        assigned = group_id or uuid4()
+        self.groups.append(assigned)
+        return assigned
 
     @property
     def texts(self) -> list[str]:
         return [text for *_, texts in self.sent for text in texts if text is not None]
+
+
+class FakeUsage:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.records: list[tuple[int, str, str, float]] = []
+
+    async def record_audio(
+        self, *, tenant_id: int, provider: str, model: str, audio_seconds: float
+    ) -> None:
+        if self.fail:
+            raise RuntimeError("the ledger is unavailable")
+        self.records.append((tenant_id, provider, model, audio_seconds))
 
 
 def voice_item(
@@ -265,8 +293,12 @@ def ingestion(
     transcripts: FakeTranscripts | None = None,
     replies: FakeReplies | None = None,
     stt: SttConfig | None = None,
+    budget_s: float | None = None,
+    usage: FakeUsage | None = None,
 ) -> VoiceIngestion:
     return VoiceIngestion(
+        budget_s=budget_s,
+        usage=usage,
         channel="telegram",
         downloader=downloader or FakeDownloader(tmp_path / "download"),
         transcriber=transcriber or FakeTranscriber(),
@@ -505,6 +537,56 @@ async def test_a_stored_transcript_repeats_neither_the_download_nor_the_call(
     assert outcome.text == "ja transcrito"
     assert downloader.calls == []
     assert transcriber.calls == []
+
+
+async def test_a_transcription_is_recorded_in_the_usage_ledger(tmp_path: Path) -> None:
+    """§11.3: "Custo | Registrado em `usage_ledger.audio_seconds`"."""
+    usage = FakeUsage()
+
+    await ingestion(
+        tmp_path=tmp_path,
+        transcriber=FakeTranscriber(Transcription("supino", duration_s=12.5)),
+        usage=usage,
+    ).ingest(voice_item(), tenant_id=TENANT)
+
+    assert usage.records == [(TENANT, "groq", "test-stt", 12.5)]
+
+
+async def test_a_recording_the_provider_did_not_measure_bills_nothing(
+    tmp_path: Path,
+) -> None:
+    """No duration, no line: an invented number is worse than a missing one."""
+    usage = FakeUsage()
+
+    await ingestion(
+        tmp_path=tmp_path, transcriber=FakeTranscriber(Transcription("supino")), usage=usage
+    ).ingest(voice_item(), tenant_id=TENANT)
+
+    assert usage.records == []
+
+
+async def test_a_refused_recording_bills_nothing(tmp_path: Path) -> None:
+    usage = FakeUsage()
+
+    await ingestion(tmp_path=tmp_path, consent=FakeConsent(granted=False), usage=usage).ingest(
+        voice_item(), tenant_id=TENANT
+    )
+
+    assert usage.records == []
+
+
+async def test_a_ledger_failure_does_not_cost_the_user_the_transcription(
+    tmp_path: Path,
+) -> None:
+    """Accounting is not the message. It understates the month, and says so."""
+    outcome = await ingestion(
+        tmp_path=tmp_path,
+        transcriber=FakeTranscriber(Transcription("supino", duration_s=3.0)),
+        usage=FakeUsage(fail=True),
+    ).ingest(voice_item(), tenant_id=TENANT)
+
+    assert outcome.status is VoiceStatus.TRANSCRIBED
+    assert outcome.text == "supino"
 
 
 # --------------------------------------------------------------------------- #
@@ -994,6 +1076,227 @@ def test_an_unknown_container_falls_back_to_the_channel_default(tmp_path: Path) 
     assert upload_format(Path("x.MP3")) == (".mp3", "audio/mpeg")
     assert upload_format(Path("x.exe")) == (".ogg", "audio/ogg")
     assert upload_format(Path("x")) == (".ogg", "audio/ogg")
+
+
+# --------------------------------------------------------------------------- #
+# Retention needs its own consent (spec 11.3, E-1)
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_failed_transcription_keeps_the_audio_only_with_model_training(
+    tmp_path: Path,
+) -> None:
+    """§11.3: "retenção só com `model_training`". The six hour buffer is retention."""
+    consent = FakeConsent(granted=True, retention=True)
+
+    await ingestion(
+        tmp_path=tmp_path,
+        consent=consent,
+        transcriber=FakeTranscriber(SttTransportError("timeout")),
+    ).ingest(voice_item(), tenant_id=TENANT)
+
+    assert pending_audio_path(tmp_path / "retry", RAW_MESSAGE).is_file()
+    assert (TENANT, MODEL_TRAINING_CONSENT) in consent.calls
+
+
+@pytest.mark.parametrize("retention", [False], ids=["revoked or never granted"])
+async def test_without_model_training_a_failed_recording_is_deleted_at_once(
+    tmp_path: Path, retention: bool
+) -> None:
+    """Keeping somebody's voice for six hours is retention, and needs its own yes.
+
+    The item is still recorded — that is `raw_message.payload`, and it does not
+    depend on this consent (invariant 6). Only the audio goes.
+    """
+    transcriber = FakeTranscriber(SttTransportError("timeout"))
+
+    outcome = await ingestion(
+        tmp_path=tmp_path,
+        consent=FakeConsent(granted=True, retention=retention),
+        transcriber=transcriber,
+    ).ingest(voice_item(), tenant_id=TENANT)
+
+    assert outcome.status is VoiceStatus.FAILED
+    assert outcome.enters_batch, "the item was discarded, not just the audio"
+    [(audio, _)] = transcriber.calls
+    assert not audio.exists()
+    assert list((tmp_path / "retry").glob("*")) == []
+
+
+async def test_a_retention_refusal_still_marks_the_item_incomplete(tmp_path: Path) -> None:
+    [resolved] = await ingestion(
+        tmp_path=tmp_path,
+        consent=FakeConsent(granted=True, retention=False),
+        transcriber=FakeTranscriber(SttTransportError("timeout")),
+    ).resolve([voice_item()], tenant_id=TENANT)
+
+    assert resolved["status"] == "incomplete"
+    assert resolved["was_audio"] is True
+
+
+# --------------------------------------------------------------------------- #
+# The burst fits inside the job that runs it (E-3)
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_slow_burst_stops_transcribing_before_the_job_is_killed(
+    tmp_path: Path,
+) -> None:
+    """ARQ cancels at `job_timeout` and does not retry: `TimeoutError` is not
+    `CancelledError`, so the drain is left orphaned and nothing re-drives it
+    until the user sends another message. The voice step has to fit.
+    """
+
+    class SlowTranscriber:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def transcribe(self, audio: Path, *, prompt: str) -> Transcription:
+            self.calls += 1
+            await asyncio.sleep(0.20)
+            return Transcription("demorou")
+
+    transcriber = SlowTranscriber()
+    items = [voice_item(raw_message_id=raw_id) for raw_id in (11, 12, 13)]
+
+    resolved = await ingestion(
+        tmp_path=tmp_path, transcriber=transcriber, stt=config(timeout_s=1), budget_s=0.30
+    ).resolve(items, tenant_id=TENANT)
+
+    assert transcriber.calls < 3, "the whole burst was transcribed past the budget"
+    assert len(resolved) == 3, "an item was dropped instead of recorded"
+    assert resolved[-1]["status"] == "incomplete"
+
+
+async def test_an_item_that_outruns_the_budget_is_recorded_not_lost(
+    tmp_path: Path,
+) -> None:
+    """A single call that never returns must not take the drain with it."""
+
+    class HangingTranscriber:
+        async def transcribe(self, audio: Path, *, prompt: str) -> Transcription:
+            await asyncio.sleep(30)
+            raise AssertionError("the budget did not cut this short")
+
+    resolved = await ingestion(
+        tmp_path=tmp_path, transcriber=HangingTranscriber(), budget_s=0.15
+    ).resolve([voice_item()], tenant_id=TENANT)
+
+    assert len(resolved) == 1
+    assert resolved[0]["status"] == "incomplete"
+    assert resolved[0]["was_audio"] is True
+
+
+async def test_a_burst_within_the_budget_is_transcribed_in_full(tmp_path: Path) -> None:
+    transcriber = FakeTranscriber(Transcription("um"), Transcription("dois"), Transcription("tres"))
+    items = [voice_item(raw_message_id=raw_id) for raw_id in (21, 22, 23)]
+
+    resolved = await ingestion(tmp_path=tmp_path, transcriber=transcriber, budget_s=30).resolve(
+        items, tenant_id=TENANT
+    )
+
+    assert [item["text"] for item in resolved] == ["um", "dois", "tres"]
+
+
+# --------------------------------------------------------------------------- #
+# The credential is usable, or the deployment does not start (E-6)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "credential",
+    ["gsk-key\n", " gsk-key", "gsk-key ", "gsk-key\t"],
+    ids=["newline", "leading", "trailing", "tab"],
+)
+def test_a_credential_wearing_whitespace_is_refused_at_startup(credential: str) -> None:
+    """A header value with a newline is refused by the HTTP stack itself.
+
+    The broad handler then turns that into `incomplete` for *every* recording,
+    which is an incident. The channel registry already refuses padding rather
+    than trimming it, for the same reason: the deployment is what needs fixing.
+    """
+    with pytest.raises(ValueError, match="whitespace"):
+        GroqTranscriber(http=httpx.AsyncClient(), api_key=SecretStr(credential), config=config())
+
+
+def test_a_usable_credential_is_accepted() -> None:
+    transcriber = GroqTranscriber(
+        http=httpx.AsyncClient(), api_key=SecretStr("gsk-key"), config=config()
+    )
+
+    assert transcriber is not None
+
+
+# --------------------------------------------------------------------------- #
+# The fixed reply is idempotent by construction (E-5)
+# --------------------------------------------------------------------------- #
+
+
+async def test_the_same_refusal_reuses_one_response_group(tmp_path: Path) -> None:
+    """The marker and the enqueue commit separately, so the enqueue itself has
+    to be idempotent: a group id derived from the row makes the retry's insert
+    a no-op instead of a second bubble at the user.
+    """
+    replies = FakeReplies()
+    first = ingestion(
+        tmp_path=tmp_path,
+        transcriber=FakeTranscriber(Transcription("")),
+        transcripts=FakeTranscripts(),
+        replies=replies,
+    )
+    await first.ingest(voice_item(), tenant_id=TENANT)
+
+    # The marker write failed, so the retry sees `answered=False` again.
+    second = ingestion(
+        tmp_path=tmp_path,
+        transcriber=FakeTranscriber(Transcription("")),
+        transcripts=FakeTranscripts(),
+        replies=replies,
+    )
+    await second.ingest(voice_item(), tenant_id=TENANT)
+
+    assert len(replies.groups) == 2
+    assert replies.groups[0] == replies.groups[1], "the retry opened a second group"
+
+
+async def test_two_different_refusals_do_not_share_a_group(tmp_path: Path) -> None:
+    replies = FakeReplies()
+
+    await ingestion(
+        tmp_path=tmp_path,
+        transcriber=FakeTranscriber(Transcription("")),
+        replies=replies,
+    ).ingest(voice_item(), tenant_id=TENANT)
+    await ingestion(tmp_path=tmp_path, consent=FakeConsent(granted=False), replies=replies).ingest(
+        voice_item(), tenant_id=TENANT
+    )
+
+    assert replies.groups[0] != replies.groups[1]
+
+
+# --------------------------------------------------------------------------- #
+# The single output path (E-4, invariant 2)
+# --------------------------------------------------------------------------- #
+
+
+def test_the_service_never_writes_the_outbound_queue_itself() -> None:
+    """Invariant 2 and ADR-0009: one path out, and this is not it.
+
+    The fixed replies of §11.3 exist before `voice_agent` and `deliver` do, so
+    the service decides them — but it hands a block to the outbound service of
+    S02-T06 and never touches the queue, the channel API, or a delivery.
+    """
+    source = (ROOT / "src" / "fittrack" / "services" / "stt.py").read_text(encoding="utf-8")
+    statements = [
+        line
+        for line in source.splitlines()
+        if "outbound" in line.lower() and not line.lstrip().startswith("#")
+    ]
+
+    # Prose about the queue is fine; a statement that writes it is not.
+    assert not [line for line in statements if "INSERT" in line or "UPDATE" in line]
+    assert "PostgresOutboundQueueStore" not in source
+    assert "from fittrack.services.outbound import" not in source
 
 
 # --------------------------------------------------------------------------- #

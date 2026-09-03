@@ -166,6 +166,12 @@ class FakeBatchStore:
             attempts=row.attempts,
         )
 
+    async def mark_failed(self, *, batch_id: int, tenant_id: int, error: str) -> None:
+        row = self._rows.get(batch_id)
+        if row is not None and row.status == "pending":
+            row.status = "failed"
+            row.error = error
+
     async def mark_done(self, *, batch_id: int, tenant_id: int) -> None:
         row = self._rows.get(batch_id)
         if row is not None and row.tenant_id == tenant_id:
@@ -182,6 +188,7 @@ class StoredBatch:
     key_version: int
     status: str = "pending"
     attempts: int = 0
+    error: str | None = None
 
 
 @dataclass
@@ -347,6 +354,9 @@ class _KeepsVoice:
     def __init__(self) -> None:
         self.calls = 0
 
+    async def may_process_voice(self, *, tenant_id: int) -> bool:
+        return True
+
     async def resolve(
         self, items: list[dict[str, object]], *, tenant_id: int
     ) -> list[dict[str, object]]:
@@ -359,11 +369,37 @@ class _KeepsVoice:
         return items
 
 
+class _RevokedVoice:
+    """A resolver for a tenant whose `workout_data` consent is gone.
+
+    `VoiceIngestion` answers the same way: the consent gate is the first thing
+    it checks, so the recording is neither downloaded nor decrypted, the fixed
+    reply is queued, and the item leaves the burst.
+    """
+
+    def __init__(self) -> None:
+        self.resolved = 0
+        self.asked = 0
+
+    async def may_process_voice(self, *, tenant_id: int) -> bool:
+        self.asked += 1
+        return False
+
+    async def resolve(
+        self, items: list[dict[str, object]], *, tenant_id: int
+    ) -> list[dict[str, object]]:
+        self.resolved += 1
+        return [item for item in items if item.get("kind") != "voice"]
+
+
 class _DropsVoice:
     """A resolver whose second attempt came back inaudible: the item is answered."""
 
     def __init__(self) -> None:
         self.calls = 0
+
+    async def may_process_voice(self, *, tenant_id: int) -> bool:
+        return True
 
     async def resolve(
         self, items: list[dict[str, object]], *, tenant_id: int
@@ -570,6 +606,97 @@ class TestPersistBatch:
         assert resolver.calls == 1
 
     @pytest.mark.asyncio
+    async def test_a_reused_batch_is_not_handed_over_after_consent_is_revoked(
+        self, cipher: ColumnCipher, fake_store: FakeBatchStore
+    ) -> None:
+        """E-2. Looking the batch up first must not step around the consent gate.
+
+        `insert` can succeed and `enqueue_process_batch` fail; the drain comes
+        round again, and `workout_data` can be revoked in between. Returning the
+        persisted row without asking would hand an already-decrypted transcript
+        to the graph for a tenant who withdrew consent — criterion 9 through the
+        back door.
+        """
+        items: list[dict[str, object]] = [
+            {"channel_message_id": "m1", "raw_message_id": 101, "kind": "voice"},
+            {"channel_message_id": "m2", "raw_message_id": 102, "kind": "text", "text": "oi"},
+        ]
+        first = await persist_batch(
+            drain=_make_drain(list(items)),
+            tenant_id=1,
+            cipher=cipher,
+            store=fake_store,
+            voice=_KeepsVoice(),
+        )
+        assert first is not None
+
+        revoked = _RevokedVoice()
+        retry = await persist_batch(
+            drain=_make_drain(list(items)),
+            tenant_id=1,
+            cipher=cipher,
+            store=fake_store,
+            voice=revoked,
+        )
+
+        assert revoked.asked == 1, "the consent gate was not consulted on the reuse path"
+        assert retry is None, "the batch was handed to the graph despite revoked consent"
+        row = await fake_store.get(batch_id=first, tenant_id=1)
+        assert row is not None
+        assert row.status == "failed", "the row was left pending with nothing to pick it up"
+
+    @pytest.mark.asyncio
+    async def test_a_text_only_drain_does_not_pay_for_the_consent_gate(
+        self, cipher: ColumnCipher, fake_store: FakeBatchStore
+    ) -> None:
+        """Nothing in a text burst depends on it, so nothing asks."""
+        items: list[dict[str, object]] = [
+            {"channel_message_id": "m1", "raw_message_id": 101, "kind": "text", "text": "oi"}
+        ]
+        await persist_batch(
+            drain=_make_drain(list(items)), tenant_id=1, cipher=cipher, store=fake_store
+        )
+
+        revoked = _RevokedVoice()
+        retry = await persist_batch(
+            drain=_make_drain(list(items)),
+            tenant_id=1,
+            cipher=cipher,
+            store=fake_store,
+            voice=revoked,
+        )
+
+        assert revoked.asked == 0
+        assert retry is not None
+
+    @pytest.mark.asyncio
+    async def test_a_reused_batch_still_goes_through_while_consent_holds(
+        self, cipher: ColumnCipher, fake_store: FakeBatchStore
+    ) -> None:
+        """The gate is a gate, not a second transcription: the saving of D-2 holds."""
+        items: list[dict[str, object]] = [
+            {"channel_message_id": "m1", "raw_message_id": 101, "kind": "voice"}
+        ]
+        resolver = _KeepsVoice()
+        first = await persist_batch(
+            drain=_make_drain(list(items)),
+            tenant_id=1,
+            cipher=cipher,
+            store=fake_store,
+            voice=resolver,
+        )
+        retry = await persist_batch(
+            drain=_make_drain(list(items)),
+            tenant_id=1,
+            cipher=cipher,
+            store=fake_store,
+            voice=resolver,
+        )
+
+        assert retry == first
+        assert resolver.calls == 1
+
+    @pytest.mark.asyncio
     async def test_an_untranscribed_voice_item_is_still_recorded_as_incomplete(
         self, cipher: ColumnCipher, fake_store: FakeBatchStore
     ) -> None:
@@ -616,6 +743,9 @@ class TestPersistBatch:
         """S02-T07: the batch the graph receives holds text, never a media ref."""
 
         class Resolver:
+            async def may_process_voice(self, *, tenant_id: int) -> bool:
+                return True
+
             async def resolve(
                 self, items: list[dict[str, object]], *, tenant_id: int
             ) -> list[dict[str, object]]:
@@ -651,6 +781,9 @@ class TestPersistBatch:
         """An inaudible lone voice note was answered on its own (§11.3)."""
 
         class DroppingResolver:
+            async def may_process_voice(self, *, tenant_id: int) -> bool:
+                return True
+
             async def resolve(
                 self, items: list[dict[str, object]], *, tenant_id: int
             ) -> list[dict[str, object]]:

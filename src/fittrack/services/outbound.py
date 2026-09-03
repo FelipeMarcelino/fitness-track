@@ -313,15 +313,23 @@ class OutboundService:
         blocks: Sequence[OutboundBlock],
         proactive: bool = False,
         scheduled_at: datetime | None = None,
+        group_id: UUID | None = None,
     ) -> UUID:
-        """Persist one answer with a fresh group, even when it has one block."""
+        """Persist one answer with its own group, even when it has one block.
+
+        `group_id` is normally left out and a fresh one is minted. A caller
+        passes one when the answer has to be idempotent across a retry — the
+        fixed replies of §11.3 derive theirs from the message they answer, and
+        the unique index of migration 0006 turns the second attempt into a
+        no-op rather than a second bubble.
+        """
         if tenant_id <= 0 or identity_id <= 0:
             raise ValueError("tenant_id and identity_id must be positive")
         if not blocks:
             raise ValueError("an outbound response must contain at least one block")
         if any(block.media_path is not None for block in blocks):
             raise ValueError(LOCAL_MEDIA_QUEUE_ERROR)
-        group_id = self._group_id()
+        group_id = group_id or self._group_id()
         schedule = scheduled_at or self._now()
         if schedule.tzinfo is None or schedule.utcoffset() is None:
             raise ValueError("scheduled_at must be timezone-aware")
@@ -484,7 +492,10 @@ class PostgresOutboundQueueStore:
                         ":id, :tenant_id, :identity_id, CAST(:channel AS channel_kind), "
                         ":kind, :payload, :key_version, :group_id, :seq, "
                         ":scheduled_at, :scheduled_at"
-                        ")"
+                        # A caller that derives its group id is asking for the
+                        # enqueue to be repeatable (migration 0006). Everyone
+                        # else mints a fresh UUID, which never collides.
+                        ") ON CONFLICT (group_id, seq) DO NOTHING"
                     ),
                     {
                         "id": item_id,

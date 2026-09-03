@@ -93,6 +93,10 @@ class BatchStore(Protocol):
         """Set ``status='done'``, ``finished_at=now()``, ``attempts += 1``."""
         ...
 
+    async def mark_failed(self, *, batch_id: int, tenant_id: int, error: str) -> None:
+        """Set ``status='failed'`` with a reason, so nothing picks the row up."""
+        ...
+
 
 class PostgresBatchStore:
     """Tenant-scoped PostgreSQL implementation of :class:`BatchStore`."""
@@ -171,6 +175,17 @@ class PostgresBatchStore:
                 {"batch_id": batch_id},
             )
 
+    async def mark_failed(self, *, batch_id: int, tenant_id: int, error: str) -> None:
+        async with tenant_session(self._sessions, tenant_id) as session:
+            await session.execute(
+                text(
+                    "UPDATE processing_batch "
+                    "SET status = 'failed', error = :error, finished_at = now() "
+                    "WHERE id = :batch_id AND status = 'pending'"
+                ),
+                {"batch_id": batch_id, "error": error},
+            )
+
     @staticmethod
     def _to_batch_row(row: object) -> BatchRow:
         from collections.abc import Mapping
@@ -200,6 +215,15 @@ class VoiceResolver(Protocol):
         self, items: list[dict[str, object]], *, tenant_id: int
     ) -> list[dict[str, object]]:
         """Return the burst with its voice items turned into text."""
+        ...
+
+    async def may_process_voice(self, *, tenant_id: int) -> bool:
+        """Whether this tenant's recordings may still be used at all (§11.3).
+
+        The cheap half of `resolve`: one indexed query and no provider call, so
+        the reuse path can ask without paying for a transcription it does not
+        need.
+        """
         ...
 
 
@@ -299,6 +323,26 @@ async def persist_batch(
             message_ids=message_ids,
         )
         if existing is not None:
+            if not await _voice_still_allowed(drain.items, tenant_id=tenant_id, voice=voice):
+                # Consent went away between the insert and this retry. Handing
+                # the row over would give the graph a transcript the tenant has
+                # withdrawn permission for — the whole gate, stepped around by
+                # the lookup that skips the voice step (§11.3, criterion 9).
+                if voice is not None:
+                    # Through the ordinary path, so the tenant is told why:
+                    # `ingest` refuses at the consent gate before it downloads
+                    # or decrypts anything, and queues the fixed reply once.
+                    await voice.resolve(drain.items, tenant_id=tenant_id)
+                await store.mark_failed(
+                    batch_id=existing.id,
+                    tenant_id=tenant_id,
+                    error="workout_data consent revoked before the batch was processed",
+                )
+                logger.info(
+                    "batch abandoned: consent was revoked before it was processed",
+                    extra={"tenant_id": tenant_id, "batch_id": existing.id},
+                )
+                return None
             logger.info(
                 "batch already persisted, reusing",
                 extra={"tenant_id": tenant_id, "batch_id": existing.id},
@@ -343,6 +387,23 @@ async def persist_batch(
         extra={"tenant_id": tenant_id, "batch_id": row_id, "item_count": len(items)},
     )
     return row_id
+
+
+async def _voice_still_allowed(
+    items: list[dict[str, object]],
+    *,
+    tenant_id: int,
+    voice: VoiceResolver | None,
+) -> bool:
+    """Whether a burst that carries voice may still be handed to the graph.
+
+    Only asked when there is voice in it and something to ask: a text burst
+    depends on no recording, and a deployment with no transcription wiring has
+    no transcript in the batch to protect.
+    """
+    if voice is None or not any(item.get("kind") == "voice" for item in items):
+        return True
+    return await voice.may_process_voice(tenant_id=tenant_id)
 
 
 # ─── Process ───────────────────────────────────────────────────────────────

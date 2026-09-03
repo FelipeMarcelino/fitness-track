@@ -64,6 +64,7 @@ from fittrack.services.stt import (
     GroqTranscriber,
     SqlConsentGate,
     SqlTranscriptStore,
+    SqlUsageLedger,
     VoiceIngestion,
     purge_stale_audio,
 )
@@ -89,6 +90,15 @@ JOB_TIMEOUT = 90
 # How often the retention sweep of §11.3 runs on its own, for the worker that
 # keeps a failed recording and then receives no more voice.
 AUDIO_SWEEP_MINUTES = frozenset({0, 30})
+
+# What the voice step of one burst may spend, leaving the rest of `flush_check`
+# — the drain read, the encryption, the insert and the enqueue — inside the job
+# budget. ARQ kills a job at `job_timeout` and does *not* retry it
+# (`TimeoutError` is not `CancelledError`, so its "will be run again" branch
+# never fires), and the drain is then orphaned in Redis with nothing to
+# re-drive it until the tenant sends another message. A burst of slow
+# recordings must not be able to reach that.
+VOICE_BUDGET_S = JOB_TIMEOUT - 20
 
 
 def build_redis_settings(settings: Settings | None = None) -> RedisSettings:
@@ -232,10 +242,14 @@ def build_voice_ingestion(
     ctx["stt_http"] = http
     return VoiceIngestion(
         channel=VOICE_CHANNEL,
+        budget_s=VOICE_BUDGET_S,
         downloader=channel,
         transcriber=GroqTranscriber(http=http, api_key=credential, config=stt),
         consent=SqlConsentGate(sessions),
         transcripts=SqlTranscriptStore(sessions, cipher),
+        # The cost line of §11.3. Accounting only: a ledger failure is logged
+        # and never costs the user their transcription.
+        usage=SqlUsageLedger(sessions),
         config=stt,
         prompt_dir=Path(settings.fittrack_config_dir) / "prompts",
         # The fixed replies of §11.3 leave through the single output path of

@@ -24,14 +24,16 @@ for: the day LGPD tightens, `faster-whisper` self-hosted replaces
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from time import monotonic
 from typing import Protocol
-from uuid import UUID
+from uuid import UUID, uuid5
 
 import httpx
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -52,6 +54,7 @@ __all__ = [
     "DEFAULT_RETRY_DIR",
     "GROQ_TRANSCRIPTIONS_URL",
     "INAUDIBLE_PROMPT",
+    "MODEL_TRAINING_CONSENT",
     "TOO_LONG_PROMPT",
     "WORKOUT_DATA_CONSENT",
     "AudioTranscriber",
@@ -61,11 +64,13 @@ __all__ = [
     "ReplyQueue",
     "SqlConsentGate",
     "SqlTranscriptStore",
+    "SqlUsageLedger",
     "SttError",
     "SttRefusedError",
     "SttTransportError",
     "TranscriptStore",
     "Transcription",
+    "UsageLedger",
     "VoiceIngestion",
     "VoiceMessage",
     "VoiceOutcome",
@@ -92,10 +97,13 @@ INAUDIBLE_PROMPT = "stt_inaudible.md"
 TOO_LONG_PROMPT = "stt_too_long.md"
 CONSENT_PROMPT = "voice_consent_required.md"
 
-# The `consent_kind` of the schema (spec 5.2) that covers using the recording.
-# Keeping the audio for training is a *different* consent (`model_training`),
-# which is why nothing here retains anything.
+# The two `consent_kind` values of the schema (spec 5.2) this path needs, and
+# they are not interchangeable: §11.3 says the *use* of the audio is covered by
+# `workout_data`, and "retenção só com `model_training`". Transcribing is use;
+# keeping the recording for six hours so a retry can repeat the call is
+# retention, and it asks the second question.
 WORKOUT_DATA_CONSENT = "workout_data"
+MODEL_TRAINING_CONSENT = "model_training"
 
 # tmpfs, never a persistent volume: the file is the user's voice. Its own
 # directory rather than `/tmp` itself, because the retention sweep deletes what
@@ -114,6 +122,11 @@ DEFAULT_RETRY_DIR = MEDIA_TMPFS_DIR
 # provider that picks its decoder from the multipart filename would refuse a
 # recording it supports. The suffix is channel-supplied text, so it is matched
 # against what the provider documents rather than passed through.
+# The group id of a fixed reply is derived from the message it answers, so a
+# retry that re-enqueues it lands on the same row instead of a second bubble
+# (see `_reply_group`).
+VOICE_REPLY_NAMESPACE = UUID("f17b9a54-6a71-5c2b-9a0e-2b2f0b1d0c11")
+
 AUDIO_SUFFIX = ".ogg"
 UPLOAD_MIME = "audio/ogg"
 UPLOAD_FORMATS: Mapping[str, str] = {
@@ -289,6 +302,20 @@ class TranscriptStore(Protocol):
         """Record that this message has had its fixed reply, once."""
 
 
+class UsageLedger(Protocol):
+    """`usage_ledger`, as the cost line of §11.3 needs it."""
+
+    async def record_audio(
+        self,
+        *,
+        tenant_id: int,
+        provider: str,
+        model: str,
+        audio_seconds: float,
+    ) -> None:
+        """Record the seconds a transcription billed for."""
+
+
 class ReplyQueue(Protocol):
     """The outbound service, as the fixed replies of 11.3 need it (S02-T06)."""
 
@@ -299,8 +326,9 @@ class ReplyQueue(Protocol):
         identity_id: int,
         channel: ChannelKind,
         blocks: Sequence[OutboundBlock],
+        group_id: UUID | None = None,
     ) -> UUID:
-        """Queue one answer, with its own group id."""
+        """Queue one answer under the given group, or a fresh one."""
 
 
 # --------------------------------------------------------------------------- #
@@ -543,11 +571,24 @@ class GroqTranscriber:
 
 
 def _secret(api_key: object) -> str:
-    """The credential as a string, from a `SecretStr` or a plain one."""
+    """The credential as a string, from a `SecretStr` or a plain one.
+
+    Padding is refused rather than trimmed, exactly as the channel registry
+    refuses it: a token that kept the newline of the file it was mounted from
+    is a broken deployment, and quietly repairing one hides what needs fixing.
+    It also cannot work — `Authorization` with a newline is rejected by the
+    HTTP stack itself, and the broad failure handler would turn that into
+    `incomplete` for every recording, which is an incident rather than a
+    deployment that never happened. The complaint never quotes the value.
+    """
     getter = getattr(api_key, "get_secret_value", None)
     value = getter() if callable(getter) else api_key
     if not isinstance(value, str) or not value.strip():
         raise ValueError("the transcription provider needs a credential")
+    if value != value.strip():
+        raise ValueError(
+            "the transcription credential carries whitespace around it; set it without the padding"
+        )
     return value
 
 
@@ -578,6 +619,7 @@ class VoiceIngestion:
         self,
         *,
         channel: ChannelKind,
+        budget_s: float | None = None,
         downloader: MediaDownloader,
         transcriber: AudioTranscriber,
         consent: ConsentGate,
@@ -585,6 +627,7 @@ class VoiceIngestion:
         config: SttConfig,
         prompt_dir: Path,
         replies: ReplyQueue | None = None,
+        usage: UsageLedger | None = None,
         retry_dir: Path = DEFAULT_RETRY_DIR,
     ) -> None:
         # Which channel the downloader speaks. `download_media` takes a
@@ -593,6 +636,14 @@ class VoiceIngestion:
         # against `getFile` — the same category error the channel registry
         # checks for at the other end.
         self._channel = channel
+        # How long the whole voice step of one burst may take. The transcription
+        # runs inside `flush_check`, and ARQ kills a job at `job_timeout`
+        # without retrying it — `TimeoutError` is not `CancelledError`, so its
+        # "cancelled, will be run again" branch never fires. The drain is then
+        # left orphaned in Redis and nothing re-drives it until the tenant sends
+        # another message, so an unbounded loop over a burst can strand it
+        # indefinitely. `None` leaves it unbounded, which only tests want.
+        self._budget_s = budget_s
         self._downloader = downloader
         self._transcriber = transcriber
         self._consent = consent
@@ -600,6 +651,7 @@ class VoiceIngestion:
         self._config = config
         self._prompt_dir = prompt_dir
         self._replies = replies
+        self._usage = usage
         self._retry_dir = retry_dir
         # Read now, not on the first voice message. A misspelled `prompt_file`
         # or a missing fixed reply is a deployment error, and discovering it
@@ -611,6 +663,16 @@ class VoiceIngestion:
         }
 
     # --- the batch integration point (S02-T05) ----------------------------- #
+
+    async def may_process_voice(self, *, tenant_id: int) -> bool:
+        """Whether this tenant's recordings may still be used (§11.3).
+
+        The gate on its own, without the transcription behind it. `persist_batch`
+        asks before handing a batch it already persisted to the graph: the row
+        may have been written before the tenant withdrew consent, and the reuse
+        path would otherwise step around the check that `ingest` makes.
+        """
+        return await self._consent.has_consent(tenant_id=tenant_id, kind=WORKOUT_DATA_CONSENT)
 
     async def resolve(
         self, items: list[dict[str, object]], *, tenant_id: int
@@ -625,12 +687,24 @@ class VoiceIngestion:
         if not any(item.get("kind") == "voice" for item in items):
             return items
 
+        deadline = None if self._budget_s is None else monotonic() + self._budget_s
         kept: list[dict[str, object]] = []
         for item in items:
             if item.get("kind") != "voice":
                 kept.append(item)
                 continue
-            outcome = await self.ingest(item, tenant_id=tenant_id)
+            outcome = await self._within_budget(item, tenant_id=tenant_id, deadline=deadline)
+            if outcome is None:
+                # Out of budget. The item stays, in the shape of a failed
+                # transcription — recorded, outside every analysis (invariant
+                # 6). Better than the whole burst being stranded by a job the
+                # queue will not run again.
+                item["was_audio"] = True
+                item["text"] = ""
+                item["status"] = "incomplete"
+                item["media_ref"] = None
+                kept.append(item)
+                continue
             if not outcome.enters_batch:
                 continue
             item["was_audio"] = True
@@ -646,6 +720,35 @@ class VoiceIngestion:
                 item["status"] = "incomplete"
             kept.append(item)
         return kept
+
+    async def _within_budget(
+        self, item: dict[str, object], *, tenant_id: int, deadline: float | None
+    ) -> VoiceOutcome | None:
+        """One item, or ``None`` when the burst has run out of time.
+
+        A hard deadline rather than an estimate: the download and the provider
+        call have their own timeouts, and adding them up would still be a guess
+        about which of the two is slow today.
+        """
+        if deadline is None:
+            return await self.ingest(item, tenant_id=tenant_id)
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            logger.warning(
+                "voice budget exhausted, the recording was not transcribed",
+                extra={"tenant_id": tenant_id, "raw_message_id": item.get("raw_message_id")},
+            )
+            return None
+        try:
+            return await asyncio.wait_for(self.ingest(item, tenant_id=tenant_id), remaining)
+        except TimeoutError:
+            # The recording is already at its `raw_message_id` path and inside
+            # the swept directory, so nothing is stranded by the cancellation.
+            logger.warning(
+                "voice transcription outran the budget for this burst",
+                extra={"tenant_id": tenant_id, "raw_message_id": item.get("raw_message_id")},
+            )
+            return None
 
     # --- one item ---------------------------------------------------------- #
 
@@ -756,19 +859,13 @@ class VoiceIngestion:
             # Every failure, not only the ones this module names. An engine
             # that raised something unexpected is a bug, and a bug must not
             # cost the user their message (invariant 6): the item goes to the
-            # batch as `incomplete` and the recording stays where the next
-            # attempt looks for it. The type is logged; the traceback is not,
-            # because a third party's exception text can carry the URL that
-            # authenticates the download (spec 20.6).
-            logger.warning(
-                "transcription failed, the recording is kept for a retry",
-                extra={
-                    "tenant_id": tenant_id,
-                    "raw_message_id": raw_message_id,
-                    "error": type(error).__name__,
-                    "retention_hours": self._config.retry_retention_hours,
-                },
-            )
+            # batch as `incomplete` either way. The type is logged; the
+            # traceback is not, because a third party's exception text can
+            # carry the URL that authenticates the download (spec 20.6).
+            #
+            # Whether the *recording* survives is a separate question, and
+            # §11.3 answers it with a separate consent.
+            await self._retain_or_discard(audio, tenant_id=tenant_id, error=error)
             return VoiceOutcome(VoiceStatus.FAILED)
 
         # Not `text`: that name belongs to SQLAlchemy's constructor in this
@@ -800,6 +897,7 @@ class VoiceIngestion:
         await self._transcripts.save(
             tenant_id=tenant_id, raw_message_id=raw_message_id, transcript=transcript
         )
+        await self._record_usage(tenant_id=tenant_id, seconds=result.duration_s)
         _discard(audio)
         logger.info(
             "voice transcribed",
@@ -812,6 +910,56 @@ class VoiceIngestion:
         return VoiceOutcome(VoiceStatus.TRANSCRIBED, text=transcript)
 
     # --- internals --------------------------------------------------------- #
+
+    async def _record_usage(self, *, tenant_id: int, seconds: float | None) -> None:
+        """The cost line of §11.3: `usage_ledger.audio_seconds`.
+
+        Accounting, not the message: a ledger that refuses must not cost the
+        user their transcription, so the failure is logged and the turn goes
+        on. It does understate the month, which is why it is a warning.
+
+        `cost_usd` stays at its default. §7.2 prices tokens, not audio minutes,
+        and inventing a rate here would put a number in the quota ceiling of
+        §19.3 that nobody chose.
+        """
+        if self._usage is None or seconds is None:
+            return
+        try:
+            await self._usage.record_audio(
+                tenant_id=tenant_id,
+                provider=self._config.provider,
+                model=self._config.model,
+                audio_seconds=seconds,
+            )
+        except Exception as error:
+            logger.warning(
+                "the transcription was not recorded in the usage ledger",
+                extra={"tenant_id": tenant_id, "error": type(error).__name__},
+            )
+
+    async def _retain_or_discard(self, audio: Path, *, tenant_id: int, error: Exception) -> None:
+        """Keep the recording for a retry, but only where §11.3 allows it.
+
+        "Retenção só com `model_training`" — and six hours of somebody's voice
+        in tmpfs is retention, whatever it is kept for. Without that consent the
+        file goes now and the retry pays for the download again, which is the
+        ordinary cost of not being allowed to keep it.
+
+        The item is unaffected either way: `raw_message.payload` holds the
+        original update, so nothing the user sent is discarded (invariant 6).
+        """
+        retained = await self._consent.has_consent(tenant_id=tenant_id, kind=MODEL_TRAINING_CONSENT)
+        if not retained:
+            _discard(audio)
+        logger.warning(
+            "transcription failed",
+            extra={
+                "tenant_id": tenant_id,
+                "error": type(error).__name__,
+                "audio_retained": retained,
+                "retention_hours": self._config.retry_retention_hours if retained else 0,
+            },
+        )
 
     def _prompt(self, name: str) -> str:
         return self._prompts[name]
@@ -902,6 +1050,10 @@ class VoiceIngestion:
                 identity_id=row.identity_id,
                 channel=row.channel,
                 blocks=[block],
+                # Derived, not fresh: the marker below and this insert commit in
+                # separate transactions, so the enqueue has to be idempotent on
+                # its own or a retry between the two tells the user twice.
+                group_id=_reply_group(raw_message_id, status),
             )
             # After the enqueue, so a failure there is retried rather than
             # marked as answered and dropped.
@@ -916,6 +1068,18 @@ class VoiceIngestion:
                 extra={"tenant_id": tenant_id, "voice_status": status.value},
             )
         return VoiceOutcome(status, reply=block)
+
+
+def _reply_group(raw_message_id: int, status: VoiceStatus) -> UUID:
+    """One group per message and refusal, stable across retries.
+
+    `outbound_queue` has a unique index on `(group_id, seq)` (migration 0006),
+    so re-enqueueing the same refusal is a no-op rather than a second bubble.
+    The status is in the name because a message can be refused twice for
+    different reasons — too long today, unconsented on the retry — and the
+    second refusal is a different thing to say.
+    """
+    return uuid5(VOICE_REPLY_NAMESPACE, f"{raw_message_id}:{status.value}")
 
 
 def _row_id(item: Mapping[str, object]) -> int:
@@ -982,6 +1146,44 @@ class SqlConsentGate:
                 {"kind": kind},
             )
         return bool(granted)
+
+
+class SqlUsageLedger:
+    """`usage_ledger` (spec 5.2), for the audio line of §11.3.
+
+    One row per transcription. `agent` is the free-text label of §20.3 rather
+    than an `LLMRole`: transcription is not one (ADR-0007), and the ledger has
+    always keyed cost by the thing that spent it.
+    """
+
+    AGENT = "stt"
+
+    def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
+        self._sessions = sessions
+
+    async def record_audio(
+        self,
+        *,
+        tenant_id: int,
+        provider: str,
+        model: str,
+        audio_seconds: float,
+    ) -> None:
+        async with tenant_session(self._sessions, tenant_id) as session:
+            await session.execute(
+                text(
+                    "INSERT INTO usage_ledger "
+                    "(tenant_id, agent, provider, model, audio_seconds) "
+                    "VALUES (:tenant_id, :agent, :provider, :model, :audio_seconds)"
+                ),
+                {
+                    "tenant_id": tenant_id,
+                    "agent": self.AGENT,
+                    "provider": provider,
+                    "model": model,
+                    "audio_seconds": round(audio_seconds, 2),
+                },
+            )
 
 
 class SqlTranscriptStore:

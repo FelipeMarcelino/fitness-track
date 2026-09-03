@@ -27,6 +27,7 @@ from fittrack.services.stt import (
     WORKOUT_DATA_CONSENT,
     SqlConsentGate,
     SqlTranscriptStore,
+    SqlUsageLedger,
     encrypt_transcript,
 )
 from tests.conftest import CA_FILE
@@ -405,3 +406,34 @@ async def test_processing_a_message_is_not_answering_it_either(
 
     assert row is not None
     assert row.answered is False
+
+
+# --------------------------------------------------------------------------- #
+# SqlUsageLedger (spec 11.3, cost)
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_transcription_lands_in_the_usage_ledger(
+    owner: asyncpg.Connection, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    """The cost line of §11.3, in the table §5.2 already reserves for it."""
+    tenant_id = await make_tenant(owner)
+
+    await SqlUsageLedger(sessions).record_audio(
+        tenant_id=tenant_id, provider="groq", model="a-model", audio_seconds=12.345
+    )
+
+    row = await owner.fetchrow(
+        "SELECT agent, provider, model, audio_seconds, cost_usd, input_tokens "
+        "FROM usage_ledger WHERE tenant_id = $1",
+        tenant_id,
+    )
+    assert row is not None
+    assert row["agent"] == "stt"
+    assert row["provider"] == "groq"
+    assert row["model"] == "a-model"
+    # NUMERIC(8,2): the seconds are rounded to what the column can hold.
+    assert float(row["audio_seconds"]) == pytest.approx(12.35, abs=0.01)
+    # No audio price exists in config/models.yaml, so nothing is claimed here.
+    assert float(row["cost_usd"]) == 0.0
+    assert row["input_tokens"] == 0
