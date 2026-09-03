@@ -274,7 +274,7 @@ async def test_check_does_not_call_an_unmigrated_database_ready(
     assert run_bootstrap(disposable_database).returncode == 0
     migrated = run_bootstrap(disposable_database, "--check")
     assert migrated.returncode == 0
-    assert "0003" in migrated.stdout
+    assert "0004" in migrated.stdout
 
 
 async def test_the_revoke_refuses_to_report_success_after_finding_nothing(

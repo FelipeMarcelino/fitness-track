@@ -33,7 +33,7 @@ from fittrack.services.outbound import (
     retry_delay,
     unsupported_media_block,
 )
-from fittrack.settings import ChannelKind
+from fittrack.settings import ChannelKind, get_settings
 
 NOW = datetime(2026, 9, 2, 14, 0, tzinfo=UTC)
 IDENTITY = ChannelIdentity(
@@ -101,18 +101,41 @@ def test_the_fixed_media_degradation_is_a_versioned_prompt() -> None:
     assert block.text
 
 
+def test_the_media_degradation_prompt_honours_the_configured_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configured = tmp_path / "operator-config"
+    prompt = configured / "prompts" / "unsupported_media.md"
+    prompt.parent.mkdir(parents=True)
+    prompt.write_text("Mensagem configurada pelo operador.\n", encoding="utf-8")
+    monkeypatch.setenv("FITTRACK_CONFIG_DIR", str(configured))
+    get_settings.cache_clear()
+    try:
+        assert unsupported_media_block().text == "Mensagem configurada pelo operador."
+    finally:
+        get_settings.cache_clear()
+
+
 @dataclass
 class FakeStore:
     queued: list[NewOutbound] = field(default_factory=list)
     retried: list[tuple[int, int, datetime, str | None]] = field(default_factory=list)
     dead: list[tuple[int, UUID, int, int, str]] = field(default_factory=list)
-    sent: list[tuple[int, int, SendReceipt]] = field(default_factory=list)
+    sent: list[tuple[int, int, int, SendReceipt]] = field(default_factory=list)
+    revoked: list[tuple[int, int, datetime]] = field(default_factory=list)
 
     async def enqueue(self, rows: Sequence[NewOutbound]) -> None:
         self.queued.extend(rows)
 
-    async def mark_sent(self, *, item_id: int, tenant_id: int, receipt: SendReceipt) -> None:
-        self.sent.append((item_id, tenant_id, receipt))
+    async def mark_sent(
+        self, *, item_id: int, tenant_id: int, attempts: int, receipt: SendReceipt
+    ) -> None:
+        self.sent.append((item_id, tenant_id, attempts, receipt))
+
+    async def revoke_identity(
+        self, *, identity_id: int, tenant_id: int, revoked_at: datetime
+    ) -> None:
+        self.revoked.append((identity_id, tenant_id, revoked_at))
 
     async def mark_retry(
         self,
@@ -207,6 +230,22 @@ async def test_every_block_is_queued_with_one_response_group_and_increasing_sequ
     assert [row.seq for row in store.queued] == [0, 1]
 
 
+async def test_local_media_is_rejected_before_an_unusable_path_is_queued(tmp_path: Path) -> None:
+    media_path = tmp_path / "worker-local-photo.jpg"
+    media_path.write_bytes(b"private image")
+    store = FakeStore()
+
+    with pytest.raises(ValueError, match="durable shared media storage"):
+        await service(store).enqueue_response(
+            tenant_id=7,
+            identity_id=41,
+            channel="telegram",
+            blocks=[OutboundBlock(kind="media", media_path=media_path)],
+        )
+
+    assert store.queued == []
+
+
 @pytest.mark.parametrize("media_kind", ["image", "document"])
 async def test_each_unsupported_media_kind_gets_a_fixed_grouped_response(
     media_kind: str,
@@ -254,13 +293,18 @@ async def test_every_response_gets_a_new_group_even_when_each_has_one_block() ->
     assert first != second
 
 
-def item(*, attempts: int = 0, proactive: bool = False) -> OutboundItem:
+def item(
+    *,
+    attempts: int = 0,
+    proactive: bool = False,
+    block: OutboundBlock | None = None,
+) -> OutboundItem:
     return OutboundItem(
         id=10,
         tenant_id=7,
         identity_id=41,
         channel="telegram",
-        block=OutboundBlock(kind="text", text="safe response"),
+        block=block or OutboundBlock(kind="text", text="safe response"),
         group_id=UUID("22222222-2222-2222-2222-222222222222"),
         seq=0,
         attempts=attempts,
@@ -321,6 +365,53 @@ async def test_deliver_acquires_the_identity_rate_limit_before_sending() -> None
     await outbound.deliver(item=item(), identity=IDENTITY, channel=OrderedChannel())
 
     assert events == [("acquire", 41), ("send", 41)]
+
+
+async def test_success_counts_the_send_attempt() -> None:
+    store = FakeStore()
+    result = await service(store).deliver(
+        item=item(attempts=2), identity=IDENTITY, channel=StubChannel()
+    )
+
+    assert result.status is DeliveryStatus.SENT
+    assert result.attempts == 3
+    assert store.sent[0][2] == 3
+
+
+async def test_undeliverable_failure_revokes_the_target_identity() -> None:
+    store = FakeStore()
+    await service(store).deliver(
+        item=item(),
+        identity=IDENTITY,
+        channel=StubChannel(ClassifiedError(ErrorClass.UNDELIVERABLE, code="403")),
+    )
+
+    assert store.revoked == [(41, 7, NOW)]
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_status"),
+    [
+        (None, DeliveryStatus.SENT),
+        (ClassifiedError(ErrorClass.ACCOUNT, code="401"), DeliveryStatus.DEAD),
+    ],
+)
+async def test_terminal_delivery_removes_worker_local_media(
+    tmp_path: Path,
+    failure: ClassifiedError | None,
+    expected_status: DeliveryStatus,
+) -> None:
+    media_path = tmp_path / "temporary-report.pdf"
+    media_path.write_bytes(b"private report")
+
+    result = await service(FakeStore()).deliver(
+        item=item(block=OutboundBlock(kind="media", media_path=media_path)),
+        identity=IDENTITY,
+        channel=StubChannel(failure),
+    )
+
+    assert result.status is expected_status
+    assert not media_path.exists()
 
 
 @pytest.mark.parametrize(

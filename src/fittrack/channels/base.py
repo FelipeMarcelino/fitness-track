@@ -258,13 +258,11 @@ class OutboundBlock:
     text: str | None = field(default=None, repr=False)
     emoji: str | None = None
     buttons: tuple[str, ...] | None = field(default=None, repr=False)
-    # A local path, which is enough for Telegram: `media_upload="inline"` sends
-    # the bytes in the same request as the message (spec 18.2), so there is no
-    # upload to strand. WhatsApp is `two_step` — upload, then send by `media_id`
-    # — and a send that fails after the upload has no field here to carry the
-    # id into the retry, nor a path that survives a worker restart. That is a
-    # real gap and it is phase 2.0's: the field it needs belongs with the
-    # adapter that does the two steps, not ahead of it (spec 18.3, 23).
+    # A local path is valid only for a same-worker inline send. It is never a
+    # durable queue reference: worker tmpfs is private and ephemeral, so the
+    # outbound queue rejects it until shared blob storage exists (ADR-0005).
+    # WhatsApp is `two_step` — upload, then send by `media_id` — and needs a
+    # durable reference in phase 2.0 (spec 18.3, 23).
     media_path: Path | None = None
     reply_to: tuple[ChannelKind, str] | None = None  # (channel, channel_message_id)
     template: TemplateRef | None = None  # windowed channels only

@@ -36,15 +36,16 @@ from fittrack.channels.base import (
 )
 from fittrack.db.engine import tenant_session
 from fittrack.security.crypto import ColumnCipher, column_aad
-from fittrack.settings import ChannelKind
+from fittrack.settings import ChannelKind, get_settings
 
 BACKOFF_LADDER_SECONDS = (2, 8, 32, 2 * 60, 8 * 60)
 MAX_RETRIES = len(BACKOFF_LADDER_SECONDS)
 MAX_JITTER = 0.25
-
-DEFAULT_UNSUPPORTED_MEDIA_PROMPT = (
-    Path(__file__).resolve().parents[3] / "config" / "prompts" / "unsupported_media.md"
+LOCAL_MEDIA_QUEUE_ERROR = (
+    "cannot queue a worker-local media path without durable shared media storage"
 )
+
+UNSUPPORTED_MEDIA_PROMPT = Path("prompts") / "unsupported_media.md"
 
 
 class DeliveryStatus(StrEnum):
@@ -98,7 +99,13 @@ class OutboundQueueStore(Protocol):
 
     async def enqueue(self, rows: Sequence[NewOutbound]) -> None: ...
 
-    async def mark_sent(self, *, item_id: int, tenant_id: int, receipt: SendReceipt) -> None: ...
+    async def mark_sent(
+        self, *, item_id: int, tenant_id: int, attempts: int, receipt: SendReceipt
+    ) -> None: ...
+
+    async def revoke_identity(
+        self, *, identity_id: int, tenant_id: int, revoked_at: datetime
+    ) -> None: ...
 
     async def mark_retry(
         self,
@@ -176,9 +183,11 @@ def retry_delay(
 
 
 def unsupported_media_block(
-    prompt_path: Path = DEFAULT_UNSUPPORTED_MEDIA_PROMPT,
+    prompt_path: Path | None = None,
 ) -> OutboundBlock:
     """Load the fixed photo/document response from versioned configuration."""
+    if prompt_path is None:
+        prompt_path = Path(get_settings().fittrack_config_dir) / UNSUPPORTED_MEDIA_PROMPT
     text_content = prompt_path.read_text(encoding="utf-8").strip()
     if not text_content:
         raise ValueError(f"{prompt_path.name}: unsupported-media prompt is empty")
@@ -310,6 +319,8 @@ class OutboundService:
             raise ValueError("tenant_id and identity_id must be positive")
         if not blocks:
             raise ValueError("an outbound response must contain at least one block")
+        if any(block.media_path is not None for block in blocks):
+            raise ValueError(LOCAL_MEDIA_QUEUE_ERROR)
         group_id = self._group_id()
         schedule = scheduled_at or self._now()
         if schedule.tzinfo is None or schedule.utcoffset() is None:
@@ -337,7 +348,7 @@ class OutboundService:
         identity_id: int,
         channel: ChannelKind,
         media_kind: Literal["image", "document"],
-        prompt_path: Path = DEFAULT_UNSUPPORTED_MEDIA_PROMPT,
+        prompt_path: Path | None = None,
     ) -> UUID:
         """Queue the AD-27 pt-BR photo/document degradation as a normal response."""
         # The parameter makes both accepted inbound cases explicit at the call
@@ -361,11 +372,11 @@ class OutboundService:
         """Attempt one row, persisting success, retry time, or dead status."""
         _require_matching_destination(item, identity, channel)
         await self._rate_limiter.acquire(item.identity_id)
+        attempts = item.attempts + 1
         try:
             receipt = await channel.send(identity, item.block)
         except Exception as error:
             verdict = channel.classify_error(error)
-            attempts = item.attempts + 1
             delay = retry_delay(
                 verdict,
                 attempts,
@@ -384,6 +395,13 @@ class OutboundService:
                 return DeliveryResult(DeliveryStatus.RETRY, attempts, next_retry_at)
 
             error_code = verdict.code or verdict.error_class.value
+            dead_at = self._now()
+            if verdict.error_class is ErrorClass.UNDELIVERABLE:
+                await self._store.revoke_identity(
+                    identity_id=item.identity_id,
+                    tenant_id=item.tenant_id,
+                    revoked_at=dead_at,
+                )
             await self._store.mark_dead(
                 item_id=item.id,
                 tenant_id=item.tenant_id,
@@ -391,16 +409,25 @@ class OutboundService:
                 seq=item.seq,
                 attempts=attempts,
                 error_code=error_code,
-                dead_at=self._now(),
+                dead_at=dead_at,
             )
+            _remove_terminal_media(item.block)
             return DeliveryResult(DeliveryStatus.DEAD, attempts)
 
         await self._store.mark_sent(
             item_id=item.id,
             tenant_id=item.tenant_id,
+            attempts=attempts,
             receipt=receipt,
         )
-        return DeliveryResult(DeliveryStatus.SENT, item.attempts)
+        _remove_terminal_media(item.block)
+        return DeliveryResult(DeliveryStatus.SENT, attempts)
+
+
+def _remove_terminal_media(block: OutboundBlock) -> None:
+    """Remove same-worker temporary media after the queue row is terminal."""
+    if block.media_path is not None:
+        block.media_path.unlink(missing_ok=True)
 
 
 def _require_matching_destination(
@@ -434,6 +461,8 @@ class PostgresOutboundQueueStore:
         tenant_id = rows[0].tenant_id
         if any(row.tenant_id != tenant_id for row in rows):
             raise ValueError("one enqueue call cannot cross tenant boundaries")
+        if any(row.block.media_path is not None for row in rows):
+            raise ValueError(LOCAL_MEDIA_QUEUE_ERROR)
         ids = await self._reserve_ids(len(rows))
         async with tenant_session(self._sessions, tenant_id) as session:
             for item_id, row in zip(ids, rows, strict=True):
@@ -481,16 +510,44 @@ class PostgresOutboundQueueStore:
             )
             return [int(row.id) for row in result]
 
-    async def mark_sent(self, *, item_id: int, tenant_id: int, receipt: SendReceipt) -> None:
+    async def mark_sent(
+        self,
+        *,
+        item_id: int,
+        tenant_id: int,
+        attempts: int,
+        receipt: SendReceipt,
+    ) -> None:
         async with tenant_session(self._sessions, tenant_id) as session:
             await session.execute(
                 text(
-                    "UPDATE outbound_queue SET sent_at = :sent_at, retryable = NULL, "
+                    "UPDATE outbound_queue SET attempts = :attempts, sent_at = :sent_at, "
+                    "retryable = NULL, "
                     "error_code = NULL, last_error = NULL "
                     "WHERE id = :id"
                 ),
-                {"id": item_id, "sent_at": receipt.sent_at},
+                {"id": item_id, "attempts": attempts, "sent_at": receipt.sent_at},
             )
+
+    async def revoke_identity(
+        self,
+        *,
+        identity_id: int,
+        tenant_id: int,
+        revoked_at: datetime,
+    ) -> None:
+        """Revoke one destination through the identity security boundary."""
+        async with tenant_session(self._sessions, tenant_id) as session:
+            revoked = await session.scalar(
+                text("SELECT revoke_channel_identity(:identity_id, :tenant_id, :revoked_at)"),
+                {
+                    "identity_id": identity_id,
+                    "tenant_id": tenant_id,
+                    "revoked_at": revoked_at,
+                },
+            )
+            if revoked is not True:
+                raise LookupError("identity does not belong to tenant")
 
     async def mark_retry(
         self,
@@ -550,6 +607,8 @@ class PostgresOutboundQueueStore:
 
 
 def _encode_payload(block: OutboundBlock, *, proactive: bool) -> bytes:
+    if block.media_path is not None:
+        raise ValueError(LOCAL_MEDIA_QUEUE_ERROR)
     template = None
     if block.template is not None:
         template = {
@@ -562,7 +621,9 @@ def _encode_payload(block: OutboundBlock, *, proactive: bool) -> bytes:
         "text": block.text,
         "emoji": block.emoji,
         "buttons": list(block.buttons) if block.buttons is not None else None,
-        "media_path": str(block.media_path) if block.media_path is not None else None,
+        # Legacy rows may still decode this field, but new queue rows never
+        # persist a path into a worker's private tmpfs (ADR-0005).
+        "media_path": None,
         "reply_to": list(block.reply_to) if block.reply_to is not None else None,
         "template": template,
         "proactive": proactive,
