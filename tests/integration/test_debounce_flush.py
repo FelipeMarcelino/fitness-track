@@ -177,10 +177,61 @@ async def test_flush_check_drains_buffer_when_debounce_expired() -> None:
     assert result.items[0]["raw_message_id"] == 1
     assert result.items[1]["raw_message_id"] == 2
     assert isinstance(result.batch_id, str) and len(result.batch_id) > 0
-    # No re-enqueue
-    assert scheduler.calls == []
+    # One unconditional follow-up probe, not a re-enqueue of this same check —
+    # see test_flush_check_always_reschedules_one_probe_after_a_successful_drain
+    # for why that follow-up exists at all.
+    assert scheduler.calls == [(1, 10)]
     # Lock released
     assert await redis.get("lock:1") is None
+
+
+async def test_flush_check_always_reschedules_one_probe_after_a_successful_drain() -> None:
+    """Unconditional, not "reschedule if the buffer looks refilled": a
+    check-then-reschedule still races an append landing between the check and
+    this job's stable id actually being released, which is invisible to any
+    check run from inside the job (spec 18.2 review, round 3). The one probe
+    this always costs finds nothing and returns immediately in the ordinary
+    case — the debounce gate at the top of `flush_check` is what keeps that
+    cheap, the same way it keeps every unprompted flush cheap.
+    """
+    redis = FakeRedis()
+    scheduler = FakeScheduler()
+    await redis.rpush("buffer:1", _buffer_item(1))
+
+    result = await flush_check(tenant_id=1, redis=redis, scheduler=scheduler, debounce_window_s=10)
+
+    assert result is not None
+    assert scheduler.calls == [(1, 10)]
+
+
+async def test_flush_check_reschedules_a_buffer_refilled_during_the_drain_handler() -> None:
+    """The scenario the unconditional reschedule exists for: a message that
+    arrives while `drain_handler` is still running (voice transcription is
+    not instant) renews `buffer:1` under this job's own stable id, which
+    ARQ's `enqueue_job` dedup silently swallows while the id is held (spec
+    18.2 review). The probe this test's own reschedule buys is what notices
+    it — one flush_check later, the debounce gate is what actually decides
+    whether to drain again.
+    """
+    redis = FakeRedis()
+    scheduler = FakeScheduler()
+    await redis.rpush("buffer:1", _buffer_item(1))
+
+    async def handler(drain: DrainResult) -> None:
+        # Simulates the ingress appending while this handler is still running.
+        await redis.rpush("buffer:1", _buffer_item(99))
+
+    result = await flush_check(
+        tenant_id=1,
+        redis=redis,
+        scheduler=scheduler,
+        debounce_window_s=10,
+        drain_handler=handler,
+    )
+
+    assert result is not None
+    assert len(result.items) == 1
+    assert scheduler.calls == [(1, 10)]
 
 
 async def test_flush_check_reenqueues_when_lock_is_busy() -> None:
@@ -295,8 +346,8 @@ async def test_flush_check_recovers_orphaned_drain() -> None:
     assert [item["raw_message_id"] for item in result.items] == [1, 2]
     # Drain key cleaned up
     assert await redis.lrange("drain:1", 0, -1) == []
-    # No re-enqueue
-    assert scheduler.calls == []
+    # One unconditional follow-up probe, same as any other successful drain.
+    assert scheduler.calls == [(1, 10)]
 
 
 async def test_orphan_recovery_does_not_lose_new_buffer() -> None:

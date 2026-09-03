@@ -781,6 +781,66 @@ def test_an_adapter_that_does_not_exist_yet_says_so() -> None:
         ChannelRegistry.from_config(whatsapp_config())
 
 
+# --------------------------------------------------------------------------- #
+# The polling transport (S02-T08) — built the same lazy way as the adapter
+# --------------------------------------------------------------------------- #
+
+
+class StubOffsetRedis:
+    """Enough of the raw Redis client for construction; never called here."""
+
+    async def get(self, name: str) -> str | bytes | None:  # pragma: no cover - unused
+        raise NotImplementedError
+
+    async def set(self, name: str, value: str) -> None:  # pragma: no cover - unused
+        raise NotImplementedError
+
+
+def test_build_telegram_poller_wires_a_real_poller() -> None:
+    """The registry's lazy-import pattern, extended to the dev-only transport."""
+    from fittrack.channels.registry import build_telegram_poller
+
+    poller = build_telegram_poller(
+        telegram_config(telegram_mode="polling", telegram_webhook_secret=None),
+        redis=StubOffsetRedis(),
+    )
+    assert type(poller).__name__ == "TelegramPoller"
+
+
+def test_build_telegram_poller_namespaces_the_offset_by_bot_token() -> None:
+    """Two bots must not share one offset (S02-T08 review)."""
+    from fittrack.channels.registry import build_telegram_poller
+
+    first = build_telegram_poller(
+        telegram_config(
+            telegram_mode="polling",
+            telegram_webhook_secret=None,
+            telegram_bot_token=StubSecret("a"),
+        ),
+        redis=StubOffsetRedis(),
+    )
+    second = build_telegram_poller(
+        telegram_config(
+            telegram_mode="polling",
+            telegram_webhook_secret=None,
+            telegram_bot_token=StubSecret("b"),
+        ),
+        redis=StubOffsetRedis(),
+    )
+
+    assert first._offsets._key != second._offsets._key
+
+
+def test_build_telegram_poller_requires_the_bot_token() -> None:
+    from fittrack.channels.registry import build_telegram_poller
+
+    with pytest.raises(MissingCredentialError, match="TELEGRAM_BOT_TOKEN"):
+        build_telegram_poller(
+            telegram_config(telegram_mode="polling", telegram_bot_token=None),
+            redis=StubOffsetRedis(),
+        )
+
+
 if TYPE_CHECKING:  # pragma: no cover
 
     def _settings_is_a_channel_config(settings: Settings) -> ChannelConfig:

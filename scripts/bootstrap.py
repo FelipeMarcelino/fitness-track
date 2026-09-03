@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""Bring a database to a state the application can run against.
+"""Bring a database — and, since S02-T08, Telegram — to a state the application
+can run against.
 
-Two steps, both idempotent, because a bootstrap that can only be run once is a
-bootstrap nobody dares run:
+Four steps. The first three are idempotent, because a bootstrap that can only
+be run once is a bootstrap nobody dares run; the fourth (Telegram) is
+idempotent for the same reason `setWebhook`/`deleteWebhook` themselves are —
+registering what is already registered is a no-op:
 
 1. **Migrations**, to `head`. Alembic is already idempotent — an
    already-migrated database is a no-op.
@@ -12,13 +15,19 @@ bootstrap nobody dares run:
 3. **Withdrawing the grants step 2 hands out by accident.** See
    `LANGGRAPH_TABLES` below: this one exists because of how the other two
    interact, and it is the only step here that is a fix rather than a setup.
+4. **Reconciling Telegram's webhook against `TELEGRAM_MODE`** (spec 18.2):
+   `setWebhook` in webhook mode, `deleteWebhook` in polling mode — the two are
+   mutually exclusive, and this is the one place both channels' worth of
+   deployments run through, so it is where the conflict gets resolved rather
+   than discovered as a 409 from the poller.
 
-Deliberately *not* here: any Telegram call, and any seed. `setWebhook` belongs
-to the sprint that builds the adapter, and the exercise catalogue to the one
-that needs it — a bootstrap that reaches out to a third party is one that cannot
-run in CI.
+Deliberately *not* here: any seed. The exercise catalogue belongs to the
+sprint that needs it.
 
-    python -m scripts.bootstrap            # migrate and set up
+`--check` never reaches Telegram: a dry run promises to change nothing, and a
+network call has side effects, not just an inconsistent read.
+
+    python -m scripts.bootstrap            # migrate, set up, and reconcile
     python -m scripts.bootstrap --check    # report, change nothing
 """
 
@@ -30,7 +39,21 @@ import subprocess
 import sys
 from pathlib import Path
 
+import httpx
+
+from fittrack.channels.telegram.client import (
+    DEFAULT_TIMEOUT_SECONDS,
+    TelegramApiError,
+    TelegramClient,
+)
+from fittrack.channels.telegram.polling import ALLOWED_UPDATES
+from fittrack.settings import Settings
+
 ROOT = Path(__file__).resolve().parent.parent
+
+# What Telegram accepts concurrently against one webhook (spec 18.2) — the
+# same figure the sprint's plan names for `setWebhook`.
+MAX_WEBHOOK_CONNECTIONS = 40
 
 
 class BootstrapError(RuntimeError):
@@ -174,8 +197,6 @@ def _owner_dsn(env_file: str | None = ".env") -> str:
     `env_file=None` reads only the process environment, which is what a test
     wants: with the file in play, unsetting the variable proves nothing.
     """
-    from fittrack.settings import Settings
-
     settings = Settings(_env_file=env_file)
     if settings.migration_database_url is None:
         raise BootstrapError(
@@ -183,6 +204,57 @@ def _owner_dsn(env_file: str | None = ".env") -> str:
             "which is a different principal from the one the application uses (spec 19.1)."
         )
     return settings.migration_database_url.get_secret_value().replace("+asyncpg", "")
+
+
+async def reconcile_telegram(settings: Settings, *, http: httpx.AsyncClient | None = None) -> str:
+    """`setWebhook` or `deleteWebhook`, whichever `TELEGRAM_MODE` asks for.
+
+    The two are mutually exclusive with each other and with a second poller
+    (spec 18.2's 409 trap), so this is the one place every deployment runs
+    through before either channel starts moving updates.
+
+    `http` is accepted rather than always opened, so a test can hand this a
+    `MockTransport` — the same shape `TelegramClient` already takes everywhere
+    else. When omitted, this owns the client it opens and closes it before
+    returning.
+    """
+    if "telegram" not in settings.channels:
+        return "telegram is not an enabled channel; nothing to reconcile"
+
+    token = settings.telegram_bot_token
+    if token is None:  # pragma: no cover - Settings already refuses to boot without it
+        raise BootstrapError("TELEGRAM_BOT_TOKEN is unset")
+
+    owns_http = http is None
+    connection = http if http is not None else httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_SECONDS)
+    try:
+        client = TelegramClient(token, http=connection)
+        try:
+            if settings.telegram_mode == "webhook":
+                secret = settings.telegram_webhook_secret
+                if secret is None or not settings.telegram_webhook_url:
+                    # pragma: no cover - Settings already refuses to boot in this state
+                    raise BootstrapError(
+                        "TELEGRAM_MODE=webhook requires TELEGRAM_WEBHOOK_SECRET and "
+                        "TELEGRAM_WEBHOOK_URL"
+                    )
+                await client.call(
+                    "setWebhook",
+                    {
+                        "url": settings.telegram_webhook_url,
+                        "secret_token": secret.get_secret_value(),
+                        "allowed_updates": list(ALLOWED_UPDATES),
+                        "max_connections": MAX_WEBHOOK_CONNECTIONS,
+                    },
+                )
+                return "webhook registered"
+            await client.call("deleteWebhook", {})
+            return "webhook deleted; polling is ready"
+        except TelegramApiError as error:
+            raise BootstrapError(f"Telegram refused {error}") from error
+    finally:
+        if owns_http:
+            await connection.aclose()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -197,9 +269,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"migrations: {migrate(check_only=args.check)}")
         if args.check:
             print("langgraph:  not checked (--check changes nothing)")
+            print("telegram:   not checked (--check changes nothing)")
         else:
             print(f"langgraph:  {asyncio.run(setup_langgraph_tables(dsn))}")
             print(f"grants:     {asyncio.run(revoke_application_grants(dsn))}")
+            print(f"telegram:   {asyncio.run(reconcile_telegram(Settings(_env_file='.env')))}")
     except BootstrapError as error:
         print(str(error), file=sys.stderr)
         return 1

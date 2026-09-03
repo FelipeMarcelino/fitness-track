@@ -252,4 +252,17 @@ async def flush_check(
         if drain_handler is not None:
             await drain_handler(result)
         await redis.delete(drain_key)
+        # Unconditional, not "reschedule if the buffer looks refilled": a
+        # message can arrive while `drain_handler` runs (voice transcription
+        # is not instant), and the ingress renews `buffer:{tenant_id}` under
+        # this job's own stable id — which ARQ's `enqueue_job` dedup silently
+        # swallows while that id is still held (worker.py's module
+        # docstring), all the way until this function actually returns. A
+        # check-then-reschedule here still races: an append between the
+        # check and the real job-key release is invisible to it (spec 18.2
+        # review, round 2). The one probe this schedules costs a Redis round
+        # trip and an early return when the buffer is genuinely empty — the
+        # gate at the top of this function is what makes that cheap, the
+        # same way every ordinary flush that finds nothing to do already is.
+        await scheduler.schedule_flush_check(tenant_id=tenant_id, delay_s=debounce_window_s)
         return result

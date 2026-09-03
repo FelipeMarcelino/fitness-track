@@ -29,8 +29,14 @@ services:
       target: dev
     # One of each locally: a published host port cannot be shared by two
     # replicas, and a second worker only makes the logs harder to read.
+    # It is also what makes `TELEGRAM_MODE=polling` safe to run at all — two
+    # pollers on the same bot collide on `getUpdates` (spec 18.2).
     deploy:
       replicas: 1
+    # The only file that lets the operator's `.env` choose polling: the base
+    # file hardcodes `webhook` for the production topology (S02-T08).
+    environment:
+      TELEGRAM_MODE: ${TELEGRAM_MODE}
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
@@ -69,6 +75,10 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       REDIS_PASSWORD: ${REDIS_PASSWORD}
       FITTRACK_RUNTIME_PASSWORD: ${FITTRACK_RUNTIME_PASSWORD}
+      # Every service validates the whole environment at startup
+      # (fittrack.startup); the worker has to agree with the ingress about the
+      # mode or `Settings` refuses to boot it (S02-T08).
+      TELEGRAM_MODE: ${TELEGRAM_MODE}
     volumes:
       - type: bind
         source: ./certs/ca/ca.crt
@@ -91,6 +101,8 @@ services:
     build:
       context: .
       target: dev
+    environment:
+      TELEGRAM_MODE: ${TELEGRAM_MODE}
     volumes:
       - type: bind
         source: ./certs/ca/ca.crt
