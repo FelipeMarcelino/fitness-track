@@ -20,6 +20,7 @@ o ADR explica *como se chegou nele*.
 | [0002](0002-portao-do-judge-suspenso.md) | Portão do LLM-as-judge suspenso na fundação | substituído por ADR-0004 | — |
 | [0003](0003-escopo-de-tenant-dentro-da-chave-estrangeira.md) | Escopo de tenant dentro da chave estrangeira | aceito | — |
 | [0004](0004-openai-como-provider-do-judge.md) | OpenAI como provider do LLM-as-judge | aceito | AD-19 (somente JUDGE) |
+| [0005](0005-midia-local-nao-entra-na-fila.md) | Mídia local não entra na fila | aceito | — |
 
 > ⚠️ **ADR-0001 está referenciado mas ausente da árvore.** O `CLAUDE.md` e a §2 da spec apontam para
 > `doc/adr/0001-groq-como-provider-primario.md`, e o arquivo não existe. O conteúdo da decisão está

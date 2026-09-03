@@ -1,10 +1,9 @@
 """The pre-tenant boundary (spec 19.1).
 
-The one operation that cannot run inside `SET LOCAL app.tenant_id`: at the
-moment a webhook arrives there is a channel and an opaque identifier, and
-finding the tenant *is* the operation. Two `SECURITY DEFINER` functions are the
-entire surface of that exception, so the tests here are as much about what the
-application still **cannot** do as about what it can.
+Resolving before tenancy and revoking a dead destination cannot use an ordinary
+runtime table write. Narrow `SECURITY DEFINER` functions are the entire surface
+of that exception, so the tests here are as much about what the application
+still **cannot** do as about what it can.
 """
 
 from __future__ import annotations
@@ -60,7 +59,7 @@ def service(app_session: AsyncSession, cipher: ColumnCipher) -> IdentityService:
 
 
 # --------------------------------------------------------------------------- #
-# The two operations
+# Identity resolution and creation
 # --------------------------------------------------------------------------- #
 
 
@@ -215,7 +214,11 @@ async def test_the_application_cannot_read_the_identity_table_directly(
 async def test_the_functions_run_as_a_role_the_application_is_not(
     owner: asyncpg.Connection,
 ) -> None:
-    for name in ("resolve_tenant_for_identity", "create_tenant_with_identity"):
+    for name in (
+        "resolve_tenant_for_identity",
+        "create_tenant_with_identity",
+        "revoke_channel_identity",
+    ):
         row = await owner.fetchrow(
             """
             SELECT p.prosecdef, r.rolname AS owner, p.proconfig
@@ -245,7 +248,11 @@ async def test_the_owning_role_cannot_log_in(owner: asyncpg.Connection) -> None:
 
 async def test_public_cannot_execute_the_boundary(owner: asyncpg.Connection) -> None:
     """A new function grants EXECUTE to PUBLIC by default."""
-    for name in ("resolve_tenant_for_identity", "create_tenant_with_identity"):
+    for name in (
+        "resolve_tenant_for_identity",
+        "create_tenant_with_identity",
+        "revoke_channel_identity",
+    ):
         assert not await owner.fetchval(
             "SELECT has_function_privilege('public', p.oid, 'EXECUTE')"
             "  FROM pg_proc p WHERE p.proname = $1",
@@ -277,6 +284,21 @@ async def test_the_definer_role_has_only_the_grants_it_needs(
         ("tenant", "INSERT"),
     }, f"unexpected table grants: {sorted(grants)}"
 
+    column_grants = {
+        (row["table_name"], row["column_name"], row["privilege_type"])
+        for row in await owner.fetch(
+            """
+            SELECT table_name, column_name, privilege_type
+              FROM information_schema.column_privileges
+             WHERE grantee = 'fittrack_identity' AND privilege_type = 'UPDATE'
+            """
+        )
+    }
+    assert column_grants == {
+        ("channel_identity", "is_primary", "UPDATE"),
+        ("channel_identity", "revoked_at", "UPDATE"),
+    }, f"unexpected column grants: {sorted(column_grants)}"
+
     # `role_table_grants` only reports relations, so on its own the assertion
     # above is blind to sequences, schemas and functions — which is most of the
     # ways a role's reach can grow. Asserting the blast radius means asserting
@@ -305,12 +327,12 @@ async def test_the_definer_role_has_only_the_grants_it_needs(
             """
         )
     }
-    # The two it owns, and nothing else. Ownership reports as a grant here, so
-    # this is the boundary itself rather than an extra privilege — a third name
-    # appearing would mean the role had been handed something new.
+    # The three it owns, and nothing else. Ownership reports as a grant here,
+    # so this is the boundary itself rather than an extra privilege.
     assert routines == {
         "resolve_tenant_for_identity",
         "create_tenant_with_identity",
+        "revoke_channel_identity",
     }, f"unexpected routine grants: {sorted(routines)}"
 
     schemas = {
@@ -504,8 +526,8 @@ async def test_the_migration_normalises_a_role_that_already_exists(
 
     A `fittrack_identity` left over from an older run — or made by hand — can
     carry LOGIN and a password. That turns a boundary reachable only through
-    two functions into a principal anyone with the password can connect as, and
-    one that bypasses RLS at that.
+    named functions into a principal anyone with the password can connect as,
+    and one that bypasses RLS at that.
     """
     guard = split_statements(IDENTITY_BOUNDARY)[0]
     assert "fittrack_identity" in guard and guard.lstrip().startswith("DO")
@@ -587,8 +609,7 @@ async def test_the_application_cannot_write_to_the_identity_table(
 
     `ALTER DEFAULT PRIVILEGES` handed the application DML on every table, so it
     could add a second identity for itself, or set `revoked_at`, without ever
-    calling a function — which made "two functions are the entire pre-tenant
-    surface" untrue for writes.
+    calling a named boundary function.
     """
     tenant: int = await owner.fetchval(
         "INSERT INTO tenant (display_name) VALUES ('writes') RETURNING id"

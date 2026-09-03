@@ -5,12 +5,11 @@ cannot: at the moment a webhook arrives the only facts are a channel and an
 opaque identifier, and finding the tenant *is* the operation. There is nothing
 to set the setting to yet.
 
-So it goes through two `SECURITY DEFINER` functions instead (migration 0002),
-owned by a role that can do nothing else and callable only by `fittrack_app`.
-That is the entire pre-tenant surface, and it is deliberately two functions
-rather than a general escape hatch: the application cannot *write* to
-`channel_identity` at all, so linking an account or revoking one has to go
-through the boundary.
+So it goes through narrowly scoped `SECURITY DEFINER` functions instead
+(migrations 0002 and 0004), owned by a role that can do nothing else and
+callable only by `fittrack_app`. That is the entire pre-tenant surface: the
+application cannot *write* to `channel_identity` directly, so creating or
+revoking an account has to go through a named boundary operation.
 
 It can read its own rows — RLS scopes that to the bound tenant, which is the
 same protection every other table gets, and a `deliver` that has to address a
