@@ -97,6 +97,12 @@ class BatchStore(Protocol):
         """Set ``status='failed'`` with a reason, so nothing picks the row up."""
         ...
 
+    async def update_content(
+        self, *, batch_id: int, tenant_id: int, combined_text: bytes, key_version: int
+    ) -> None:
+        """Replace a pending batch's payload, leaving its id and status alone."""
+        ...
+
 
 class PostgresBatchStore:
     """Tenant-scoped PostgreSQL implementation of :class:`BatchStore`."""
@@ -173,6 +179,23 @@ class PostgresBatchStore:
                     "WHERE id = :batch_id AND status = 'pending'"
                 ),
                 {"batch_id": batch_id},
+            )
+
+    async def update_content(
+        self, *, batch_id: int, tenant_id: int, combined_text: bytes, key_version: int
+    ) -> None:
+        async with tenant_session(self._sessions, tenant_id) as session:
+            await session.execute(
+                text(
+                    "UPDATE processing_batch "
+                    "SET combined_text = :combined_text, key_version = :key_version "
+                    "WHERE id = :batch_id AND status = 'pending'"
+                ),
+                {
+                    "combined_text": combined_text,
+                    "key_version": key_version,
+                    "batch_id": batch_id,
+                },
             )
 
     async def mark_failed(self, *, batch_id: int, tenant_id: int, error: str) -> None:
@@ -323,26 +346,22 @@ async def persist_batch(
             message_ids=message_ids,
         )
         if existing is not None:
-            if not await _voice_still_allowed(drain.items, tenant_id=tenant_id, voice=voice):
+            if existing.status == "pending" and not await _voice_still_allowed(
+                drain.items, tenant_id=tenant_id, voice=voice
+            ):
                 # Consent went away between the insert and this retry. Handing
-                # the row over would give the graph a transcript the tenant has
-                # withdrawn permission for — the whole gate, stepped around by
-                # the lookup that skips the voice step (§11.3, criterion 9).
-                if voice is not None:
-                    # Through the ordinary path, so the tenant is told why:
-                    # `ingest` refuses at the consent gate before it downloads
-                    # or decrypts anything, and queues the fixed reply once.
-                    await voice.resolve(drain.items, tenant_id=tenant_id)
-                await store.mark_failed(
-                    batch_id=existing.id,
+                # the row over as it stands would give the graph a transcript
+                # the tenant has withdrawn permission for — the whole gate,
+                # stepped around by the lookup that skips the voice step
+                # (§11.3, criterion 9).
+                return await _repair_without_voice(
+                    drain=drain,
+                    existing=existing,
                     tenant_id=tenant_id,
-                    error="workout_data consent revoked before the batch was processed",
+                    cipher=cipher,
+                    store=store,
+                    voice=voice,
                 )
-                logger.info(
-                    "batch abandoned: consent was revoked before it was processed",
-                    extra={"tenant_id": tenant_id, "batch_id": existing.id},
-                )
-                return None
             logger.info(
                 "batch already persisted, reusing",
                 extra={"tenant_id": tenant_id, "batch_id": existing.id},
@@ -387,6 +406,67 @@ async def persist_batch(
         extra={"tenant_id": tenant_id, "batch_id": row_id, "item_count": len(items)},
     )
     return row_id
+
+
+async def _repair_without_voice(
+    *,
+    drain: DrainResult,
+    existing: BatchRow,
+    tenant_id: int,
+    cipher: ColumnCipher,
+    store: BatchStore,
+    voice: VoiceResolver | None,
+) -> int | None:
+    """Rewrite a persisted batch without the content consent was withdrawn for.
+
+    The burst is resolved again — which, with the gate closed, refuses the
+    recording before downloading or decrypting anything and queues the fixed
+    reply once (idempotently, by `answered_at` and the derived group id). What
+    comes back is the rest of the burst, and the rest is not tainted: a text
+    message in the same rajada depends on no recording, and dropping it would
+    make the same "oi" survive or vanish according to *when* the tenant
+    revoked, which is not a distinction they made.
+
+    Rewritten in place rather than inserted beside: a second row carrying the
+    same drain identity would be found by the next retry, repaired again, and
+    inserted again — the loop. One row, rewritten idempotently, has neither
+    problem. The row id does not move, so the associated data of §22.2 still
+    matches (spec 22.2).
+    """
+    items = await voice.resolve(drain.items, tenant_id=tenant_id) if voice is not None else []
+    items = prepare_items(items)
+    if not items:
+        await store.mark_failed(
+            batch_id=existing.id,
+            tenant_id=tenant_id,
+            error="workout_data consent revoked before the batch was processed",
+        )
+        logger.info(
+            "batch abandoned: consent was revoked and nothing else was in the burst",
+            extra={"tenant_id": tenant_id, "batch_id": existing.id},
+        )
+        return None
+
+    encrypted = cipher.encrypt(
+        json.dumps(items, ensure_ascii=False).encode(),
+        column_aad(
+            tenant_id=tenant_id,
+            table="processing_batch",
+            column="combined_text",
+            row_id=existing.id,
+        ),
+    )
+    await store.update_content(
+        batch_id=existing.id,
+        tenant_id=tenant_id,
+        combined_text=encrypted,
+        key_version=cipher.active_version,
+    )
+    logger.info(
+        "batch repaired: the withdrawn recording left it, the rest of the burst did not",
+        extra={"tenant_id": tenant_id, "batch_id": existing.id, "item_count": len(items)},
+    )
+    return existing.id
 
 
 async def _voice_still_allowed(

@@ -235,13 +235,19 @@ class FakeReplies:
 
 
 class FakeUsage:
-    def __init__(self, *, fail: bool = False) -> None:
+    def __init__(self, *, fail: bool = False, hang: bool = False) -> None:
         self.fail = fail
+        self.hang = hang
         self.records: list[tuple[int, str, str, float]] = []
 
     async def record_audio(
         self, *, tenant_id: int, provider: str, model: str, audio_seconds: float
     ) -> None:
+        if self.hang:
+            # The await E-7 added between persisting the transcript and
+            # deleting the recording — and therefore a place the deadline of
+            # E-3 can cut in.
+            await asyncio.sleep(30)
         if self.fail:
             raise RuntimeError("the ledger is unavailable")
         self.records.append((tenant_id, provider, model, audio_seconds))
@@ -432,9 +438,14 @@ def test_the_request_timeout_fits_inside_the_job_that_runs_it(committed: SttConf
     that keeps the recording for a retry, so the voice path would lose both the
     transcription and the retention rule of §11.3.
     """
-    from fittrack.worker import JOB_TIMEOUT
+    from fittrack.worker import JOB_TIMEOUT, VOICE_BUDGET_S
 
     assert committed.timeout_s < JOB_TIMEOUT
+    # And the budget the voice step actually runs under (G-4). Raising
+    # `timeout_s` past it would cut every request short at the budget before
+    # its own timeout could fire — a graceful degradation nobody would notice.
+    assert VOICE_BUDGET_S < JOB_TIMEOUT
+    assert committed.timeout_s <= VOICE_BUDGET_S
 
 
 def test_a_response_format_without_no_speech_prob_fails_to_load() -> None:
@@ -1297,6 +1308,114 @@ def test_the_service_never_writes_the_outbound_queue_itself() -> None:
     assert not [line for line in statements if "INSERT" in line or "UPDATE" in line]
     assert "PostgresOutboundQueueStore" not in source
     assert "from fittrack.services.outbound import" not in source
+
+
+# --------------------------------------------------------------------------- #
+# The deadline never skips the clean-up decision (G-1)
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_cancelled_transcription_does_not_leave_the_recording_behind(
+    tmp_path: Path,
+) -> None:
+    """G-1. `CancelledError` is not `Exception`, so the unwind skipped both the
+    discard and the retention decision — leaving audio in tmpfs that §11.3 may
+    not allow to be kept, until the six hour sweep happened to reach it.
+    """
+
+    class HangingTranscriber:
+        async def transcribe(self, audio: Path, *, prompt: str) -> Transcription:
+            await asyncio.sleep(30)
+            raise AssertionError("the budget did not cut this short")
+
+    resolved = await ingestion(
+        tmp_path=tmp_path,
+        transcriber=HangingTranscriber(),
+        consent=FakeConsent(granted=True, retention=True),
+        budget_s=0.15,
+    ).resolve([voice_item()], tenant_id=TENANT)
+
+    assert resolved[0]["status"] == "incomplete"
+    assert list((tmp_path / "retry").glob("*")) == [], (
+        "the recording survived a cancellation without the consent that keeping it needs"
+    )
+
+
+async def test_a_cancellation_after_the_transcript_is_stored_still_deletes_the_audio(
+    tmp_path: Path,
+) -> None:
+    """Criterion 1: immediate discard after a successful transcription.
+
+    The ledger write of E-7 sits between the two, so a deadline that lands
+    there used to leave the recording on disk with the transcription already
+    persisted — the one case where keeping it buys nothing at all.
+    """
+    transcripts = FakeTranscripts()
+
+    await ingestion(
+        tmp_path=tmp_path,
+        transcriber=FakeTranscriber(Transcription("supino", duration_s=4.0)),
+        transcripts=transcripts,
+        usage=FakeUsage(hang=True),
+        budget_s=0.15,
+    ).resolve([voice_item()], tenant_id=TENANT)
+
+    assert transcripts.saved, "the transcript was not stored before the cut"
+    assert list((tmp_path / "retry").glob("*")) == []
+
+
+# --------------------------------------------------------------------------- #
+# A recording waiting for a retry is still subject to consent (G-3)
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_pending_recording_goes_when_the_use_consent_is_withdrawn(
+    tmp_path: Path,
+) -> None:
+    """G-3. The rule of §11.3 is not only checked at the moment of failure.
+
+    An attempt fails and the recording is kept; consent is revoked before the
+    retry. The retry refuses at the gate and used to walk away, leaving the
+    audio in tmpfs for six hours after permission to hold it was withdrawn.
+    """
+    await ingestion(
+        tmp_path=tmp_path,
+        consent=FakeConsent(granted=True, retention=True),
+        transcriber=FakeTranscriber(SttTransportError("timeout")),
+    ).ingest(voice_item(), tenant_id=TENANT)
+    kept = pending_audio_path(tmp_path / "retry", RAW_MESSAGE)
+    assert kept.is_file()
+
+    outcome = await ingestion(
+        tmp_path=tmp_path, consent=FakeConsent(granted=False), replies=FakeReplies()
+    ).ingest(voice_item(), tenant_id=TENANT)
+
+    assert outcome.status is VoiceStatus.NO_CONSENT
+    assert not kept.exists()
+
+
+async def test_a_pending_recording_goes_when_the_retention_consent_is_withdrawn(
+    tmp_path: Path,
+) -> None:
+    """Keeping it needed `model_training`, and it is gone: download it again."""
+    downloader = FakeDownloader(tmp_path / "retry")
+    await ingestion(
+        tmp_path=tmp_path,
+        downloader=downloader,
+        consent=FakeConsent(granted=True, retention=True),
+        transcriber=FakeTranscriber(SttTransportError("timeout")),
+    ).ingest(voice_item(), tenant_id=TENANT)
+    assert pending_audio_path(tmp_path / "retry", RAW_MESSAGE).is_file()
+
+    outcome = await ingestion(
+        tmp_path=tmp_path,
+        downloader=downloader,
+        consent=FakeConsent(granted=True, retention=False),
+        transcriber=FakeTranscriber(Transcription("na segunda vez")),
+    ).ingest(voice_item(), tenant_id=TENANT)
+
+    assert outcome.text == "na segunda vez"
+    assert downloader.calls == [MEDIA_REF, MEDIA_REF], "the withdrawn recording was reused"
 
 
 # --------------------------------------------------------------------------- #

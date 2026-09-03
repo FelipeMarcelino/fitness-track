@@ -166,6 +166,14 @@ class FakeBatchStore:
             attempts=row.attempts,
         )
 
+    async def update_content(
+        self, *, batch_id: int, tenant_id: int, combined_text: bytes, key_version: int
+    ) -> None:
+        row = self._rows.get(batch_id)
+        if row is not None and row.status == "pending":
+            row.combined_text = combined_text
+            row.key_version = key_version
+
     async def mark_failed(self, *, batch_id: int, tenant_id: int, error: str) -> None:
         row = self._rows.get(batch_id)
         if row is not None and row.status == "pending":
@@ -640,10 +648,86 @@ class TestPersistBatch:
         )
 
         assert revoked.asked == 1, "the consent gate was not consulted on the reuse path"
-        assert retry is None, "the batch was handed to the graph despite revoked consent"
+        # The batch is repaired rather than abandoned (G-5): the withdrawn
+        # recording leaves its content, and the text of the same burst — which
+        # depends on no recording — still reaches the graph. Abandoning the row
+        # would have made the same "oi" survive or vanish depending on *when*
+        # the tenant revoked, which is not a distinction the user made.
+        assert retry == first
+        row = await fake_store.get(batch_id=first, tenant_id=1)
+        assert row is not None
+        assert row.status == "pending"
+        items_now = json.loads(
+            cipher.decrypt(
+                row.combined_text,
+                column_aad(
+                    tenant_id=1,
+                    table="processing_batch",
+                    column="combined_text",
+                    row_id=first,
+                ),
+                declared_version=1,
+            )
+        )
+        assert [item["text"] for item in items_now] == ["oi"]
+        assert not any(item.get("kind") == "voice" for item in items_now)
+
+    @pytest.mark.asyncio
+    async def test_a_voice_only_burst_is_abandoned_when_consent_is_revoked(
+        self, cipher: ColumnCipher, fake_store: FakeBatchStore
+    ) -> None:
+        """Nothing survives the refusal, so there is no batch left to hand over."""
+        items: list[dict[str, object]] = [
+            {"channel_message_id": "m1", "raw_message_id": 101, "kind": "voice"}
+        ]
+        first = await persist_batch(
+            drain=_make_drain(list(items)),
+            tenant_id=1,
+            cipher=cipher,
+            store=fake_store,
+            voice=_KeepsVoice(),
+        )
+        assert first is not None
+
+        retry = await persist_batch(
+            drain=_make_drain(list(items)),
+            tenant_id=1,
+            cipher=cipher,
+            store=fake_store,
+            voice=_RevokedVoice(),
+        )
+
+        assert retry is None
         row = await fake_store.get(batch_id=first, tenant_id=1)
         assert row is not None
         assert row.status == "failed", "the row was left pending with nothing to pick it up"
+
+    @pytest.mark.asyncio
+    async def test_repairing_a_batch_twice_does_not_grow_the_table(
+        self, cipher: ColumnCipher, fake_store: FakeBatchStore
+    ) -> None:
+        """The naive repair inserts a second batch and loops on the next retry."""
+        items: list[dict[str, object]] = [
+            {"channel_message_id": "m1", "raw_message_id": 101, "kind": "voice"},
+            {"channel_message_id": "m2", "raw_message_id": 102, "kind": "text", "text": "oi"},
+        ]
+        await persist_batch(
+            drain=_make_drain(list(items)),
+            tenant_id=1,
+            cipher=cipher,
+            store=fake_store,
+            voice=_KeepsVoice(),
+        )
+        for _ in range(3):
+            await persist_batch(
+                drain=_make_drain(list(items)),
+                tenant_id=1,
+                cipher=cipher,
+                store=fake_store,
+                voice=_RevokedVoice(),
+            )
+
+        assert len(fake_store._rows) == 1
 
     @pytest.mark.asyncio
     async def test_a_text_only_drain_does_not_pay_for_the_consent_gate(

@@ -767,6 +767,11 @@ class VoiceIngestion:
         # checked on every use rather than only on the call that produced the
         # transcript — a consent revoked between the two is a revoked consent.
         if not await self._consent.has_consent(tenant_id=tenant_id, kind=WORKOUT_DATA_CONSENT):
+            # Anything a previous attempt kept goes with the refusal. §11.3
+            # allows a recording to be held for a retry that may now never
+            # happen, and the permission it was held under has just been
+            # withdrawn — the rule is not only checked at the moment of failure.
+            self._discard_pending(raw_message_id)
             logger.info(
                 "voice refused: no workout_data consent",
                 extra={"tenant_id": tenant_id, "raw_message_id": raw_message_id},
@@ -847,69 +852,102 @@ class VoiceIngestion:
                 row=row,
             )
 
-        audio = await self._audio_for(media_ref, raw_message_id=raw_message_id)
+        audio = await self._audio_for(media_ref, tenant_id=tenant_id, raw_message_id=raw_message_id)
         if audio is None:
             return VoiceOutcome(VoiceStatus.FAILED)
 
+        # Everything from here owns a file, and the deadline of E-3 can cut in at
+        # any await inside it. `CancelledError` is a `BaseException`, so it reaches
+        # none of the handlers below — the `finally` is the only thing that runs on
+        # that path, and the recording must not outlive it.
+        settled = False
         try:
-            result = await self._transcriber.transcribe(
-                audio, prompt=self._prompt(self._config.prompt_file)
-            )
-        except Exception as error:
-            # Every failure, not only the ones this module names. An engine
-            # that raised something unexpected is a bug, and a bug must not
-            # cost the user their message (invariant 6): the item goes to the
-            # batch as `incomplete` either way. The type is logged; the
-            # traceback is not, because a third party's exception text can
-            # carry the URL that authenticates the download (spec 20.6).
-            #
-            # Whether the *recording* survives is a separate question, and
-            # §11.3 answers it with a separate consent.
-            await self._retain_or_discard(audio, tenant_id=tenant_id, error=error)
-            return VoiceOutcome(VoiceStatus.FAILED)
+            try:
+                result = await self._transcriber.transcribe(
+                    audio, prompt=self._prompt(self._config.prompt_file)
+                )
+            except Exception as error:
+                # Every failure, not only the ones this module names. An engine
+                # that raised something unexpected is a bug, and a bug must not
+                # cost the user their message (invariant 6): the item goes to the
+                # batch as `incomplete` either way. The type is logged; the
+                # traceback is not, because a third party's exception text can
+                # carry the URL that authenticates the download (spec 20.6).
+                #
+                # Whether the *recording* survives is a separate question, and
+                # §11.3 answers it with a separate consent.
+                await self._retain_or_discard(audio, tenant_id=tenant_id, error=error)
+                settled = True
+                return VoiceOutcome(VoiceStatus.FAILED)
 
-        # Not `text`: that name belongs to SQLAlchemy's constructor in this
-        # module, and shadowing it here is one refactor away from a confusing
-        # `NameError` in the store below.
-        transcript = result.text.strip()
-        if not transcript or self._is_inaudible(result):
+            # Not `text`: that name belongs to SQLAlchemy's constructor in this
+            # module, and shadowing it here is one refactor away from a confusing
+            # `NameError` in the store below.
+            transcript = result.text.strip()
+            if not transcript or self._is_inaudible(result):
+                _discard(audio)
+                settled = True
+                logger.info(
+                    "voice was inaudible",
+                    extra={
+                        "tenant_id": tenant_id,
+                        "raw_message_id": raw_message_id,
+                        "no_speech_prob": result.no_speech_prob,
+                    },
+                )
+                return await self._refuse(
+                    VoiceStatus.INAUDIBLE,
+                    INAUDIBLE_PROMPT,
+                    tenant_id=tenant_id,
+                    raw_message_id=raw_message_id,
+                    row=row,
+                )
+
+            # Before the unlink, deliberately: a crash between the two would
+            # otherwise leave the transcription nowhere and the audio gone. The
+            # opposite order of failure is safe — the recording sits at its
+            # `raw_message_id` path, so a retry finds it and the sweep expires it.
+            await self._transcripts.save(
+                tenant_id=tenant_id, raw_message_id=raw_message_id, transcript=transcript
+            )
+            await self._record_usage(tenant_id=tenant_id, seconds=result.duration_s)
             _discard(audio)
+            settled = True
             logger.info(
-                "voice was inaudible",
+                "voice transcribed",
                 extra={
                     "tenant_id": tenant_id,
                     "raw_message_id": raw_message_id,
-                    "no_speech_prob": result.no_speech_prob,
+                    "characters": len(transcript),
                 },
             )
-            return await self._refuse(
-                VoiceStatus.INAUDIBLE,
-                INAUDIBLE_PROMPT,
-                tenant_id=tenant_id,
-                raw_message_id=raw_message_id,
-                row=row,
-            )
-
-        # Before the unlink, deliberately: a crash between the two would
-        # otherwise leave the transcription nowhere and the audio gone. The
-        # opposite order of failure is safe — the recording sits at its
-        # `raw_message_id` path, so a retry finds it and the sweep expires it.
-        await self._transcripts.save(
-            tenant_id=tenant_id, raw_message_id=raw_message_id, transcript=transcript
-        )
-        await self._record_usage(tenant_id=tenant_id, seconds=result.duration_s)
-        _discard(audio)
-        logger.info(
-            "voice transcribed",
-            extra={
-                "tenant_id": tenant_id,
-                "raw_message_id": raw_message_id,
-                "characters": len(transcript),
-            },
-        )
-        return VoiceOutcome(VoiceStatus.TRANSCRIBED, text=transcript)
+            return VoiceOutcome(VoiceStatus.TRANSCRIBED, text=transcript)
+        except Exception as error:
+            # Something below the transcription failed — the store, most
+            # likely — and is on its way to the caller. We can still await, so
+            # the recording gets the same consent-aware decision a failed
+            # transcription gets rather than the blunt one in `finally`.
+            if not settled:
+                await self._retain_or_discard(audio, tenant_id=tenant_id, error=error)
+                settled = True
+            raise
+        finally:
+            if not settled:
+                # Cancellation, and only cancellation: every ordinary path
+                # above has settled the file. Deleting is the conservative
+                # answer, because keeping the recording needs the
+                # `model_training` consent of §11.3 and asking for it is an
+                # await that would be cancelled in turn. The cost is one more
+                # download if the message comes round again.
+                _discard(audio)
 
     # --- internals --------------------------------------------------------- #
+
+    def _discard_pending(self, raw_message_id: int) -> None:
+        """Delete whatever a previous attempt left waiting, if anything."""
+        pending = find_pending_audio(self._retry_dir, raw_message_id)
+        if pending is not None:
+            _discard(pending)
 
     async def _record_usage(self, *, tenant_id: int, seconds: float | None) -> None:
         """The cost line of §11.3: `usage_ledger.audio_seconds`.
@@ -976,7 +1014,9 @@ class VoiceIngestion:
             and result.no_speech_prob > self._config.no_speech_threshold
         )
 
-    async def _audio_for(self, media_ref: str, *, raw_message_id: int) -> Path | None:
+    async def _audio_for(
+        self, media_ref: str, *, tenant_id: int, raw_message_id: int
+    ) -> Path | None:
         """The kept file from a previous failure, or a fresh download.
 
         A fresh download is moved to its `raw_message_id` path immediately,
@@ -987,7 +1027,16 @@ class VoiceIngestion:
         """
         pending = find_pending_audio(self._retry_dir, raw_message_id)
         if pending is not None:
-            return pending
+            if await self._consent.has_consent(tenant_id=tenant_id, kind=MODEL_TRAINING_CONSENT):
+                return pending
+            # Kept under a consent that no longer holds. Delete it and pay for
+            # the download again, which is the cost of not being allowed to
+            # keep it (§11.3).
+            logger.info(
+                "a retained recording lost its retention consent and was deleted",
+                extra={"tenant_id": tenant_id, "raw_message_id": raw_message_id},
+            )
+            _discard(pending)
         try:
             downloaded = await self._downloader.download_media(media_ref)
         except Exception as error:
@@ -1073,8 +1122,10 @@ class VoiceIngestion:
 def _reply_group(raw_message_id: int, status: VoiceStatus) -> UUID:
     """One group per message and refusal, stable across retries.
 
-    `outbound_queue` has a unique index on `(group_id, seq)` (migration 0006),
-    so re-enqueueing the same refusal is a no-op rather than a second bubble.
+    `outbound_queue` has carried `UNIQUE (group_id, seq)` since the initial
+    schema (spec 5.2), so re-enqueueing the same refusal is a no-op rather than
+    a second bubble — the insert says `ON CONFLICT DO NOTHING`, and the
+    constraint it infers was already there.
     The status is in the name because a message can be refused twice for
     different reasons — too long today, unconsented on the retry — and the
     second refusal is a different thing to say.
