@@ -42,7 +42,7 @@ from fittrack.channels.base import OutboundBlock
 from fittrack.config import SttConfig
 from fittrack.db.engine import tenant_session
 from fittrack.security.crypto import ColumnCipher, column_aad
-from fittrack.security.tmpfile import open_no_follow
+from fittrack.security.tmpfile import open_no_follow, private_directory
 from fittrack.settings import ChannelKind
 
 logger = logging.getLogger(__name__)
@@ -190,14 +190,19 @@ class VoiceOutcome:
 class VoiceMessage:
     """The `raw_message` row behind a buffered voice item.
 
-    It answers three questions in one query: who to reply to, on which channel,
-    and whether this recording was already transcribed by an attempt that then
-    failed further down.
+    It answers four questions in one query: who to reply to, on which channel,
+    whether this recording was already transcribed by an attempt that then
+    failed further down, and whether it has already been answered.
     """
 
     identity_id: int
     channel: ChannelKind
     transcript: str | None
+    # `processed_at`, as a boolean. A drain is kept until the batch is persisted
+    # and enqueued (§17.3), so a failure after a fixed reply was queued means
+    # the same burst is processed again — and without a durable marker the user
+    # would be told twice that we could not hear them.
+    answered: bool = False
 
 
 # --------------------------------------------------------------------------- #
@@ -234,6 +239,9 @@ class TranscriptStore(Protocol):
 
     async def save(self, *, tenant_id: int, raw_message_id: int, transcript: str) -> None:
         """Persist the transcription. Called before the audio is deleted."""
+
+    async def mark_answered(self, *, tenant_id: int, raw_message_id: int) -> None:
+        """Record that this message has had its fixed reply, once."""
 
 
 class ReplyQueue(Protocol):
@@ -320,11 +328,16 @@ def pending_audio_path(directory: Path, raw_message_id: int) -> Path:
 def purge_stale_audio(directory: Path, *, max_age_s: int, now: float | None = None) -> int:
     """Delete recordings past the retention window, returning how many.
 
-    Spec 11.3 gives a failed transcription six hours and no more. The sweep is
-    opportunistic — every ingestion runs it — so the rule holds without a
-    scheduled job, in a directory this module owns and nothing else writes to.
+    Spec 11.3 gives a failed transcription six hours and no more. Two things
+    call this: every ingestion, which covers a worker that keeps receiving
+    voice, and the half-hourly cron job registered in ``worker.py``, which
+    covers the one that does not — a replica holding one failed recording and
+    then going quiet would otherwise keep it for the life of the container.
+
+    The directory is one this module owns and nothing else writes to, which is
+    what makes deleting by age safe.
     """
-    if not directory.is_dir():
+    if not directory.is_dir() or directory.is_symlink():
         return 0
     cutoff = (time.time() if now is None else now) - max_age_s
     removed = 0
@@ -513,7 +526,14 @@ class VoiceIngestion:
         self._prompt_dir = prompt_dir
         self._replies = replies
         self._retry_dir = retry_dir
-        self._prompts: dict[str, str] = {}
+        # Read now, not on the first voice message. A misspelled `prompt_file`
+        # or a missing fixed reply is a deployment error, and discovering it
+        # after a recording has been downloaded turns it into an `incomplete`
+        # message for every voice note instead of a worker that never started.
+        self._prompts = {
+            name: load_prompt(name, prompt_dir=prompt_dir)
+            for name in (config.prompt_file, INAUDIBLE_PROMPT, TOO_LONG_PROMPT, CONSENT_PROMPT)
+        }
 
     # --- the batch integration point (S02-T05) ----------------------------- #
 
@@ -540,6 +560,11 @@ class VoiceIngestion:
                 continue
             item["was_audio"] = True
             item["text"] = outcome.text
+            # The `file_id` fetches the recording from the channel and has no
+            # reader downstream — the graph gets text (spec 11.1). Leaving it
+            # in would serialise a reusable channel access reference into
+            # `combined_text` and into every trace built from it.
+            item["media_ref"] = None
             if outcome.status is VoiceStatus.FAILED:
                 # Spec 11.3 and invariant 6: recorded, and outside every
                 # analysis. `v_set_volume` filters on `complete`.
@@ -569,7 +594,11 @@ class VoiceIngestion:
                 extra={"tenant_id": tenant_id, "raw_message_id": raw_message_id},
             )
             return await self._refuse(
-                VoiceStatus.NO_CONSENT, CONSENT_PROMPT, tenant_id=tenant_id, row=row
+                VoiceStatus.NO_CONSENT,
+                CONSENT_PROMPT,
+                tenant_id=tenant_id,
+                raw_message_id=raw_message_id,
+                row=row,
             )
 
         if row is not None and row.transcript:
@@ -593,7 +622,11 @@ class VoiceIngestion:
                 },
             )
             return await self._refuse(
-                VoiceStatus.TOO_LONG, TOO_LONG_PROMPT, tenant_id=tenant_id, row=row
+                VoiceStatus.TOO_LONG,
+                TOO_LONG_PROMPT,
+                tenant_id=tenant_id,
+                raw_message_id=raw_message_id,
+                row=row,
             )
         item_channel = item.get("channel")
         if item_channel != self._channel:
@@ -619,7 +652,11 @@ class VoiceIngestion:
                 extra={"tenant_id": tenant_id, "raw_message_id": raw_message_id},
             )
             return await self._refuse(
-                VoiceStatus.TOO_LONG, TOO_LONG_PROMPT, tenant_id=tenant_id, row=row
+                VoiceStatus.TOO_LONG,
+                TOO_LONG_PROMPT,
+                tenant_id=tenant_id,
+                raw_message_id=raw_message_id,
+                row=row,
             )
 
         audio = await self._audio_for(media_ref, raw_message_id=raw_message_id)
@@ -634,11 +671,10 @@ class VoiceIngestion:
             # Every failure, not only the ones this module names. An engine
             # that raised something unexpected is a bug, and a bug must not
             # cost the user their message (invariant 6): the item goes to the
-            # batch as `incomplete` and the recording is kept for the retry.
-            # The type is logged; the traceback is not, because a third party's
-            # exception text can carry the URL that authenticates the download
-            # (spec 20.6).
-            self._keep_for_retry(audio, raw_message_id=raw_message_id)
+            # batch as `incomplete` and the recording stays where the next
+            # attempt looks for it. The type is logged; the traceback is not,
+            # because a third party's exception text can carry the URL that
+            # authenticates the download (spec 20.6).
             logger.warning(
                 "transcription failed, the recording is kept for a retry",
                 extra={
@@ -665,11 +701,17 @@ class VoiceIngestion:
                 },
             )
             return await self._refuse(
-                VoiceStatus.INAUDIBLE, INAUDIBLE_PROMPT, tenant_id=tenant_id, row=row
+                VoiceStatus.INAUDIBLE,
+                INAUDIBLE_PROMPT,
+                tenant_id=tenant_id,
+                raw_message_id=raw_message_id,
+                row=row,
             )
 
         # Before the unlink, deliberately: a crash between the two would
-        # otherwise leave the transcription nowhere and the audio gone.
+        # otherwise leave the transcription nowhere and the audio gone. The
+        # opposite order of failure is safe — the recording sits at its
+        # `raw_message_id` path, so a retry finds it and the sweep expires it.
         await self._transcripts.save(
             tenant_id=tenant_id, raw_message_id=raw_message_id, transcript=transcript
         )
@@ -687,8 +729,6 @@ class VoiceIngestion:
     # --- internals --------------------------------------------------------- #
 
     def _prompt(self, name: str) -> str:
-        if name not in self._prompts:
-            self._prompts[name] = load_prompt(name, prompt_dir=self._prompt_dir)
         return self._prompts[name]
 
     def _is_inaudible(self, result: Transcription) -> bool:
@@ -704,12 +744,19 @@ class VoiceIngestion:
         )
 
     async def _audio_for(self, media_ref: str, *, raw_message_id: int) -> Path | None:
-        """The kept file from a previous failure, or a fresh download."""
+        """The kept file from a previous failure, or a fresh download.
+
+        A fresh download is moved to its `raw_message_id` path immediately,
+        before anything can fail. The channel names the file with a UUID it
+        alone knows; if the process died between that name and a later rename,
+        the recording would sit in tmpfs under a name no retry could look for
+        and no sweep would recognise as ours.
+        """
         pending = pending_audio_path(self._retry_dir, raw_message_id)
         if pending.is_file():
             return pending
         try:
-            return await self._downloader.download_media(media_ref)
+            downloaded = await self._downloader.download_media(media_ref)
         except Exception as error:
             # Any channel failure: a 429, a network drop, a file the channel
             # will not serve. The message is not discarded — the item goes to
@@ -720,22 +767,23 @@ class VoiceIngestion:
                 extra={"raw_message_id": raw_message_id, "error": type(error).__name__},
             )
             return None
+        return self._adopt(downloaded, destination=pending, raw_message_id=raw_message_id)
 
-    def _keep_for_retry(self, audio: Path, *, raw_message_id: int) -> None:
-        """Move the recording to where the next attempt will look for it."""
-        destination = pending_audio_path(self._retry_dir, raw_message_id)
-        if audio == destination:
-            return
+    def _adopt(self, downloaded: Path, *, destination: Path, raw_message_id: int) -> Path:
+        """Put a fresh download where every later attempt can address it."""
         try:
-            self._retry_dir.mkdir(parents=True, exist_ok=True)
-            audio.replace(destination)
+            private_directory(self._retry_dir)
+            downloaded.replace(destination)
         except OSError:
-            # Nothing is lost that was not already lost: without the file the
-            # retry pays for the download again, which is the ordinary path.
+            # Transcribe from where it landed rather than refusing the message.
+            # The cost is that this one recording is not retryable and not
+            # swept, which is strictly better than discarding the input.
             logger.warning(
-                "the recording could not be kept for a retry",
+                "the recording could not be moved into the retry buffer",
                 extra={"raw_message_id": raw_message_id},
             )
+            return downloaded
+        return destination
 
     async def _refuse(
         self,
@@ -743,16 +791,29 @@ class VoiceIngestion:
         prompt: str,
         *,
         tenant_id: int,
+        raw_message_id: int,
         row: VoiceMessage | None,
     ) -> VoiceOutcome:
         """Answer with one of the fixed replies of 11.3, and queue it if wired."""
         block = OutboundBlock(kind="text", text=self._prompt(prompt))
-        if self._replies is not None and row is not None:
+        if self._replies is not None and row is not None and row.answered:
+            # A retried drain reaching the same refusal a second time must not
+            # tell the user a second time.
+            logger.info(
+                "voice was already answered, not queueing the reply again",
+                extra={"tenant_id": tenant_id, "voice_status": status.value},
+            )
+        elif self._replies is not None and row is not None:
             await self._replies.enqueue_response(
                 tenant_id=tenant_id,
                 identity_id=row.identity_id,
                 channel=row.channel,
                 blocks=[block],
+            )
+            # After the enqueue, so a failure there is retried rather than
+            # marked as answered and dropped.
+            await self._transcripts.mark_answered(
+                tenant_id=tenant_id, raw_message_id=raw_message_id
             )
         elif self._replies is not None:
             # Without the row there is no identity to address, and inventing
@@ -812,8 +873,12 @@ class SqlConsentGate:
         async with tenant_session(self._sessions, tenant_id) as session:
             granted = await session.scalar(
                 text(
-                    "SELECT granted FROM consent "
-                    "WHERE kind = CAST(:kind AS consent_kind) AND revoked_at IS NULL "
+                    # The latest row first, *then* the two conditions. Filtering
+                    # `revoked_at IS NULL` before ordering would drop the
+                    # revocation and answer from the older grant behind it —
+                    # which is a revoked consent reading as granted.
+                    "SELECT granted AND revoked_at IS NULL FROM consent "
+                    "WHERE kind = CAST(:kind AS consent_kind) "
                     "ORDER BY granted_at DESC, id DESC LIMIT 1"
                 ),
                 {"kind": kind},
@@ -837,7 +902,7 @@ class SqlTranscriptStore:
         async with tenant_session(self._sessions, tenant_id) as session:
             result = await session.execute(
                 text(
-                    "SELECT identity_id, channel, transcript "
+                    "SELECT identity_id, channel, transcript, processed_at "
                     "FROM raw_message WHERE id = :raw_message_id"
                 ),
                 {"raw_message_id": raw_message_id},
@@ -862,6 +927,7 @@ class SqlTranscriptStore:
                 if blob
                 else None
             ),
+            answered=row["processed_at"] is not None,
         )
 
     async def save(self, *, tenant_id: int, raw_message_id: int, transcript: str) -> None:
@@ -889,4 +955,15 @@ class SqlTranscriptStore:
                     "WHERE id = :raw_message_id"
                 ),
                 {"transcript": encrypted, "raw_message_id": raw_message_id},
+            )
+
+    async def mark_answered(self, *, tenant_id: int, raw_message_id: int) -> None:
+        """Stamp `processed_at`, once, so a retried drain does not reply twice."""
+        async with tenant_session(self._sessions, tenant_id) as session:
+            await session.execute(
+                text(
+                    "UPDATE raw_message SET processed_at = now() "
+                    "WHERE id = :raw_message_id AND processed_at IS NULL"
+                ),
+                {"raw_message_id": raw_message_id},
             )

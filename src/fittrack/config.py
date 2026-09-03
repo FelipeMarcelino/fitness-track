@@ -136,7 +136,12 @@ class SttConfig(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    provider: Provider
+    # Narrower than `Provider`, and it has to be. There is one transcriber
+    # implementation and it posts to Groq's endpoint (spec 11.1), while the
+    # wiring reads `{provider}_api_key` — so `provider: openai` would validate,
+    # pick up `OPENAI_API_KEY` and send it to api.groq.com as a bearer token.
+    # A second provider arrives with a second transcriber, and widens this then.
+    provider: Literal["groq"]
     model: Annotated[str, Field(min_length=1, pattern=r"\S")]
     language: Annotated[str, Field(min_length=2)] = "pt"
     # A `Literal` rather than a string: `no_speech_prob` and the segments the
@@ -146,7 +151,12 @@ class SttConfig(BaseModel):
     # The vocabulary of 11.2, by name. The file itself is pt-BR content and
     # lives beside the other prompts (AD-27).
     prompt_file: Annotated[str, Field(min_length=1)] = "stt_vocabulary.md"
-    timeout_s: Annotated[int, Field(gt=0)] = 120
+    # The transcription happens inside `flush_check`, so this has to leave room
+    # for the download and the persistence inside the ARQ job timeout — a
+    # request still pending when ARQ cancels the job never reaches the handler
+    # that keeps the recording for a retry. `tests/unit/test_stt.py` pins the
+    # two together.
+    timeout_s: Annotated[int, Field(gt=0)] = 60
     max_audio_seconds: Annotated[int, Field(gt=0)] = 300
     no_speech_threshold: Annotated[float, Field(ge=0.0, le=1.0)] = 0.6
     retry_retention_hours: Annotated[int, Field(gt=0)] = 6

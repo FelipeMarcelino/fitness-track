@@ -224,11 +224,23 @@ def prepare_items(
 
     Preserves arrival order (§4.1).  Items without ``raw_message_id`` are
     kept in the list but excluded from ``message_ids``.
+
+    A voice item that reaches this point without text was never transcribed —
+    either no resolver was wired (a deployment with no STT credential, see
+    ``worker.build_voice_ingestion``) or the resolver failed. Either way it
+    leaves here in the shape the rest of the pipeline expects from a failed
+    transcription: empty text, ``status='incomplete'`` so it stays outside
+    every analysis (invariant 6), and no ``media_ref``, which nothing
+    downstream reads and which is a reusable channel access reference (§20.6).
     """
     message_ids: list[str] = []
     for item in items:
         if item.get("kind") == "voice":
             item["was_audio"] = True
+            if not item.get("text"):
+                item["text"] = ""
+                item["status"] = "incomplete"
+            item["media_ref"] = None
         # This is globally unique across channels and remains stable when an
         # orphaned Redis drain is retried.
         msg_id = item.get("raw_message_id")

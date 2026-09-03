@@ -33,8 +33,9 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 import httpx
-from arq import ArqRedis, Retry, func
+from arq import ArqRedis, Retry, cron, func
 from arq.connections import RedisSettings
+from arq.cron import CronJob
 from arq.worker import Function
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -59,10 +60,12 @@ from fittrack.services.outbound import (
     RedisRateLimiter,
 )
 from fittrack.services.stt import (
+    DEFAULT_RETRY_DIR,
     GroqTranscriber,
     SqlConsentGate,
     SqlTranscriptStore,
     VoiceIngestion,
+    purge_stale_audio,
 )
 from fittrack.settings import ChannelKind, Settings, get_settings
 from fittrack.startup import startup
@@ -75,6 +78,17 @@ HEARTBEAT = Path("/tmp/fittrack-worker.hb")
 # one at 4s, which is well inside the 90s job timeout of the default queue.
 MAX_TRIES = 3
 MAX_BACKOFF_EXPONENT = 2
+
+# One job's budget. The transcription of S02-T07 runs inside `flush_check`, so
+# this has to cover the download, the provider call and the persistence — a
+# request still in flight when ARQ cancels the job never reaches the handler
+# that keeps the recording for a retry. `SttConfig.timeout_s` is held below it
+# by `tests/unit/test_stt.py`.
+JOB_TIMEOUT = 90
+
+# How often the retention sweep of §11.3 runs on its own, for the worker that
+# keeps a failed recording and then receives no more voice.
+AUDIO_SWEEP_MINUTES = frozenset({0, 30})
 
 
 def build_redis_settings(settings: Settings | None = None) -> RedisSettings:
@@ -206,6 +220,12 @@ def build_voice_ingestion(
 
     sessions = session_factory(ctx["db_engine"])
     cipher = ColumnCipher(Keyring.from_settings(settings))
+    # Kept so `worker_shutdown` can release the adapter's connection pool: the
+    # registry is discarded here and the `Channel` protocol of 18.1 declares no
+    # lifecycle method, so nobody else holds it.
+    ctx["voice_channel"] = channel
+    # What the half-hourly sweep needs, without re-reading the configuration.
+    ctx["voice_retention_s"] = stt.retry_retention_hours * 3600
     # One pool for the worker, closed at shutdown. The adapter's own client is
     # separate and owned by the registry.
     http = httpx.AsyncClient(timeout=stt.timeout_s)
@@ -238,14 +258,37 @@ async def worker_startup(ctx: dict[str, Any]) -> None:
     ctx["voice"] = build_voice_ingestion(ctx, settings, config)
 
 
+async def sweep_voice_audio(ctx: dict[str, Any]) -> None:
+    """Expire recordings past the retention window of §11.3.
+
+    Registered as a cron job because the rule is a maximum, not a best effort:
+    an ingestion-time sweep covers a worker that keeps receiving voice, and a
+    replica that kept one failed recording and then went quiet would otherwise
+    hold it for the life of the container.
+    """
+    retention_s = ctx.get("voice_retention_s")
+    if not isinstance(retention_s, int):
+        return  # voice is not wired in this deployment
+    removed = purge_stale_audio(DEFAULT_RETRY_DIR, max_age_s=retention_s)
+    if removed:
+        logger.info("expired retained recordings", extra={"removed": removed})
+
+
 async def worker_shutdown(ctx: dict[str, Any]) -> None:
-    """Dispose the worker's database pool and HTTP client cleanly."""
+    """Dispose the worker's database pool and HTTP clients cleanly."""
     engine = ctx.pop("db_engine", None)
     ctx.pop("batch_store", None)
     ctx.pop("voice", None)
+    ctx.pop("voice_retention_s", None)
     http = ctx.pop("stt_http", None)
     if isinstance(http, httpx.AsyncClient):
         await http.aclose()
+    # The adapter owns the pool the registry built for it. `Channel` does not
+    # declare `aclose` (spec 18.1), so this asks rather than assumes.
+    channel = ctx.pop("voice_channel", None)
+    close_channel = getattr(channel, "aclose", None)
+    if callable(close_channel):
+        await close_channel()
     if isinstance(engine, AsyncEngine):
         await engine.dispose()
 
@@ -365,10 +408,18 @@ def _worker_settings() -> type:
             func(flush_check, keep_result=0, max_tries=MAX_TRIES),
             func(process_batch, keep_result=0, max_tries=MAX_TRIES),
         ]
+        cron_jobs: ClassVar[list[CronJob]] = [
+            cron(
+                sweep_voice_audio,
+                minute=set(AUDIO_SWEEP_MINUTES),
+                run_at_startup=True,
+                keep_result=0,
+            )
+        ]
         redis_settings: ClassVar[RedisSettings] = build_redis_settings()
         queue_name = "arq:queue"
         max_jobs = 10
-        job_timeout = 90
+        job_timeout = JOB_TIMEOUT
         on_startup = worker_startup
         on_shutdown = worker_shutdown
 

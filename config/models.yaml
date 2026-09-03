@@ -85,7 +85,10 @@ stt:
   # em nenhum outro formato de resposta (§11.1).
   response_format: verbose_json
   prompt_file: stt_vocabulary.md
-  timeout_s: 120
+  # Cabe dentro do `job_timeout` do worker (90s), que também paga o
+  # download e a persistência. Um pedido ainda pendente quando o ARQ
+  # cancela o job não chega ao tratamento que guarda o áudio para retry.
+  timeout_s: 60
   # As três regras da tabela da §11.3, no único lugar onde são configuráveis.
   max_audio_seconds: 300
   no_speech_threshold: 0.6

@@ -18,6 +18,7 @@ import asyncpg
 import httpx
 import pytest
 from arq import ArqRedis, Retry
+from arq.connections import RedisSettings
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -420,6 +421,46 @@ class TestPersistBatch:
         row = await fake_store.get(batch_id=row_id, tenant_id=1)
         assert row is not None
         assert row.key_version == cipher.active_version
+
+    @pytest.mark.asyncio
+    async def test_an_untranscribed_voice_item_is_still_recorded_as_incomplete(
+        self, cipher: ColumnCipher, fake_store: FakeBatchStore
+    ) -> None:
+        """No resolver wired: the item keeps the shape of a failed transcription.
+
+        `build_voice_ingestion` returns `None` where a deployment has no STT
+        credential, and a voice item must not reach the graph with a null text
+        and a live channel reference (S02-T07 review).
+        """
+        drain = _make_drain(
+            [
+                {
+                    "channel_message_id": "m1",
+                    "raw_message_id": 101,
+                    "kind": "voice",
+                    "text": None,
+                    "media_ref": "AwACAgE-file-id",
+                }
+            ]
+        )
+        row_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
+        assert row_id is not None
+        row = await fake_store.get(batch_id=row_id, tenant_id=1)
+        assert row is not None
+
+        plaintext = cipher.decrypt(
+            row.combined_text,
+            column_aad(
+                tenant_id=1, table="processing_batch", column="combined_text", row_id=row_id
+            ),
+            declared_version=1,
+        )
+        [item] = json.loads(plaintext)
+        assert item["was_audio"] is True
+        assert item["text"] == ""
+        assert item["status"] == "incomplete"
+        assert item["media_ref"] is None
+        assert "AwACAgE-file-id" not in plaintext.decode()
 
     @pytest.mark.asyncio
     async def test_voice_is_transcribed_before_the_combined_text_is_encrypted(
@@ -936,16 +977,87 @@ def test_voice_is_disabled_rather_than_fatal(overrides: dict[str, object], reaso
     assert "stt_http" not in ctx
 
 
+class ClosingChannel:
+    """A channel that records whether the wiring released its pool."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
 @pytest.mark.asyncio
-async def test_worker_shutdown_closes_the_transcription_client() -> None:
+async def test_worker_shutdown_closes_both_http_clients() -> None:
+    """The adapter owns the pool the registry built for it (S02-T07 review)."""
     http = httpx.AsyncClient()
-    ctx: dict[str, object] = {"stt_http": http, "voice": object()}
+    channel = ClosingChannel()
+    ctx: dict[str, object] = {
+        "stt_http": http,
+        "voice": object(),
+        "voice_channel": channel,
+        "voice_retention_s": 60,
+    }
 
     await worker_module.worker_shutdown(ctx)
 
     assert http.is_closed
-    assert "stt_http" not in ctx
-    assert "voice" not in ctx
+    assert channel.closed
+    for key in ("stt_http", "voice", "voice_channel", "voice_retention_s"):
+        assert key not in ctx
+
+
+@pytest.mark.asyncio
+async def test_the_audio_sweep_expires_what_the_window_has_passed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§11.3 is a maximum, so the sweep also runs on a schedule (S02-T07 review)."""
+    stale = tmp_path / "1.ogg"
+    stale.write_bytes(b"forgotten")
+    os.utime(stale, (1_000.0, 1_000.0))
+    monkeypatch.setattr(worker_module, "DEFAULT_RETRY_DIR", tmp_path)
+
+    await worker_module.sweep_voice_audio({"voice_retention_s": 3600})
+
+    assert not stale.exists()
+
+
+@pytest.mark.asyncio
+async def test_the_audio_sweep_does_nothing_where_voice_is_not_wired(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    kept = tmp_path / "1.ogg"
+    kept.write_bytes(b"not ours to delete")
+    os.utime(kept, (1_000.0, 1_000.0))
+    monkeypatch.setattr(worker_module, "DEFAULT_RETRY_DIR", tmp_path)
+
+    await worker_module.sweep_voice_audio({})
+
+    assert kept.is_file()
+
+
+def test_the_sweep_is_registered_as_a_cron_job(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Otherwise the retention window depends on the next voice message arriving.
+
+    `build_redis_settings` is stubbed so the assertion is about the
+    registration and not about this process having a validated environment.
+    """
+    monkeypatch.setattr(
+        worker_module,
+        "build_redis_settings",
+        lambda settings=None: RedisSettings.from_dsn("rediss://:secret@redis.internal:6380/3"),
+    )
+    settings = worker_module.WorkerSettings
+
+    [job] = settings.cron_jobs
+    assert job.coroutine is worker_module.sweep_voice_audio
+    assert job.run_at_startup
+    assert job.minute == worker_module.AUDIO_SWEEP_MINUTES
+    # The transcription runs inside a job, so the budget has to cover it.
+    assert settings.job_timeout == worker_module.JOB_TIMEOUT
+    assert (
+        load_models(Path("config") / "models.yaml").require_stt().timeout_s < settings.job_timeout
+    )
 
 
 def test_arq_redis_settings_use_validated_url_and_ca() -> None:

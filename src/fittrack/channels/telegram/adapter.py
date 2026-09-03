@@ -207,6 +207,16 @@ class TelegramAdapter:
             case _:  # pragma: no cover - the Literal is closed
                 raise ChannelError(f"telegram cannot send a {block.kind} block")
 
+    async def aclose(self) -> None:
+        """Release the connection pool the registry built for this adapter.
+
+        Not part of the protocol of 18.1, which has no lifecycle method: the
+        long-running services hold their adapters for the life of the process.
+        A worker that builds one to download voice notes does not, and an
+        unclosed `httpx` pool per restart is a leak the wiring can avoid.
+        """
+        await self._client.aclose()
+
     async def answer_callback(self, callback_query_id: str) -> None:
         """Stop the button spinning, before anything is queued (spec 18.2).
 

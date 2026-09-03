@@ -35,7 +35,7 @@ from pydantic import SecretStr, ValidationError
 from fittrack.channels.base import InboundMessage, OutboundBlock
 from fittrack.config import ConfigError, SttConfig, configured_providers, load_config, load_models
 from fittrack.security.crypto import ColumnCipher, DecryptionError, Keyring
-from fittrack.security.tmpfile import create_private, open_no_follow
+from fittrack.security.tmpfile import create_private, open_no_follow, private_directory
 from fittrack.services.stt import (
     CONSENT_PROMPT,
     GROQ_TRANSCRIPTIONS_URL,
@@ -127,9 +127,25 @@ class FakeConsent:
 class FakeTranscripts:
     """A transcript store that can record what the audio looked like on save."""
 
-    def __init__(self, *, transcript: str | None = None) -> None:
-        self.row = VoiceMessage(identity_id=IDENTITY, channel="telegram", transcript=transcript)
+    def __init__(
+        self,
+        *,
+        transcript: str | None = None,
+        answered: bool = False,
+        missing: bool = False,
+    ) -> None:
+        self.row = (
+            None
+            if missing
+            else VoiceMessage(
+                identity_id=IDENTITY,
+                channel="telegram",
+                transcript=transcript,
+                answered=answered,
+            )
+        )
         self.saved: list[tuple[int, int, str]] = []
+        self.answered: list[tuple[int, int]] = []
         self.watch: Path | None = None
         self.audio_existed_on_save: list[bool] = []
 
@@ -140,6 +156,9 @@ class FakeTranscripts:
         self.saved.append((tenant_id, raw_message_id, transcript))
         if self.watch is not None:
             self.audio_existed_on_save.append(self.watch.is_file())
+
+    async def mark_answered(self, *, tenant_id: int, raw_message_id: int) -> None:
+        self.answered.append((tenant_id, raw_message_id))
 
 
 class FakeReplies:
@@ -307,10 +326,43 @@ def test_the_committed_stt_configuration_matches_the_spec(committed: SttConfig) 
 
 
 def test_the_duration_ceiling_agrees_with_the_channel_parser(committed: SttConfig) -> None:
-    """One ceiling, two enforcers: the parser drops the reference, the service replies."""
+    """One ceiling, two enforcers: the parser drops the reference, the service replies.
+
+    They have to be the same number. The parser's is a module constant and the
+    service's is configuration, so raising only the second would leave a
+    recording between the two refused as too long by a service configured to
+    accept it — the setting would validate and never take effect.
+    """
     from fittrack.channels.telegram.adapter import MAX_AUDIO_SECONDS
 
-    assert committed.max_audio_seconds == MAX_AUDIO_SECONDS
+    assert committed.max_audio_seconds == MAX_AUDIO_SECONDS, (
+        "raising stt.max_audio_seconds needs MAX_AUDIO_SECONDS in the Telegram "
+        "parser raised with it, or the parser strips the media_ref first and the "
+        "new ceiling never applies"
+    )
+
+
+@pytest.mark.parametrize("provider", ["openai", "anthropic", "xai"])
+def test_a_provider_this_code_cannot_talk_to_fails_to_load(provider: str) -> None:
+    """The wiring reads `{provider}_api_key` and always posts to Groq (spec 11.1).
+
+    A configuration naming another provider would validate, pick up that
+    provider's credential and send it to api.groq.com as a bearer token.
+    """
+    with pytest.raises(ValidationError):
+        SttConfig.model_validate({"provider": provider, "model": "m"})
+
+
+def test_the_request_timeout_fits_inside_the_job_that_runs_it(committed: SttConfig) -> None:
+    """The transcription runs inside `flush_check`, and ARQ cancels at the cap.
+
+    A request still pending when the job is cancelled never reaches the handler
+    that keeps the recording for a retry, so the voice path would lose both the
+    transcription and the retention rule of §11.3.
+    """
+    from fittrack.worker import JOB_TIMEOUT
+
+    assert committed.timeout_s < JOB_TIMEOUT
 
 
 def test_a_response_format_without_no_speech_prob_fails_to_load() -> None:
@@ -552,6 +604,106 @@ async def test_a_download_failure_never_reaches_the_caller(tmp_path: Path) -> No
 
     assert outcome.status is VoiceStatus.FAILED
     assert outcome.enters_batch
+
+
+async def test_the_recording_is_addressable_before_anything_can_fail(
+    tmp_path: Path,
+) -> None:
+    """The channel names the file with a UUID only it knows (spec 11.1).
+
+    If the process died between that name and a later rename, the recording
+    would sit in tmpfs under a name no retry looks for and no sweep recognises.
+    """
+    transcriber = FakeTranscriber()
+
+    await ingestion(tmp_path=tmp_path, transcriber=transcriber).ingest(
+        voice_item(), tenant_id=TENANT
+    )
+
+    [(audio, _)] = transcriber.calls
+    assert audio == pending_audio_path(tmp_path / "retry", RAW_MESSAGE)
+
+
+async def test_a_transcript_that_cannot_be_stored_leaves_the_audio_addressable(
+    tmp_path: Path,
+) -> None:
+    """A database error must not orphan the recording under an unknown name."""
+
+    class FailingTranscripts(FakeTranscripts):
+        async def save(self, *, tenant_id: int, raw_message_id: int, transcript: str) -> None:
+            raise RuntimeError("the database is unavailable")
+
+    with pytest.raises(RuntimeError):
+        await ingestion(tmp_path=tmp_path, transcripts=FailingTranscripts()).ingest(
+            voice_item(), tenant_id=TENANT
+        )
+
+    assert pending_audio_path(tmp_path / "retry", RAW_MESSAGE).is_file()
+
+
+async def test_a_fixed_reply_is_not_sent_twice_for_the_same_recording(
+    tmp_path: Path,
+) -> None:
+    """A drain is retried until the batch is persisted and enqueued (§17.3)."""
+    replies = FakeReplies()
+    transcripts = FakeTranscripts(answered=True)
+
+    outcome = await ingestion(
+        tmp_path=tmp_path,
+        transcriber=FakeTranscriber(Transcription("")),
+        transcripts=transcripts,
+        replies=replies,
+    ).ingest(voice_item(), tenant_id=TENANT)
+
+    assert outcome.status is VoiceStatus.INAUDIBLE
+    assert replies.texts == []
+    assert transcripts.answered == []
+
+
+async def test_answering_a_recording_marks_it_after_the_enqueue(tmp_path: Path) -> None:
+    """After, so a failure to queue is retried rather than marked and dropped."""
+    transcripts = FakeTranscripts()
+
+    await ingestion(
+        tmp_path=tmp_path,
+        transcriber=FakeTranscriber(Transcription("")),
+        transcripts=transcripts,
+        replies=FakeReplies(),
+    ).ingest(voice_item(), tenant_id=TENANT)
+
+    assert transcripts.answered == [(TENANT, RAW_MESSAGE)]
+
+
+async def test_a_missing_row_is_not_marked_and_gets_no_reply(tmp_path: Path) -> None:
+    """Without the row there is no identity to address (an LGPD deletion in flight)."""
+    replies = FakeReplies()
+    transcripts = FakeTranscripts(missing=True)
+
+    outcome = await ingestion(
+        tmp_path=tmp_path,
+        transcriber=FakeTranscriber(Transcription("")),
+        transcripts=transcripts,
+        replies=replies,
+    ).ingest(voice_item(), tenant_id=TENANT)
+
+    assert outcome.status is VoiceStatus.INAUDIBLE
+    assert replies.texts == []
+    assert transcripts.answered == []
+
+
+def test_a_missing_prompt_file_fails_when_the_service_is_built(tmp_path: Path) -> None:
+    """A misspelled `prompt_file` is a deployment error, not an incomplete message."""
+    with pytest.raises(OSError):
+        VoiceIngestion(
+            channel="telegram",
+            downloader=FakeDownloader(tmp_path / "download"),
+            transcriber=FakeTranscriber(),
+            consent=FakeConsent(),
+            transcripts=FakeTranscripts(),
+            config=config(prompt_file="not_a_file.md"),
+            prompt_dir=PROMPTS,
+            retry_dir=tmp_path / "retry",
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -796,6 +948,16 @@ async def test_resolve_marks_voice_items_and_keeps_arrival_order(tmp_path: Path)
     assert "was_audio" not in resolved[0]
 
 
+async def test_a_resolved_voice_item_carries_no_channel_reference(tmp_path: Path) -> None:
+    """The `file_id` fetches the recording and has no reader downstream (§20.6)."""
+    [resolved] = await ingestion(
+        tmp_path=tmp_path, transcriber=FakeTranscriber(Transcription("transcrito"))
+    ).resolve([voice_item()], tenant_id=TENANT)
+
+    assert resolved["media_ref"] is None
+    assert MEDIA_REF not in json.dumps(resolved)
+
+
 async def test_resolve_flags_a_failed_transcription_as_incomplete(tmp_path: Path) -> None:
     """Invariant 6: the item is recorded, outside every analysis."""
     [resolved] = await ingestion(
@@ -1019,6 +1181,47 @@ def test_a_symlinked_destination_is_refused(tmp_path: Path) -> None:
         pass
     with pytest.raises(OSError), open_no_follow(link):
         pass
+
+
+@pytest.mark.skipif(not hasattr(os, "O_NOFOLLOW"), reason="the platform has no O_NOFOLLOW")
+def test_a_symlinked_directory_is_refused(tmp_path: Path) -> None:
+    """`/tmp` is shared and the retry directory's name is predictable.
+
+    `mkdir(exist_ok=True)` accepts a symlink *to* a directory, and everything
+    written afterwards — and everything the sweep deletes — would land in the
+    target.
+    """
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    link = tmp_path / "retry"
+    link.symlink_to(elsewhere, target_is_directory=True)
+
+    with pytest.raises(NotADirectoryError):
+        private_directory(link)
+
+
+def test_a_private_directory_is_created_owner_only(tmp_path: Path) -> None:
+    directory = private_directory(tmp_path / "retry")
+
+    assert directory.is_dir()
+    assert directory.stat().st_mode & 0o777 == 0o700
+    # Idempotent: every ingestion calls it.
+    assert private_directory(directory) == directory
+
+
+def test_the_sweep_refuses_to_traverse_a_symlinked_directory(tmp_path: Path) -> None:
+    """Otherwise the retention rule deletes files in somebody else's directory."""
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    victim = elsewhere / "1.ogg"
+    victim.write_bytes(b"not ours")
+    stale = time.time() - 7 * 3600
+    os.utime(victim, (stale, stale))
+    link = tmp_path / "retry"
+    link.symlink_to(elsewhere, target_is_directory=True)
+
+    assert purge_stale_audio(link, max_age_s=6 * 3600) == 0
+    assert victim.is_file()
 
 
 def test_reading_a_regular_file_is_allowed(tmp_path: Path) -> None:
