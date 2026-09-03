@@ -48,6 +48,9 @@ from fittrack.channels.telegram.client import (
 from fittrack.channels.telegram.markup import clip_caption, inline_keyboard, to_telegram_html
 from fittrack.channels.telegram.secret import verify_secret_header
 
+# A value, not a type: the download directory is read at import time.
+from fittrack.settings import MEDIA_TMPFS_DIR
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
@@ -70,7 +73,13 @@ MAX_AUDIO_SECONDS = 300
 
 # Media lands in tmpfs and is deleted after transcription (spec 11.1). Never a
 # persistent volume: the recording is the user's voice.
-DEFAULT_DOWNLOAD_DIR = Path("/tmp")
+#
+# The directory is shared with the transcription service, which renames the
+# file to its `raw_message_id` and expires whatever is left after six hours
+# (§11.3). Downloading into `/tmp` itself instead would put the file outside
+# the only sweep that exists — a partial download interrupted by a SIGKILL, or
+# one whose rename failed, would then sit in tmpfs until the container died.
+DEFAULT_DOWNLOAD_DIR = MEDIA_TMPFS_DIR
 
 # The emoji Telegram accepts on `setMessageReaction`. It is a fixed, published
 # list, and `✅` is not in it — which is exactly why 13.2 keeps a map per channel
@@ -207,6 +216,16 @@ class TelegramAdapter:
             case _:  # pragma: no cover - the Literal is closed
                 raise ChannelError(f"telegram cannot send a {block.kind} block")
 
+    async def aclose(self) -> None:
+        """Release the connection pool the registry built for this adapter.
+
+        Not part of the protocol of 18.1, which has no lifecycle method: the
+        long-running services hold their adapters for the life of the process.
+        A worker that builds one to download voice notes does not, and an
+        unclosed `httpx` pool per restart is a leak the wiring can avoid.
+        """
+        await self._client.aclose()
+
     async def answer_callback(self, callback_query_id: str) -> None:
         """Stop the button spinning, before anything is queued (spec 18.2).
 
@@ -283,7 +302,7 @@ class TelegramAdapter:
     def _from_message(
         self, payload: Mapping[str, Any], message: Mapping[str, Any]
     ) -> InboundMessage:
-        kind, text, media_ref = _classify_message(message)
+        kind, text, media_ref, duration_s = _classify_message(message)
         return InboundMessage(
             channel=self.kind,
             external_id=str(message["chat"]["id"]),
@@ -294,6 +313,7 @@ class TelegramAdapter:
             button_payload=None,
             sent_at=datetime.fromtimestamp(int(message["date"]), tz=UTC),
             raw=payload,
+            media_duration_s=duration_s,
         )
 
     def _from_callback(
@@ -477,32 +497,33 @@ def _is_private(chat: Mapping[str, Any] | None) -> bool:
 
 def _classify_message(
     message: Mapping[str, Any],
-) -> tuple[InboundKind, str | None, str | None]:
+) -> tuple[InboundKind, str | None, str | None, int | None]:
     """What a `message` update is, of the kinds 18.2 handles."""
     if text := message.get("text"):
-        return "text", str(text), None
+        return "text", str(text), None, None
 
     # Voice, and the two containers that are voice when they are short enough
-    # (spec 11). Past the ceiling it is still recorded, but with no `media_ref`:
-    # nothing downstream should fetch what will not be transcribed.
+    # (spec 11). Past the ceiling it stays a recording and keeps its duration,
+    # but loses its `media_ref`: nothing downstream can fetch what will not be
+    # transcribed, and the transcription service still has something it can
+    # answer — 11.3 asks the user to split it, and 18.4 says never silence.
     #
-    # `other` is the only truthful value the closed Literal of 18.1 offers, and
-    # it is doing three jobs at once — this, a reaction update to discard, and a
-    # membership change to act on. The ingress has to tell them apart from the
-    # payload, because 11.3 asks the user to split the recording and 18.4 says
-    # never silence. Noted for S02-T03; giving 18.1 a field instead is an ADR.
+    # It used to come back as `other`, which is the label for a reaction to
+    # discard and a membership change to act on, so nothing could tell the
+    # three apart from the kind alone. ADR-0006 records the change.
     for field in ("voice", "audio", "video_note"):
         if media := message.get(field):
-            if int(media.get("duration", 0)) > MAX_AUDIO_SECONDS:
-                return "other", None, None
-            return "voice", None, str(media["file_id"])
+            duration_s = int(media.get("duration", 0))
+            if duration_s > MAX_AUDIO_SECONDS:
+                return "voice", None, None, duration_s
+            return "voice", None, str(media["file_id"]), duration_s
 
     if photo := message.get("photo"):
         # Telegram sends a ladder of thumbnails; the last is the original.
-        return "image", None, str(photo[-1]["file_id"])
+        return "image", None, str(photo[-1]["file_id"]), None
     if document := message.get("document"):
-        return "document", None, str(document["file_id"])
-    return "other", None, None
+        return "document", None, str(document["file_id"]), None
+    return "other", None, None, None
 
 
 def _addressable(channel_message_id: str) -> int:

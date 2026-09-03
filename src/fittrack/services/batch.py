@@ -93,6 +93,16 @@ class BatchStore(Protocol):
         """Set ``status='done'``, ``finished_at=now()``, ``attempts += 1``."""
         ...
 
+    async def mark_failed(self, *, batch_id: int, tenant_id: int, error: str) -> None:
+        """Set ``status='failed'`` with a reason, so nothing picks the row up."""
+        ...
+
+    async def update_content(
+        self, *, batch_id: int, tenant_id: int, combined_text: bytes, key_version: int
+    ) -> None:
+        """Replace a pending batch's payload, leaving its id and status alone."""
+        ...
+
 
 class PostgresBatchStore:
     """Tenant-scoped PostgreSQL implementation of :class:`BatchStore`."""
@@ -171,6 +181,34 @@ class PostgresBatchStore:
                 {"batch_id": batch_id},
             )
 
+    async def update_content(
+        self, *, batch_id: int, tenant_id: int, combined_text: bytes, key_version: int
+    ) -> None:
+        async with tenant_session(self._sessions, tenant_id) as session:
+            await session.execute(
+                text(
+                    "UPDATE processing_batch "
+                    "SET combined_text = :combined_text, key_version = :key_version "
+                    "WHERE id = :batch_id AND status = 'pending'"
+                ),
+                {
+                    "combined_text": combined_text,
+                    "key_version": key_version,
+                    "batch_id": batch_id,
+                },
+            )
+
+    async def mark_failed(self, *, batch_id: int, tenant_id: int, error: str) -> None:
+        async with tenant_session(self._sessions, tenant_id) as session:
+            await session.execute(
+                text(
+                    "UPDATE processing_batch "
+                    "SET status = 'failed', error = :error, finished_at = now() "
+                    "WHERE id = :batch_id AND status = 'pending'"
+                ),
+                {"batch_id": batch_id, "error": error},
+            )
+
     @staticmethod
     def _to_batch_row(row: object) -> BatchRow:
         from collections.abc import Mapping
@@ -188,6 +226,30 @@ class PostgresBatchStore:
         )
 
 
+class VoiceResolver(Protocol):
+    """The transcription step of the drain (S02-T07).
+
+    Declared as a port rather than imported concretely so that a drain with no
+    voice in it — which is most of them — costs nothing and needs no provider
+    credential. `VoiceIngestion` in ``services/stt.py`` is the implementation.
+    """
+
+    async def resolve(
+        self, items: list[dict[str, object]], *, tenant_id: int
+    ) -> list[dict[str, object]]:
+        """Return the burst with its voice items turned into text."""
+        ...
+
+    async def may_process_voice(self, *, tenant_id: int) -> bool:
+        """Whether this tenant's recordings may still be used at all (§11.3).
+
+        The cheap half of `resolve`: one indexed query and no provider call, so
+        the reuse path can ask without paying for a transcription it does not
+        need.
+        """
+        ...
+
+
 class BatchEnqueuer(Protocol):
     """Enqueue a ``process_batch`` job without exposing ARQ.
 
@@ -202,24 +264,45 @@ class BatchEnqueuer(Protocol):
 # ─── Pure helpers ──────────────────────────────────────────────────────────
 
 
-def prepare_items(
-    items: list[dict[str, object]],
-) -> tuple[list[dict[str, object]], list[str]]:
-    """Mark voice items ``was_audio=True`` and extract message ids.
+def drain_message_ids(items: list[dict[str, object]]) -> list[str]:
+    """The identity of a drain: its raw-message ids, in arrival order (§4.1).
 
-    Preserves arrival order (§4.1).  Items without ``raw_message_id`` are
-    kept in the list but excluded from ``message_ids``.
+    Taken from the drain *as it arrived*, before anything resolves voice. That
+    is what makes it an identity: the drain is fixed, while what it resolves to
+    is not — a transcription that failed on one attempt can come back inaudible
+    on the next, and an item answered with a fixed reply leaves the batch. An
+    identity computed after that step changes between two runs over the same
+    drain, and the row persisted by the first is no longer found by the second:
+    a mixed burst inserts a duplicate, and a voice-only burst abandons the row
+    it already wrote.
+
+    Items without a ``raw_message_id`` are excluded; the ingress refuses to
+    buffer one (`RedisTenantBuffer.append`), so in practice there are none.
     """
-    message_ids: list[str] = []
+    return [str(item["raw_message_id"]) for item in items if item.get("raw_message_id") is not None]
+
+
+def prepare_items(items: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Mark voice items ``was_audio=True`` and normalise the untranscribed ones.
+
+    Preserves arrival order (§4.1).
+
+    A voice item that reaches this point without text was never transcribed —
+    either no resolver was wired (a deployment with no STT credential, see
+    ``worker.build_voice_ingestion``) or the resolver failed. Either way it
+    leaves here in the shape the rest of the pipeline expects from a failed
+    transcription: empty text, ``status='incomplete'`` so it stays outside
+    every analysis (invariant 6), and no ``media_ref``, which nothing
+    downstream reads and which is a reusable channel access reference (§20.6).
+    """
     for item in items:
         if item.get("kind") == "voice":
             item["was_audio"] = True
-        # This is globally unique across channels and remains stable when an
-        # orphaned Redis drain is retried.
-        msg_id = item.get("raw_message_id")
-        if msg_id is not None:
-            message_ids.append(str(msg_id))
-    return items, message_ids
+            if not item.get("text"):
+                item["text"] = ""
+                item["status"] = "incomplete"
+            item["media_ref"] = None
+    return items
 
 
 # ─── Persist ───────────────────────────────────────────────────────────────
@@ -231,28 +314,71 @@ async def persist_batch(
     tenant_id: int,
     cipher: ColumnCipher,
     store: BatchStore,
-) -> int:
+    voice: VoiceResolver | None = None,
+) -> int | None:
     """Persist a ``processing_batch`` with encrypted ``combined_text``.
 
-    Returns the batch row id.  Voice items are marked ``was_audio=True``
-    before the combined text is encrypted (acceptance criterion T05).
-    """
-    items, message_ids = prepare_items(drain.items)
+    Returns the batch row id, or ``None`` when the drain left nothing to
+    process.  Voice items are transcribed and marked ``was_audio=True``
+    before the combined text is encrypted (S02-T05 and S02-T07): the batch the
+    graph receives holds text, never a media reference.
 
-    # The drain is acknowledged only after enqueue succeeds. If enqueue failed
-    # after the insert, the next flush retry repairs the handoff by reusing the
-    # row identified by the same ordered raw-message ids.
+    A burst can empty here, and legitimately: a lone voice note that was
+    inaudible, too long or unconsented was answered with the fixed reply of
+    §11.3, and an empty batch would only give the graph a turn with no content
+    in it.
+
+    ``message_ids`` records the messages the batch was *drained from*, which is
+    not always the same as the ones its ``combined_text`` holds: a recording
+    answered with a fixed reply leaves the burst but stays part of what this
+    drain was. That is deliberate — it is the identity of the handoff, and it
+    has to survive a retry whose voice step decided differently.
+    """
+    # Before the voice step, and from the drain as it arrived: see
+    # `drain_message_ids`. Looking the batch up first also means a retry pays
+    # for no second download, no second provider call and no second fixed
+    # reply — the drain is acknowledged only after the enqueue succeeds, so
+    # this path runs whenever that enqueue failed.
+    message_ids = drain_message_ids(drain.items)
     if message_ids:
         existing = await store.find_by_message_ids(
             tenant_id=tenant_id,
             message_ids=message_ids,
         )
         if existing is not None:
+            if existing.status == "pending" and not await _voice_still_allowed(
+                drain.items, tenant_id=tenant_id, voice=voice
+            ):
+                # Consent went away between the insert and this retry. Handing
+                # the row over as it stands would give the graph a transcript
+                # the tenant has withdrawn permission for — the whole gate,
+                # stepped around by the lookup that skips the voice step
+                # (§11.3, criterion 9).
+                return await _repair_without_voice(
+                    drain=drain,
+                    existing=existing,
+                    tenant_id=tenant_id,
+                    cipher=cipher,
+                    store=store,
+                    voice=voice,
+                )
             logger.info(
                 "batch already persisted, reusing",
                 extra={"tenant_id": tenant_id, "batch_id": existing.id},
             )
             return existing.id
+
+    items = drain.items
+    if voice is not None:
+        items = await voice.resolve(items, tenant_id=tenant_id)
+    items = prepare_items(items)
+
+    if not items:
+        logger.info(
+            "drain left no item to process",
+            extra={"tenant_id": tenant_id},
+        )
+        return None
 
     # JSON-encode items in arrival order — no concatenation (§9.3)
     combined_bytes = json.dumps(items, ensure_ascii=False).encode()
@@ -280,6 +406,84 @@ async def persist_batch(
         extra={"tenant_id": tenant_id, "batch_id": row_id, "item_count": len(items)},
     )
     return row_id
+
+
+async def _repair_without_voice(
+    *,
+    drain: DrainResult,
+    existing: BatchRow,
+    tenant_id: int,
+    cipher: ColumnCipher,
+    store: BatchStore,
+    voice: VoiceResolver | None,
+) -> int | None:
+    """Rewrite a persisted batch without the content consent was withdrawn for.
+
+    The burst is resolved again — which, with the gate closed, refuses the
+    recording before downloading or decrypting anything and queues the fixed
+    reply once (idempotently, by `answered_at` and the derived group id). What
+    comes back is the rest of the burst, and the rest is not tainted: a text
+    message in the same rajada depends on no recording, and dropping it would
+    make the same "oi" survive or vanish according to *when* the tenant
+    revoked, which is not a distinction they made.
+
+    Rewritten in place rather than inserted beside: a second row carrying the
+    same drain identity would be found by the next retry, repaired again, and
+    inserted again — the loop. One row, rewritten idempotently, has neither
+    problem. The row id does not move, so the associated data of §22.2 still
+    matches (spec 22.2).
+    """
+    items = await voice.resolve(drain.items, tenant_id=tenant_id) if voice is not None else []
+    items = prepare_items(items)
+    if not items:
+        await store.mark_failed(
+            batch_id=existing.id,
+            tenant_id=tenant_id,
+            error="workout_data consent revoked before the batch was processed",
+        )
+        logger.info(
+            "batch abandoned: consent was revoked and nothing else was in the burst",
+            extra={"tenant_id": tenant_id, "batch_id": existing.id},
+        )
+        return None
+
+    encrypted = cipher.encrypt(
+        json.dumps(items, ensure_ascii=False).encode(),
+        column_aad(
+            tenant_id=tenant_id,
+            table="processing_batch",
+            column="combined_text",
+            row_id=existing.id,
+        ),
+    )
+    await store.update_content(
+        batch_id=existing.id,
+        tenant_id=tenant_id,
+        combined_text=encrypted,
+        key_version=cipher.active_version,
+    )
+    logger.info(
+        "batch repaired: the withdrawn recording left it, the rest of the burst did not",
+        extra={"tenant_id": tenant_id, "batch_id": existing.id, "item_count": len(items)},
+    )
+    return existing.id
+
+
+async def _voice_still_allowed(
+    items: list[dict[str, object]],
+    *,
+    tenant_id: int,
+    voice: VoiceResolver | None,
+) -> bool:
+    """Whether a burst that carries voice may still be handed to the graph.
+
+    Only asked when there is voice in it and something to ask: a text burst
+    depends on no recording, and a deployment with no transcription wiring has
+    no transcript in the batch to protect.
+    """
+    if voice is None or not any(item.get("kind") == "voice" for item in items):
+        return True
+    return await voice.may_process_voice(tenant_id=tenant_id)
 
 
 # ─── Process ───────────────────────────────────────────────────────────────

@@ -215,6 +215,12 @@ class InboundMessage:
     # annotation says "do not mutate" and the copy makes it so. It never reprs
     # either — it is `channel.payload`, and it contains the `external_id`.
     raw: Mapping[str, Any] = field(repr=False)
+    # How long a recording is, when the channel says. It is what lets the rule
+    # of 11.3 be enforced where it lives — the transcription service — instead
+    # of by the absence of a `media_ref`, which says the same thing in a way
+    # nothing can answer the user with (ADR-0006). `None` for everything that
+    # is not a recording, and for a channel that does not declare it.
+    media_duration_s: int | None = None
 
     def __post_init__(self) -> None:
         # A snapshot, taken once, at the only boundary that sees the update.

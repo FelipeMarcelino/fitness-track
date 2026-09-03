@@ -120,11 +120,58 @@ class AgentOverride(BaseModel):
     timeout_s: Annotated[int, Field(gt=0)] | None = None
 
 
+class SttConfig(BaseModel):
+    """Speech to text (spec 11.1), which is not one of the roles of 7.2.
+
+    It lives in `models.yaml` for one reason: a model identifier must not
+    appear in Python (CLAUDE.md, invariant 4). Everything that makes a role a
+    role is absent here — no system prompt, no reasoning tier, no
+    cross-provider fallback — so giving it an `LLMRole` would put a value in
+    the tiering table that the gateway could not resolve and the golden set
+    could not evaluate. ADR-0007 records the choice.
+
+    The three numbers are the rules of the table in 11.3, and they are here so
+    that changing one is a configuration change rather than a deploy.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    # Narrower than `Provider`, and it has to be. There is one transcriber
+    # implementation and it posts to Groq's endpoint (spec 11.1), while the
+    # wiring reads `{provider}_api_key` — so `provider: openai` would validate,
+    # pick up `OPENAI_API_KEY` and send it to api.groq.com as a bearer token.
+    # A second provider arrives with a second transcriber, and widens this then.
+    provider: Literal["groq"]
+    model: Annotated[str, Field(min_length=1, pattern=r"\S")]
+    language: Annotated[str, Field(min_length=2)] = "pt"
+    # A `Literal` rather than a string: `no_speech_prob` and the segments the
+    # inaudibility rule of 11.3 reads arrive in no other response format, so a
+    # deployment that asked for `json` would silently lose the rule.
+    response_format: Literal["verbose_json"] = "verbose_json"
+    # The vocabulary of 11.2, by name. The file itself is pt-BR content and
+    # lives beside the other prompts (AD-27).
+    prompt_file: Annotated[str, Field(min_length=1)] = "stt_vocabulary.md"
+    # The transcription happens inside `flush_check`, so this has to leave room
+    # for the download and the persistence inside the ARQ job timeout — a
+    # request still pending when ARQ cancels the job never reaches the handler
+    # that keeps the recording for a retry. `tests/unit/test_stt.py` pins the
+    # two together.
+    timeout_s: Annotated[int, Field(gt=0)] = 60
+    max_audio_seconds: Annotated[int, Field(gt=0)] = 300
+    no_speech_threshold: Annotated[float, Field(ge=0.0, le=1.0)] = 0.6
+    retry_retention_hours: Annotated[int, Field(gt=0)] = 6
+
+
 class ModelsConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     roles: dict[LLMRole, RoleConfig]
     agents: dict[str, AgentOverride] = Field(default_factory=dict)
+    # Optional in the type, required in the committed file. A partial
+    # `models.yaml` — the shape every loader test writes — must still fail on
+    # the thing it is testing rather than on a section it does not mention;
+    # `require_stt` is what turns absence into an error at the point of use.
+    stt: SttConfig | None = None
 
     @model_validator(mode="after")
     def _every_role_is_present(self) -> Self:
@@ -184,6 +231,18 @@ class ModelsConfig(BaseModel):
                 "A renamed agent leaves dead, silent configuration behind."
             )
         return self
+
+    def require_stt(self) -> SttConfig:
+        """The transcription configuration, or a refusal naming the section.
+
+        Voice is not optional in phase 1.0 (spec 24), so a deployment whose
+        `models.yaml` has no `stt:` block cannot transcribe anything. Failing
+        here names the file; the alternative is a `None` reaching the service
+        and an `AttributeError` on the first voice message.
+        """
+        if self.stt is None:
+            raise ConfigError("models.yaml: no stt section (spec 11.1)")
+        return self.stt
 
     def resolve(self, *, agent: str | None, role: LLMRole) -> RoleConfig:
         """Resolution order: `agents.<name>` merged over the role, then the role.
@@ -387,6 +446,11 @@ def configured_providers(config: Config) -> set[str]:
     credentialed would defer the failure to the first request routed there.
     """
     providers: set[str] = {config.rag.embeddings.provider}
+    if config.models.stt is not None:
+        # Audio leaves the infrastructure through this provider (spec 11.3),
+        # and a deployment without its credential fails on the first voice
+        # message rather than at boot.
+        providers.add(config.models.stt.provider)
     roles = list(config.models.roles.values())
     roles += [
         config.models.resolve(agent=name, role=override.role)

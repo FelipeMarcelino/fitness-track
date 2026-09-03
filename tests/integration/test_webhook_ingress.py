@@ -180,6 +180,7 @@ async def test_a_buffered_envelope_contains_the_hash_and_never_the_external_id()
             "kind": "text",
             "text": "treino feito",
             "media_ref": None,
+            "duration_s": None,
             "button_payload": None,
             "sent_at": "2026-01-01T00:00:00+00:00",
             "raw_message_id": 71,

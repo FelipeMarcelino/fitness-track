@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 from fittrack.channels.base import ChannelError
+from fittrack.security.tmpfile import create_private, private_directory
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -183,7 +184,10 @@ class TelegramClient:
         neither it nor the URL appears in anything this method raises or logs.
         The local name is ours and keeps only the extension.
         """
-        into.mkdir(parents=True, exist_ok=True)
+        # `private_directory`, not `mkdir(exist_ok=True)`: the latter accepts a
+        # symlink *to* a directory, and the name is predictable in a shared
+        # `/tmp`, so the download would follow it (spec 11.1).
+        private_directory(into)
         destination = into / f"{uuid.uuid4()}{Path(file_path).suffix}"
         url = f"{API_ROOT}/file/bot{self._token.get_secret_value()}/{file_path}"
 
@@ -194,7 +198,10 @@ class TelegramClient:
                 if response.status_code >= httpx.codes.BAD_REQUEST:
                     await response.aread()
                     raise self._download_refused(response)
-                with destination.open("wb") as sink:
+                # `O_NOFOLLOW | O_EXCL`, not `Path.open`: the container's
+                # `/tmp` is shared, and a planted symlink at a guessable name
+                # would redirect somebody's voice note (spec 11.1).
+                with create_private(destination) as sink:
                     async for chunk in response.aiter_bytes():
                         written += len(chunk)
                         if written > MAX_DOWNLOAD_BYTES:

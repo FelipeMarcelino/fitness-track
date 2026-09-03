@@ -20,6 +20,7 @@ import binascii
 import json
 import re
 from functools import lru_cache
+from pathlib import Path
 from typing import Annotated, Any, Literal, Self
 from urllib.parse import parse_qs, unquote, urlsplit
 
@@ -49,6 +50,17 @@ MIN_WEBHOOK_SECRET_CHARS = 43  # 32 bytes, url-safe base64
 # The pepper is key material and is sized like it. Shorter adds no work for an
 # attacker who already knows the input space (spec 22.2).
 MIN_PEPPER_BYTES = 32
+
+# Where media lands on its way through the system (spec 11.1): tmpfs, never a
+# persistent volume, because the file is the user's voice. Its own directory
+# rather than `/tmp` itself, and that is the point — the retention sweep of
+# 11.3 deletes by age, so it must only ever look at files this system wrote.
+#
+# It lives here because two layers need the same answer and neither may import
+# the other: the channel adapter writes the download, and the transcription
+# service renames, reads and expires it (AD-39, and the architecture test that
+# keeps `channels/` from being imported outside it).
+MEDIA_TMPFS_DIR = Path("/tmp/fittrack-media")
 
 # The unprivileged principal the migration provisions (spec 19.1). Named here
 # so a DATABASE_URL that connects as anything else — the owner, most likely —

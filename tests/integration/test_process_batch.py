@@ -15,8 +15,10 @@ from types import SimpleNamespace
 from typing import cast
 
 import asyncpg
+import httpx
 import pytest
 from arq import ArqRedis, Retry
+from arq.connections import RedisSettings
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -26,12 +28,14 @@ from sqlalchemy.ext.asyncio import (
 )
 
 import fittrack.worker as worker_module
+from fittrack.config import Config, ConfigError, load_models
 from fittrack.db.engine import session_factory, split_ssl_arguments
 from fittrack.security.crypto import ColumnCipher, Keyring, column_aad
 from fittrack.services.batch import (
     BatchLockContentionError,
     BatchRow,
     PostgresBatchStore,
+    drain_message_ids,
     persist_batch,
     prepare_items,
     process_batch,
@@ -162,6 +166,20 @@ class FakeBatchStore:
             attempts=row.attempts,
         )
 
+    async def update_content(
+        self, *, batch_id: int, tenant_id: int, combined_text: bytes, key_version: int
+    ) -> None:
+        row = self._rows.get(batch_id)
+        if row is not None and row.status == "pending":
+            row.combined_text = combined_text
+            row.key_version = key_version
+
+    async def mark_failed(self, *, batch_id: int, tenant_id: int, error: str) -> None:
+        row = self._rows.get(batch_id)
+        if row is not None and row.status == "pending":
+            row.status = "failed"
+            row.error = error
+
     async def mark_done(self, *, batch_id: int, tenant_id: int) -> None:
         row = self._rows.get(batch_id)
         if row is not None and row.tenant_id == tenant_id:
@@ -178,6 +196,7 @@ class StoredBatch:
     key_version: int
     status: str = "pending"
     attempts: int = 0
+    error: str | None = None
 
 
 @dataclass
@@ -283,9 +302,13 @@ class TestPrepareItems:
             {"channel_message_id": "m1", "raw_message_id": 101, "text": "oi", "kind": "text"},
             {"channel_message_id": "m2", "raw_message_id": 102, "kind": "voice"},
         ]
-        result, _ = prepare_items(items)
+        result = prepare_items(items)
         assert result[0].get("was_audio") is None
         assert result[1]["was_audio"] is True
+
+
+class TestDrainMessageIds:
+    """The identity of the handoff, taken before anything resolves voice (D-2)."""
 
     def test_preserves_arrival_order(self) -> None:
         items: list[dict[str, object]] = [
@@ -293,24 +316,28 @@ class TestPrepareItems:
             {"channel_message_id": "m1", "raw_message_id": 101, "text": "a"},
             {"channel_message_id": "m2", "raw_message_id": 102, "text": "b"},
         ]
-        _, message_ids = prepare_items(items)
-        assert message_ids == ["103", "101", "102"]
+        assert drain_message_ids(items) == ["103", "101", "102"]
 
     def test_extracts_message_ids(self) -> None:
         items: list[dict[str, object]] = [
             {"channel_message_id": "m1", "raw_message_id": 101, "text": "hello"},
             {"channel_message_id": "m2", "raw_message_id": 102, "text": "world"},
         ]
-        _, message_ids = prepare_items(items)
-        assert message_ids == ["101", "102"]
+        assert drain_message_ids(items) == ["101", "102"]
 
     def test_handles_missing_message_id(self) -> None:
         items: list[dict[str, object]] = [
             {"text": "hello"},
             {"channel_message_id": "m2", "raw_message_id": 102, "text": "world"},
         ]
-        _, message_ids = prepare_items(items)
-        assert message_ids == ["102"]
+        assert drain_message_ids(items) == ["102"]
+
+    def test_a_voice_item_answered_on_its_own_is_still_part_of_the_drain(self) -> None:
+        """It leaves the burst, not the identity of what was drained."""
+        items: list[dict[str, object]] = [
+            {"channel_message_id": "m1", "raw_message_id": 101, "kind": "voice"},
+        ]
+        assert drain_message_ids(items) == ["101"]
 
     def test_voice_and_text_mixed(self) -> None:
         items: list[dict[str, object]] = [
@@ -323,10 +350,70 @@ class TestPrepareItems:
             },
             {"channel_message_id": "m3", "raw_message_id": 103, "kind": "voice"},
         ]
-        result, _ = prepare_items(items)
+        result = prepare_items(items)
         assert result[0]["was_audio"] is True
         assert result[1].get("was_audio") is None
         assert result[2]["was_audio"] is True
+
+
+class _KeepsVoice:
+    """A resolver whose transcription failed: the item stays, `incomplete`."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def may_process_voice(self, *, tenant_id: int) -> bool:
+        return True
+
+    async def resolve(
+        self, items: list[dict[str, object]], *, tenant_id: int
+    ) -> list[dict[str, object]]:
+        self.calls += 1
+        for item in items:
+            if item.get("kind") == "voice":
+                item["was_audio"] = True
+                item["text"] = ""
+                item["status"] = "incomplete"
+        return items
+
+
+class _RevokedVoice:
+    """A resolver for a tenant whose `workout_data` consent is gone.
+
+    `VoiceIngestion` answers the same way: the consent gate is the first thing
+    it checks, so the recording is neither downloaded nor decrypted, the fixed
+    reply is queued, and the item leaves the burst.
+    """
+
+    def __init__(self) -> None:
+        self.resolved = 0
+        self.asked = 0
+
+    async def may_process_voice(self, *, tenant_id: int) -> bool:
+        self.asked += 1
+        return False
+
+    async def resolve(
+        self, items: list[dict[str, object]], *, tenant_id: int
+    ) -> list[dict[str, object]]:
+        self.resolved += 1
+        return [item for item in items if item.get("kind") != "voice"]
+
+
+class _DropsVoice:
+    """A resolver whose second attempt came back inaudible: the item is answered."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def may_process_voice(self, *, tenant_id: int) -> bool:
+        return True
+
+    async def resolve(
+        self, items: list[dict[str, object]], *, tenant_id: int
+    ) -> list[dict[str, object]]:
+        self.calls += 1
+        return [item for item in items if item.get("kind") != "voice"]
 
 
 # ─── persist_batch ─────────────────────────────────────────────────────────
@@ -345,6 +432,7 @@ class TestPersistBatch:
     ) -> None:
         drain = _make_drain()
         row_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
+        assert row_id is not None
         row = await fake_store.get(batch_id=row_id, tenant_id=1)
         assert row is not None
 
@@ -368,6 +456,7 @@ class TestPersistBatch:
 
         drain = _make_drain()
         row_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
+        assert row_id is not None
         row = await fake_store.get(batch_id=row_id, tenant_id=1)
         assert row is not None
 
@@ -387,6 +476,7 @@ class TestPersistBatch:
     ) -> None:
         drain = _make_drain()
         row_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
+        assert row_id is not None
         row = await fake_store.get(batch_id=row_id, tenant_id=1)
         assert row is not None
         assert row.message_ids == ["101", "102"]
@@ -398,7 +488,9 @@ class TestPersistBatch:
         drain = _make_drain()
 
         first_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
+        assert first_id is not None
         retry_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
+        assert retry_id is not None
 
         assert retry_id == first_id
         assert len(fake_store._rows) == 1
@@ -409,9 +501,385 @@ class TestPersistBatch:
     ) -> None:
         drain = _make_drain()
         row_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
+        assert row_id is not None
         row = await fake_store.get(batch_id=row_id, tenant_id=1)
         assert row is not None
         assert row.key_version == cipher.active_version
+
+    @pytest.mark.asyncio
+    async def test_a_retry_whose_voice_outcome_changed_reuses_the_same_batch(
+        self, cipher: ColumnCipher, fake_store: FakeBatchStore
+    ) -> None:
+        """D-2. The handoff identity is the drain, not what the drain resolved to.
+
+        `store.insert` can succeed and `enqueue_process_batch` fail, and the
+        next `flush_check` retries the same drain. Transcription is not
+        deterministic — an attempt that failed can come back inaudible — so an
+        identity derived after the voice step changes between the two runs, and
+        the persisted row is no longer found.
+        """
+        drain = _make_drain(
+            [
+                {"channel_message_id": "m1", "raw_message_id": 101, "kind": "text", "text": "oi"},
+                {"channel_message_id": "m2", "raw_message_id": 102, "kind": "voice"},
+            ]
+        )
+
+        first = await persist_batch(
+            drain=drain, tenant_id=1, cipher=cipher, store=fake_store, voice=_KeepsVoice()
+        )
+        # The enqueue failed here, so the drain was never acknowledged.
+        retry = await persist_batch(
+            drain=_make_drain(
+                [
+                    {
+                        "channel_message_id": "m1",
+                        "raw_message_id": 101,
+                        "kind": "text",
+                        "text": "oi",
+                    },
+                    {"channel_message_id": "m2", "raw_message_id": 102, "kind": "voice"},
+                ]
+            ),
+            tenant_id=1,
+            cipher=cipher,
+            store=fake_store,
+            voice=_DropsVoice(),
+        )
+
+        assert retry == first
+        assert len(fake_store._rows) == 1, "the retry inserted a second batch for one drain"
+
+    @pytest.mark.asyncio
+    async def test_a_voice_only_retry_does_not_abandon_the_persisted_batch(
+        self, cipher: ColumnCipher, fake_store: FakeBatchStore
+    ) -> None:
+        """D-2, the other half: a drain that resolves to nothing still has a row."""
+        items: list[dict[str, object]] = [
+            {"channel_message_id": "m1", "raw_message_id": 101, "kind": "voice"}
+        ]
+
+        first = await persist_batch(
+            drain=_make_drain(list(items)),
+            tenant_id=1,
+            cipher=cipher,
+            store=fake_store,
+            voice=_KeepsVoice(),
+        )
+        retry = await persist_batch(
+            drain=_make_drain(list(items)),
+            tenant_id=1,
+            cipher=cipher,
+            store=fake_store,
+            voice=_DropsVoice(),
+        )
+
+        assert first is not None
+        assert retry == first, "the persisted batch was abandoned, and nothing enqueues it"
+
+    @pytest.mark.asyncio
+    async def test_a_retry_of_a_persisted_batch_does_not_transcribe_again(
+        self, cipher: ColumnCipher, fake_store: FakeBatchStore
+    ) -> None:
+        """D-2, the trade this direction makes, stated as a test.
+
+        Looking the batch up before the voice step means a retry pays for no
+        second download, no second provider call and no second fixed reply. The
+        cost is that a transcription which failed the first time stays
+        `incomplete` in an already-persisted batch — the documented degraded
+        outcome of criterion 5, not a loss: `raw_message.payload` still holds
+        the original update.
+        """
+        items: list[dict[str, object]] = [
+            {"channel_message_id": "m1", "raw_message_id": 101, "kind": "voice"},
+            {"channel_message_id": "m2", "raw_message_id": 102, "kind": "text", "text": "oi"},
+        ]
+        resolver = _KeepsVoice()
+
+        await persist_batch(
+            drain=_make_drain(list(items)),
+            tenant_id=1,
+            cipher=cipher,
+            store=fake_store,
+            voice=resolver,
+        )
+        await persist_batch(
+            drain=_make_drain(list(items)),
+            tenant_id=1,
+            cipher=cipher,
+            store=fake_store,
+            voice=resolver,
+        )
+
+        assert resolver.calls == 1
+
+    @pytest.mark.asyncio
+    async def test_a_reused_batch_is_not_handed_over_after_consent_is_revoked(
+        self, cipher: ColumnCipher, fake_store: FakeBatchStore
+    ) -> None:
+        """E-2. Looking the batch up first must not step around the consent gate.
+
+        `insert` can succeed and `enqueue_process_batch` fail; the drain comes
+        round again, and `workout_data` can be revoked in between. Returning the
+        persisted row without asking would hand an already-decrypted transcript
+        to the graph for a tenant who withdrew consent — criterion 9 through the
+        back door.
+        """
+        items: list[dict[str, object]] = [
+            {"channel_message_id": "m1", "raw_message_id": 101, "kind": "voice"},
+            {"channel_message_id": "m2", "raw_message_id": 102, "kind": "text", "text": "oi"},
+        ]
+        first = await persist_batch(
+            drain=_make_drain(list(items)),
+            tenant_id=1,
+            cipher=cipher,
+            store=fake_store,
+            voice=_KeepsVoice(),
+        )
+        assert first is not None
+
+        revoked = _RevokedVoice()
+        retry = await persist_batch(
+            drain=_make_drain(list(items)),
+            tenant_id=1,
+            cipher=cipher,
+            store=fake_store,
+            voice=revoked,
+        )
+
+        assert revoked.asked == 1, "the consent gate was not consulted on the reuse path"
+        # The batch is repaired rather than abandoned (G-5): the withdrawn
+        # recording leaves its content, and the text of the same burst — which
+        # depends on no recording — still reaches the graph. Abandoning the row
+        # would have made the same "oi" survive or vanish depending on *when*
+        # the tenant revoked, which is not a distinction the user made.
+        assert retry == first
+        row = await fake_store.get(batch_id=first, tenant_id=1)
+        assert row is not None
+        assert row.status == "pending"
+        items_now = json.loads(
+            cipher.decrypt(
+                row.combined_text,
+                column_aad(
+                    tenant_id=1,
+                    table="processing_batch",
+                    column="combined_text",
+                    row_id=first,
+                ),
+                declared_version=1,
+            )
+        )
+        assert [item["text"] for item in items_now] == ["oi"]
+        assert not any(item.get("kind") == "voice" for item in items_now)
+
+    @pytest.mark.asyncio
+    async def test_a_voice_only_burst_is_abandoned_when_consent_is_revoked(
+        self, cipher: ColumnCipher, fake_store: FakeBatchStore
+    ) -> None:
+        """Nothing survives the refusal, so there is no batch left to hand over."""
+        items: list[dict[str, object]] = [
+            {"channel_message_id": "m1", "raw_message_id": 101, "kind": "voice"}
+        ]
+        first = await persist_batch(
+            drain=_make_drain(list(items)),
+            tenant_id=1,
+            cipher=cipher,
+            store=fake_store,
+            voice=_KeepsVoice(),
+        )
+        assert first is not None
+
+        retry = await persist_batch(
+            drain=_make_drain(list(items)),
+            tenant_id=1,
+            cipher=cipher,
+            store=fake_store,
+            voice=_RevokedVoice(),
+        )
+
+        assert retry is None
+        row = await fake_store.get(batch_id=first, tenant_id=1)
+        assert row is not None
+        assert row.status == "failed", "the row was left pending with nothing to pick it up"
+
+    @pytest.mark.asyncio
+    async def test_repairing_a_batch_twice_does_not_grow_the_table(
+        self, cipher: ColumnCipher, fake_store: FakeBatchStore
+    ) -> None:
+        """The naive repair inserts a second batch and loops on the next retry."""
+        items: list[dict[str, object]] = [
+            {"channel_message_id": "m1", "raw_message_id": 101, "kind": "voice"},
+            {"channel_message_id": "m2", "raw_message_id": 102, "kind": "text", "text": "oi"},
+        ]
+        await persist_batch(
+            drain=_make_drain(list(items)),
+            tenant_id=1,
+            cipher=cipher,
+            store=fake_store,
+            voice=_KeepsVoice(),
+        )
+        for _ in range(3):
+            await persist_batch(
+                drain=_make_drain(list(items)),
+                tenant_id=1,
+                cipher=cipher,
+                store=fake_store,
+                voice=_RevokedVoice(),
+            )
+
+        assert len(fake_store._rows) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_text_only_drain_does_not_pay_for_the_consent_gate(
+        self, cipher: ColumnCipher, fake_store: FakeBatchStore
+    ) -> None:
+        """Nothing in a text burst depends on it, so nothing asks."""
+        items: list[dict[str, object]] = [
+            {"channel_message_id": "m1", "raw_message_id": 101, "kind": "text", "text": "oi"}
+        ]
+        await persist_batch(
+            drain=_make_drain(list(items)), tenant_id=1, cipher=cipher, store=fake_store
+        )
+
+        revoked = _RevokedVoice()
+        retry = await persist_batch(
+            drain=_make_drain(list(items)),
+            tenant_id=1,
+            cipher=cipher,
+            store=fake_store,
+            voice=revoked,
+        )
+
+        assert revoked.asked == 0
+        assert retry is not None
+
+    @pytest.mark.asyncio
+    async def test_a_reused_batch_still_goes_through_while_consent_holds(
+        self, cipher: ColumnCipher, fake_store: FakeBatchStore
+    ) -> None:
+        """The gate is a gate, not a second transcription: the saving of D-2 holds."""
+        items: list[dict[str, object]] = [
+            {"channel_message_id": "m1", "raw_message_id": 101, "kind": "voice"}
+        ]
+        resolver = _KeepsVoice()
+        first = await persist_batch(
+            drain=_make_drain(list(items)),
+            tenant_id=1,
+            cipher=cipher,
+            store=fake_store,
+            voice=resolver,
+        )
+        retry = await persist_batch(
+            drain=_make_drain(list(items)),
+            tenant_id=1,
+            cipher=cipher,
+            store=fake_store,
+            voice=resolver,
+        )
+
+        assert retry == first
+        assert resolver.calls == 1
+
+    @pytest.mark.asyncio
+    async def test_an_untranscribed_voice_item_is_still_recorded_as_incomplete(
+        self, cipher: ColumnCipher, fake_store: FakeBatchStore
+    ) -> None:
+        """No resolver wired: the item keeps the shape of a failed transcription.
+
+        `build_voice_ingestion` returns `None` where a deployment has no STT
+        credential, and a voice item must not reach the graph with a null text
+        and a live channel reference (S02-T07 review).
+        """
+        drain = _make_drain(
+            [
+                {
+                    "channel_message_id": "m1",
+                    "raw_message_id": 101,
+                    "kind": "voice",
+                    "text": None,
+                    "media_ref": "AwACAgE-file-id",
+                }
+            ]
+        )
+        row_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
+        assert row_id is not None
+        row = await fake_store.get(batch_id=row_id, tenant_id=1)
+        assert row is not None
+
+        plaintext = cipher.decrypt(
+            row.combined_text,
+            column_aad(
+                tenant_id=1, table="processing_batch", column="combined_text", row_id=row_id
+            ),
+            declared_version=1,
+        )
+        [item] = json.loads(plaintext)
+        assert item["was_audio"] is True
+        assert item["text"] == ""
+        assert item["status"] == "incomplete"
+        assert item["media_ref"] is None
+        assert "AwACAgE-file-id" not in plaintext.decode()
+
+    @pytest.mark.asyncio
+    async def test_voice_is_transcribed_before_the_combined_text_is_encrypted(
+        self, cipher: ColumnCipher, fake_store: FakeBatchStore
+    ) -> None:
+        """S02-T07: the batch the graph receives holds text, never a media ref."""
+
+        class Resolver:
+            async def may_process_voice(self, *, tenant_id: int) -> bool:
+                return True
+
+            async def resolve(
+                self, items: list[dict[str, object]], *, tenant_id: int
+            ) -> list[dict[str, object]]:
+                for item in items:
+                    if item.get("kind") == "voice":
+                        item["text"] = "transcrito"
+                        item["was_audio"] = True
+                return items
+
+        drain = _make_drain([{"channel_message_id": "m1", "raw_message_id": 101, "kind": "voice"}])
+        row_id = await persist_batch(
+            drain=drain, tenant_id=1, cipher=cipher, store=fake_store, voice=Resolver()
+        )
+        assert row_id is not None
+        row = await fake_store.get(batch_id=row_id, tenant_id=1)
+        assert row is not None
+
+        plaintext = cipher.decrypt(
+            row.combined_text,
+            column_aad(
+                tenant_id=1, table="processing_batch", column="combined_text", row_id=row_id
+            ),
+            declared_version=1,
+        )
+        [item] = json.loads(plaintext)
+        assert item["text"] == "transcrito"
+        assert item["was_audio"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_burst_the_voice_step_emptied_persists_no_batch(
+        self, cipher: ColumnCipher, fake_store: FakeBatchStore
+    ) -> None:
+        """An inaudible lone voice note was answered on its own (§11.3)."""
+
+        class DroppingResolver:
+            async def may_process_voice(self, *, tenant_id: int) -> bool:
+                return True
+
+            async def resolve(
+                self, items: list[dict[str, object]], *, tenant_id: int
+            ) -> list[dict[str, object]]:
+                return [item for item in items if item.get("kind") != "voice"]
+
+        drain = _make_drain([{"channel_message_id": "m1", "raw_message_id": 101, "kind": "voice"}])
+        row_id = await persist_batch(
+            drain=drain, tenant_id=1, cipher=cipher, store=fake_store, voice=DroppingResolver()
+        )
+
+        assert row_id is None
+        assert fake_store._rows == {}
 
     @pytest.mark.asyncio
     async def test_voice_items_marked_before_persist(
@@ -428,6 +896,7 @@ class TestPersistBatch:
         ]
         drain = _make_drain(items)
         row_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
+        assert row_id is not None
         row = await fake_store.get(batch_id=row_id, tenant_id=1)
         assert row is not None
 
@@ -448,6 +917,7 @@ class TestPersistBatch:
     ) -> None:
         drain = _make_drain()
         row_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
+        assert row_id is not None
         row = await fake_store.get(batch_id=row_id, tenant_id=1)
         assert row is not None
         assert row.status == "pending"
@@ -466,6 +936,7 @@ class TestProcessBatch:
     ) -> None:
         drain = _make_drain()
         row_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
+        assert row_id is not None
 
         await process_batch(
             tenant_id=1,
@@ -491,6 +962,7 @@ class TestProcessBatch:
     ) -> None:
         drain = _make_drain()
         row_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
+        assert row_id is not None
 
         # Process once
         await process_batch(
@@ -522,6 +994,7 @@ class TestProcessBatch:
     ) -> None:
         drain = _make_drain()
         row_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
+        assert row_id is not None
 
         # Pre-acquire the lock to simulate contention
         await fake_redis.set("lock:1", "other-worker", ex=120, nx=True)
@@ -549,6 +1022,7 @@ class TestProcessBatch:
         row_id = await persist_batch(
             drain=_make_drain(), tenant_id=1, cipher=cipher, store=fake_store
         )
+        assert row_id is not None
         fake_store._rows[row_id].status = "failed"
 
         await process_batch(
@@ -586,6 +1060,7 @@ class TestProcessBatch:
     ) -> None:
         drain = _make_drain()
         row_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
+        assert row_id is not None
 
         # Try to process with wrong tenant
         await process_batch(
@@ -618,6 +1093,7 @@ class TestEndToEnd:
 
         # Step 1: persist batch
         row_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
+        assert row_id is not None
 
         # Step 2: enqueue (simulated)
         await fake_enqueuer.enqueue_process_batch(tenant_id=1, batch_id=row_id)
@@ -646,6 +1122,7 @@ class TestEndToEnd:
         """Re-processing the same batch_id does not duplicate work."""
         drain = _make_drain()
         row_id = await persist_batch(drain=drain, tenant_id=1, cipher=cipher, store=fake_store)
+        assert row_id is not None
 
         # First processing
         await process_batch(
@@ -756,6 +1233,15 @@ async def test_worker_retries_processing_failures_with_exponential_backoff(
     assert caught.value.defer_score == 2_000
 
 
+def _voiceless_config() -> object:
+    """A configuration with no `stt:` section, which disables voice (S02-T07)."""
+
+    def require_stt() -> object:
+        raise ConfigError("models.yaml: no stt section (spec 11.1)")
+
+    return SimpleNamespace(models=SimpleNamespace(require_stt=require_stt))
+
+
 @pytest.mark.asyncio
 async def test_worker_startup_injects_postgres_batch_store(
     monkeypatch: pytest.MonkeyPatch,
@@ -763,11 +1249,12 @@ async def test_worker_startup_injects_postgres_batch_store(
     engine = cast(AsyncEngine, object())
     sessions = cast(async_sessionmaker[AsyncSession], object())
     settings = cast(Settings, object())
+    config = _voiceless_config()
     startup_calls: list[str] = []
 
     def validated_startup(service: str) -> tuple[Settings, object]:
         startup_calls.append(service)
-        return settings, object()
+        return settings, config
 
     monkeypatch.setattr(worker_module, "startup", validated_startup)
     monkeypatch.setattr(
@@ -785,6 +1272,156 @@ async def test_worker_startup_injects_postgres_batch_store(
     store = ctx["batch_store"]
     assert isinstance(store, PostgresBatchStore)
     assert store._sessions is sessions
+    # No `stt:` section: the worker still starts and still drains text (S02-T07).
+    assert ctx["voice"] is None
+
+
+# ─── The voice wiring of S02-T07 ───────────────────────────────────────────
+
+
+def _stt_settings(**overrides: object) -> Settings:
+    """The slice of the environment the voice wiring reads."""
+    return cast(
+        Settings,
+        SimpleNamespace(
+            **{
+                "channels": ("telegram",),
+                "groq_api_key": SecretStr("gsk-not-a-real-key"),
+                "telegram_bot_token": SecretStr("1234:token"),
+                "telegram_mode": "polling",
+                "telegram_webhook_secret": None,
+                "fittrack_config_dir": "config",
+                "encryption_keys": {1: bytes(range(32))},
+                "active_key_version": 1,
+                **overrides,
+            }
+        ),
+    )
+
+
+def _stt_config() -> object:
+    return SimpleNamespace(
+        models=SimpleNamespace(
+            require_stt=lambda: load_models(Path("config") / "models.yaml").require_stt()
+        )
+    )
+
+
+def test_voice_is_wired_when_the_channel_and_the_credential_are_there() -> None:
+    ctx: dict[str, object] = {
+        "db_engine": cast(AsyncEngine, object()),
+        "redis": cast(ArqRedis, object()),
+    }
+
+    voice = worker_module.build_voice_ingestion(ctx, _stt_settings(), cast(Config, _stt_config()))
+
+    assert voice is not None
+    assert isinstance(ctx["stt_http"], httpx.AsyncClient)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reason"),
+    [
+        pytest.param({"groq_api_key": None}, "no credential", id="credential"),
+        pytest.param({"channels": ()}, "channel not enabled", id="channel"),
+    ],
+)
+def test_voice_is_disabled_rather_than_fatal(overrides: dict[str, object], reason: str) -> None:
+    """A deployment that cannot transcribe still drains text (invariant 6)."""
+    ctx: dict[str, object] = {
+        "db_engine": cast(AsyncEngine, object()),
+        "redis": cast(ArqRedis, object()),
+    }
+
+    voice = worker_module.build_voice_ingestion(
+        ctx, _stt_settings(**overrides), cast(Config, _stt_config())
+    )
+
+    assert voice is None, reason
+    assert "stt_http" not in ctx
+
+
+class ClosingChannel:
+    """A channel that records whether the wiring released its pool."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_worker_shutdown_closes_both_http_clients() -> None:
+    """The adapter owns the pool the registry built for it (S02-T07 review)."""
+    http = httpx.AsyncClient()
+    channel = ClosingChannel()
+    ctx: dict[str, object] = {
+        "stt_http": http,
+        "voice": object(),
+        "voice_channel": channel,
+        "voice_retention_s": 60,
+    }
+
+    await worker_module.worker_shutdown(ctx)
+
+    assert http.is_closed
+    assert channel.closed
+    for key in ("stt_http", "voice", "voice_channel", "voice_retention_s"):
+        assert key not in ctx
+
+
+@pytest.mark.asyncio
+async def test_the_audio_sweep_expires_what_the_window_has_passed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§11.3 is a maximum, so the sweep also runs on a schedule (S02-T07 review)."""
+    stale = tmp_path / "1.ogg"
+    stale.write_bytes(b"forgotten")
+    os.utime(stale, (1_000.0, 1_000.0))
+    monkeypatch.setattr(worker_module, "DEFAULT_RETRY_DIR", tmp_path)
+
+    await worker_module.sweep_voice_audio({"voice_retention_s": 3600})
+
+    assert not stale.exists()
+
+
+@pytest.mark.asyncio
+async def test_the_audio_sweep_does_nothing_where_voice_is_not_wired(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    kept = tmp_path / "1.ogg"
+    kept.write_bytes(b"not ours to delete")
+    os.utime(kept, (1_000.0, 1_000.0))
+    monkeypatch.setattr(worker_module, "DEFAULT_RETRY_DIR", tmp_path)
+
+    await worker_module.sweep_voice_audio({})
+
+    assert kept.is_file()
+
+
+def test_the_sweep_is_registered_as_a_cron_job(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Otherwise the retention window depends on the next voice message arriving.
+
+    `build_redis_settings` is stubbed so the assertion is about the
+    registration and not about this process having a validated environment.
+    """
+    monkeypatch.setattr(
+        worker_module,
+        "build_redis_settings",
+        lambda settings=None: RedisSettings.from_dsn("rediss://:secret@redis.internal:6380/3"),
+    )
+    settings = worker_module.WorkerSettings
+
+    [job] = settings.cron_jobs
+    assert job.coroutine is worker_module.sweep_voice_audio
+    assert job.run_at_startup
+    assert job.minute == worker_module.AUDIO_SWEEP_MINUTES
+    # The transcription runs inside a job, so the budget has to cover it.
+    assert settings.job_timeout == worker_module.JOB_TIMEOUT
+    assert (
+        load_models(Path("config") / "models.yaml").require_stt().timeout_s < settings.job_timeout
+    )
 
 
 def test_arq_redis_settings_use_validated_url_and_ca() -> None:
@@ -938,6 +1575,7 @@ async def test_postgres_batch_store_round_trip(
             cipher=cipher,
             store=store,
         )
+        assert row_id is not None
 
         row = await store.get(batch_id=row_id, tenant_id=tenant_id)
         assert row is not None
