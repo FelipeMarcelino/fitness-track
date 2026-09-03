@@ -35,6 +35,7 @@ from fittrack.services.batch import (
     BatchLockContentionError,
     BatchRow,
     PostgresBatchStore,
+    drain_message_ids,
     persist_batch,
     prepare_items,
     process_batch,
@@ -286,9 +287,13 @@ class TestPrepareItems:
             {"channel_message_id": "m1", "raw_message_id": 101, "text": "oi", "kind": "text"},
             {"channel_message_id": "m2", "raw_message_id": 102, "kind": "voice"},
         ]
-        result, _ = prepare_items(items)
+        result = prepare_items(items)
         assert result[0].get("was_audio") is None
         assert result[1]["was_audio"] is True
+
+
+class TestDrainMessageIds:
+    """The identity of the handoff, taken before anything resolves voice (D-2)."""
 
     def test_preserves_arrival_order(self) -> None:
         items: list[dict[str, object]] = [
@@ -296,24 +301,28 @@ class TestPrepareItems:
             {"channel_message_id": "m1", "raw_message_id": 101, "text": "a"},
             {"channel_message_id": "m2", "raw_message_id": 102, "text": "b"},
         ]
-        _, message_ids = prepare_items(items)
-        assert message_ids == ["103", "101", "102"]
+        assert drain_message_ids(items) == ["103", "101", "102"]
 
     def test_extracts_message_ids(self) -> None:
         items: list[dict[str, object]] = [
             {"channel_message_id": "m1", "raw_message_id": 101, "text": "hello"},
             {"channel_message_id": "m2", "raw_message_id": 102, "text": "world"},
         ]
-        _, message_ids = prepare_items(items)
-        assert message_ids == ["101", "102"]
+        assert drain_message_ids(items) == ["101", "102"]
 
     def test_handles_missing_message_id(self) -> None:
         items: list[dict[str, object]] = [
             {"text": "hello"},
             {"channel_message_id": "m2", "raw_message_id": 102, "text": "world"},
         ]
-        _, message_ids = prepare_items(items)
-        assert message_ids == ["102"]
+        assert drain_message_ids(items) == ["102"]
+
+    def test_a_voice_item_answered_on_its_own_is_still_part_of_the_drain(self) -> None:
+        """It leaves the burst, not the identity of what was drained."""
+        items: list[dict[str, object]] = [
+            {"channel_message_id": "m1", "raw_message_id": 101, "kind": "voice"},
+        ]
+        assert drain_message_ids(items) == ["101"]
 
     def test_voice_and_text_mixed(self) -> None:
         items: list[dict[str, object]] = [
@@ -326,10 +335,41 @@ class TestPrepareItems:
             },
             {"channel_message_id": "m3", "raw_message_id": 103, "kind": "voice"},
         ]
-        result, _ = prepare_items(items)
+        result = prepare_items(items)
         assert result[0]["was_audio"] is True
         assert result[1].get("was_audio") is None
         assert result[2]["was_audio"] is True
+
+
+class _KeepsVoice:
+    """A resolver whose transcription failed: the item stays, `incomplete`."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def resolve(
+        self, items: list[dict[str, object]], *, tenant_id: int
+    ) -> list[dict[str, object]]:
+        self.calls += 1
+        for item in items:
+            if item.get("kind") == "voice":
+                item["was_audio"] = True
+                item["text"] = ""
+                item["status"] = "incomplete"
+        return items
+
+
+class _DropsVoice:
+    """A resolver whose second attempt came back inaudible: the item is answered."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def resolve(
+        self, items: list[dict[str, object]], *, tenant_id: int
+    ) -> list[dict[str, object]]:
+        self.calls += 1
+        return [item for item in items if item.get("kind") != "voice"]
 
 
 # ─── persist_batch ─────────────────────────────────────────────────────────
@@ -421,6 +461,113 @@ class TestPersistBatch:
         row = await fake_store.get(batch_id=row_id, tenant_id=1)
         assert row is not None
         assert row.key_version == cipher.active_version
+
+    @pytest.mark.asyncio
+    async def test_a_retry_whose_voice_outcome_changed_reuses_the_same_batch(
+        self, cipher: ColumnCipher, fake_store: FakeBatchStore
+    ) -> None:
+        """D-2. The handoff identity is the drain, not what the drain resolved to.
+
+        `store.insert` can succeed and `enqueue_process_batch` fail, and the
+        next `flush_check` retries the same drain. Transcription is not
+        deterministic — an attempt that failed can come back inaudible — so an
+        identity derived after the voice step changes between the two runs, and
+        the persisted row is no longer found.
+        """
+        drain = _make_drain(
+            [
+                {"channel_message_id": "m1", "raw_message_id": 101, "kind": "text", "text": "oi"},
+                {"channel_message_id": "m2", "raw_message_id": 102, "kind": "voice"},
+            ]
+        )
+
+        first = await persist_batch(
+            drain=drain, tenant_id=1, cipher=cipher, store=fake_store, voice=_KeepsVoice()
+        )
+        # The enqueue failed here, so the drain was never acknowledged.
+        retry = await persist_batch(
+            drain=_make_drain(
+                [
+                    {
+                        "channel_message_id": "m1",
+                        "raw_message_id": 101,
+                        "kind": "text",
+                        "text": "oi",
+                    },
+                    {"channel_message_id": "m2", "raw_message_id": 102, "kind": "voice"},
+                ]
+            ),
+            tenant_id=1,
+            cipher=cipher,
+            store=fake_store,
+            voice=_DropsVoice(),
+        )
+
+        assert retry == first
+        assert len(fake_store._rows) == 1, "the retry inserted a second batch for one drain"
+
+    @pytest.mark.asyncio
+    async def test_a_voice_only_retry_does_not_abandon_the_persisted_batch(
+        self, cipher: ColumnCipher, fake_store: FakeBatchStore
+    ) -> None:
+        """D-2, the other half: a drain that resolves to nothing still has a row."""
+        items: list[dict[str, object]] = [
+            {"channel_message_id": "m1", "raw_message_id": 101, "kind": "voice"}
+        ]
+
+        first = await persist_batch(
+            drain=_make_drain(list(items)),
+            tenant_id=1,
+            cipher=cipher,
+            store=fake_store,
+            voice=_KeepsVoice(),
+        )
+        retry = await persist_batch(
+            drain=_make_drain(list(items)),
+            tenant_id=1,
+            cipher=cipher,
+            store=fake_store,
+            voice=_DropsVoice(),
+        )
+
+        assert first is not None
+        assert retry == first, "the persisted batch was abandoned, and nothing enqueues it"
+
+    @pytest.mark.asyncio
+    async def test_a_retry_of_a_persisted_batch_does_not_transcribe_again(
+        self, cipher: ColumnCipher, fake_store: FakeBatchStore
+    ) -> None:
+        """D-2, the trade this direction makes, stated as a test.
+
+        Looking the batch up before the voice step means a retry pays for no
+        second download, no second provider call and no second fixed reply. The
+        cost is that a transcription which failed the first time stays
+        `incomplete` in an already-persisted batch — the documented degraded
+        outcome of criterion 5, not a loss: `raw_message.payload` still holds
+        the original update.
+        """
+        items: list[dict[str, object]] = [
+            {"channel_message_id": "m1", "raw_message_id": 101, "kind": "voice"},
+            {"channel_message_id": "m2", "raw_message_id": 102, "kind": "text", "text": "oi"},
+        ]
+        resolver = _KeepsVoice()
+
+        await persist_batch(
+            drain=_make_drain(list(items)),
+            tenant_id=1,
+            cipher=cipher,
+            store=fake_store,
+            voice=resolver,
+        )
+        await persist_batch(
+            drain=_make_drain(list(items)),
+            tenant_id=1,
+            cipher=cipher,
+            store=fake_store,
+            voice=resolver,
+        )
+
+        assert resolver.calls == 1
 
     @pytest.mark.asyncio
     async def test_an_untranscribed_voice_item_is_still_recorded_as_incomplete(

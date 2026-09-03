@@ -23,6 +23,7 @@ o ADR explica *como se chegou nele*.
 | [0005](0005-midia-local-nao-entra-na-fila.md) | Mídia local não entra na fila | aceito | — |
 | [0006](0006-voz-longa-continua-sendo-voz.md) | Áudio longo demais continua sendo `voice` | aceito | — |
 | [0007](0007-stt-fora-do-llm-gateway.md) | STT fora do `LLMGateway`, configurado em `models.yaml` | aceito | — |
+| [0008](0008-coluna-propria-para-resposta-fixa.md) | Coluna própria para a resposta fixa já enviada | aceito | — |
 
 > ⚠️ **ADR-0001 está referenciado mas ausente da árvore.** O `CLAUDE.md` e a §2 da spec apontam para
 > `doc/adr/0001-groq-como-provider-primario.md`, e o arquivo não existe. O conteúdo da decisão está

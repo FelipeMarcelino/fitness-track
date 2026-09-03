@@ -257,6 +257,17 @@ def tables_named_in_migrations() -> set[str]:
     return names
 
 
+def latest_revision() -> str:
+    """The newest revision on disk, rather than a number written here.
+
+    Hard-coding it makes every migration break a test that has nothing to do
+    with what the migration changed, and the failure names a revision instead
+    of the behaviour.
+    """
+    versions = ROOT / "src" / "fittrack" / "db" / "migrations" / "versions"
+    return max(path.name.split("_")[1] for path in versions.glob("_0*.py"))
+
+
 async def test_check_does_not_call_an_unmigrated_database_ready(
     disposable_database: str,
 ) -> None:
@@ -274,7 +285,7 @@ async def test_check_does_not_call_an_unmigrated_database_ready(
     assert run_bootstrap(disposable_database).returncode == 0
     migrated = run_bootstrap(disposable_database, "--check")
     assert migrated.returncode == 0
-    assert "0004" in migrated.stdout
+    assert latest_revision() in migrated.stdout
 
 
 async def test_the_revoke_refuses_to_report_success_after_finding_nothing(

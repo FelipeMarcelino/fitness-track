@@ -338,18 +338,18 @@ async def test_answering_a_recording_is_recorded_once(
     sessions: async_sessionmaker[AsyncSession],
     cipher: ColumnCipher,
 ) -> None:
-    """`processed_at` is the durable marker that stops a duplicate fixed reply."""
+    """`answered_at` is the durable marker that stops a duplicate fixed reply."""
     tenant_id = await make_tenant(owner)
     raw_message_id = await make_voice_message(owner, tenant_id)
     store = SqlTranscriptStore(sessions, cipher)
 
     await store.mark_answered(tenant_id=tenant_id, raw_message_id=raw_message_id)
     first = await owner.fetchval(
-        "SELECT processed_at FROM raw_message WHERE id = $1", raw_message_id
+        "SELECT answered_at FROM raw_message WHERE id = $1", raw_message_id
     )
     await store.mark_answered(tenant_id=tenant_id, raw_message_id=raw_message_id)
     second = await owner.fetchval(
-        "SELECT processed_at FROM raw_message WHERE id = $1", raw_message_id
+        "SELECT answered_at FROM raw_message WHERE id = $1", raw_message_id
     )
 
     assert first is not None
@@ -357,3 +357,51 @@ async def test_answering_a_recording_is_recorded_once(
     row = await store.load(tenant_id=tenant_id, raw_message_id=raw_message_id)
     assert row is not None
     assert row.answered is True
+
+
+async def test_a_stored_transcription_is_not_an_answer_to_the_user(
+    owner: asyncpg.Connection,
+    sessions: async_sessionmaker[AsyncSession],
+    cipher: ColumnCipher,
+) -> None:
+    """D-3. The two facts are separate, and one used to stand for the other.
+
+    `save` recording a transcription must not make `load` report the message as
+    answered. It did, through a shared `processed_at`, and `_refuse` reads that
+    flag: a transcription that succeeded and then failed to persist would, on
+    the retried drain with consent revoked in between, suppress the consent
+    reply *and* drop the item — leaving the user with nothing at all.
+    """
+    tenant_id = await make_tenant(owner)
+    raw_message_id = await make_voice_message(owner, tenant_id)
+    store = SqlTranscriptStore(sessions, cipher)
+
+    await store.save(
+        tenant_id=tenant_id, raw_message_id=raw_message_id, transcript="supino dez quilos"
+    )
+    row = await store.load(tenant_id=tenant_id, raw_message_id=raw_message_id)
+
+    assert row is not None
+    assert row.answered is False, "a transcription was recorded as an answer to the user"
+
+
+async def test_processing_a_message_is_not_answering_it_either(
+    owner: asyncpg.Connection,
+    sessions: async_sessionmaker[AsyncSession],
+    cipher: ColumnCipher,
+) -> None:
+    """`processed_at` belongs to the graph run of Sprint 03, not to this flag.
+
+    Sharing the column would have made the graph's own bookkeeping suppress a
+    fixed reply months from now, in a place nobody would think to look.
+    """
+    tenant_id = await make_tenant(owner)
+    raw_message_id = await make_voice_message(owner, tenant_id)
+    await owner.execute("UPDATE raw_message SET processed_at = now() WHERE id = $1", raw_message_id)
+
+    row = await SqlTranscriptStore(sessions, cipher).load(
+        tenant_id=tenant_id, raw_message_id=raw_message_id
+    )
+
+    assert row is not None
+    assert row.answered is False

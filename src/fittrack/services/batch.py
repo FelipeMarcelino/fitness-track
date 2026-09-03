@@ -217,13 +217,28 @@ class BatchEnqueuer(Protocol):
 # ─── Pure helpers ──────────────────────────────────────────────────────────
 
 
-def prepare_items(
-    items: list[dict[str, object]],
-) -> tuple[list[dict[str, object]], list[str]]:
-    """Mark voice items ``was_audio=True`` and extract message ids.
+def drain_message_ids(items: list[dict[str, object]]) -> list[str]:
+    """The identity of a drain: its raw-message ids, in arrival order (§4.1).
 
-    Preserves arrival order (§4.1).  Items without ``raw_message_id`` are
-    kept in the list but excluded from ``message_ids``.
+    Taken from the drain *as it arrived*, before anything resolves voice. That
+    is what makes it an identity: the drain is fixed, while what it resolves to
+    is not — a transcription that failed on one attempt can come back inaudible
+    on the next, and an item answered with a fixed reply leaves the batch. An
+    identity computed after that step changes between two runs over the same
+    drain, and the row persisted by the first is no longer found by the second:
+    a mixed burst inserts a duplicate, and a voice-only burst abandons the row
+    it already wrote.
+
+    Items without a ``raw_message_id`` are excluded; the ingress refuses to
+    buffer one (`RedisTenantBuffer.append`), so in practice there are none.
+    """
+    return [str(item["raw_message_id"]) for item in items if item.get("raw_message_id") is not None]
+
+
+def prepare_items(items: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Mark voice items ``was_audio=True`` and normalise the untranscribed ones.
+
+    Preserves arrival order (§4.1).
 
     A voice item that reaches this point without text was never transcribed —
     either no resolver was wired (a deployment with no STT credential, see
@@ -233,7 +248,6 @@ def prepare_items(
     every analysis (invariant 6), and no ``media_ref``, which nothing
     downstream reads and which is a reusable channel access reference (§20.6).
     """
-    message_ids: list[str] = []
     for item in items:
         if item.get("kind") == "voice":
             item["was_audio"] = True
@@ -241,12 +255,7 @@ def prepare_items(
                 item["text"] = ""
                 item["status"] = "incomplete"
             item["media_ref"] = None
-        # This is globally unique across channels and remains stable when an
-        # orphaned Redis drain is retried.
-        msg_id = item.get("raw_message_id")
-        if msg_id is not None:
-            message_ids.append(str(msg_id))
-    return items, message_ids
+    return items
 
 
 # ─── Persist ───────────────────────────────────────────────────────────────
@@ -271,15 +280,19 @@ async def persist_batch(
     inaudible, too long or unconsented was answered with the fixed reply of
     §11.3, and an empty batch would only give the graph a turn with no content
     in it.
-    """
-    items = drain.items
-    if voice is not None:
-        items = await voice.resolve(items, tenant_id=tenant_id)
-    items, message_ids = prepare_items(items)
 
-    # The drain is acknowledged only after enqueue succeeds. If enqueue failed
-    # after the insert, the next flush retry repairs the handoff by reusing the
-    # row identified by the same ordered raw-message ids.
+    ``message_ids`` records the messages the batch was *drained from*, which is
+    not always the same as the ones its ``combined_text`` holds: a recording
+    answered with a fixed reply leaves the burst but stays part of what this
+    drain was. That is deliberate — it is the identity of the handoff, and it
+    has to survive a retry whose voice step decided differently.
+    """
+    # Before the voice step, and from the drain as it arrived: see
+    # `drain_message_ids`. Looking the batch up first also means a retry pays
+    # for no second download, no second provider call and no second fixed
+    # reply — the drain is acknowledged only after the enqueue succeeds, so
+    # this path runs whenever that enqueue failed.
+    message_ids = drain_message_ids(drain.items)
     if message_ids:
         existing = await store.find_by_message_ids(
             tenant_id=tenant_id,
@@ -291,6 +304,11 @@ async def persist_batch(
                 extra={"tenant_id": tenant_id, "batch_id": existing.id},
             )
             return existing.id
+
+    items = drain.items
+    if voice is not None:
+        items = await voice.resolve(items, tenant_id=tenant_id)
+    items = prepare_items(items)
 
     if not items:
         logger.info(

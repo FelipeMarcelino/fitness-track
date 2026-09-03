@@ -72,9 +72,11 @@ __all__ = [
     "VoiceStatus",
     "decrypt_transcript",
     "encrypt_transcript",
+    "find_pending_audio",
     "load_prompt",
     "pending_audio_path",
     "purge_stale_audio",
+    "upload_format",
 ]
 
 # Spec 11.1. The path is in the spec and the model is not: the identifier lives
@@ -106,8 +108,27 @@ WORKOUT_DATA_CONSENT = "workout_data"
 # unswept, which is half of the rule in 11.3.
 DEFAULT_RETRY_DIR = MEDIA_TMPFS_DIR
 
+# Both channels deliver a *voice note* as ogg/opus (spec 11.1), and that is the
+# fallback. It is not the only thing that arrives, though: `audio` and
+# `video_note` are the same inbound kind and come as mp3, m4a or mp4, and a
+# provider that picks its decoder from the multipart filename would refuse a
+# recording it supports. The suffix is channel-supplied text, so it is matched
+# against what the provider documents rather than passed through.
 AUDIO_SUFFIX = ".ogg"
 UPLOAD_MIME = "audio/ogg"
+UPLOAD_FORMATS: Mapping[str, str] = {
+    ".ogg": "audio/ogg",
+    ".oga": "audio/ogg",
+    ".opus": "audio/ogg",
+    ".mp3": "audio/mpeg",
+    ".mpga": "audio/mpeg",
+    ".mpeg": "audio/mpeg",
+    ".m4a": "audio/mp4",
+    ".mp4": "video/mp4",
+    ".wav": "audio/wav",
+    ".webm": "audio/webm",
+    ".flac": "audio/flac",
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -206,10 +227,16 @@ class VoiceMessage:
 
     identity_id: int
     channel: ChannelKind
-    # `processed_at`, as a boolean. A drain is kept until the batch is persisted
-    # and enqueued (§17.3), so a failure after a fixed reply was queued means
-    # the same burst is processed again — and without a durable marker the user
-    # would be told twice that we could not hear them.
+    # `answered_at`, as a boolean: has this message already had its one fixed
+    # reply? A drain is kept until the batch is persisted and enqueued (§17.3),
+    # so a failure after the reply was queued means the same burst is processed
+    # again, and without a durable marker the user is told twice.
+    #
+    # Its own column rather than `processed_at` (ADR-0008). The two facts are
+    # different, and conflating them cost a user their only reply: a
+    # transcription that succeeded stamped `processed_at`, and the retry — with
+    # consent revoked in between — read that as "already answered", suppressed
+    # the consent reply and dropped the item from the batch.
     answered: bool = False
 
 
@@ -333,14 +360,42 @@ def decrypt_transcript(
 # --------------------------------------------------------------------------- #
 
 
-def pending_audio_path(directory: Path, raw_message_id: int) -> Path:
+def upload_format(audio: Path) -> tuple[str, str]:
+    """The container to declare for a recording, and its media type.
+
+    Chosen from a known set rather than trusted: the local name comes from
+    Telegram's `file_path`, which is not ours. Anything unrecognised becomes
+    the ogg/opus both channels send for a voice note.
+    """
+    suffix = audio.suffix.lower()
+    mime = UPLOAD_FORMATS.get(suffix)
+    return (suffix, mime) if mime is not None else (AUDIO_SUFFIX, UPLOAD_MIME)
+
+
+def pending_audio_path(directory: Path, raw_message_id: int, suffix: str = AUDIO_SUFFIX) -> Path:
     """Where a failed transcription leaves its audio for the next attempt.
 
     Named after the row, because that is what the retry knows: the buffered
     envelope and the persisted batch both carry `raw_message_id`, and the
-    channel's own `file_id` must not become a filename (spec 20.6).
+    channel's own `file_id` must not become a filename (spec 20.6). The
+    container is kept, because renaming an mp4 to `.ogg` is how a supported
+    recording gets refused by the provider on the retry.
     """
-    return directory / f"{raw_message_id}{AUDIO_SUFFIX}"
+    return directory / f"{raw_message_id}{suffix}"
+
+
+def find_pending_audio(directory: Path, raw_message_id: int) -> Path | None:
+    """The recording a previous attempt kept, whatever container it is in."""
+    if not directory.is_dir() or directory.is_symlink():
+        return None
+    return next(
+        (
+            candidate
+            for candidate in sorted(directory.glob(f"{raw_message_id}.*"))
+            if candidate.is_file() and candidate.suffix.lower() in UPLOAD_FORMATS
+        ),
+        None,
+    )
 
 
 def purge_stale_audio(directory: Path, *, max_age_s: int, now: float | None = None) -> int:
@@ -440,6 +495,7 @@ class GroqTranscriber:
         self._url = url
 
     async def transcribe(self, audio: Path, *, prompt: str) -> Transcription:
+        suffix, mime = upload_format(audio)
         data = {
             "model": self._config.model,
             "language": self._config.language,
@@ -452,10 +508,11 @@ class GroqTranscriber:
                     self._url,
                     headers={"Authorization": f"Bearer {self._key}"},
                     data=data,
-                    # A fixed name: the local one is the channel's download and
-                    # says something about where the bytes came from. Only the
-                    # suffix carries information the provider needs.
-                    files={"file": (f"audio{AUDIO_SUFFIX}", source.read(), UPLOAD_MIME)},
+                    # A fixed stem: the local one is the channel's download and
+                    # says something about where the bytes came from. The
+                    # suffix is the part the provider needs, so it is the part
+                    # that travels.
+                    files={"file": (f"audio{suffix}", source.read(), mime)},
                     timeout=self._config.timeout_s,
                 )
         except OSError as error:
@@ -780,8 +837,8 @@ class VoiceIngestion:
         the recording would sit in tmpfs under a name no retry could look for
         and no sweep would recognise as ours.
         """
-        pending = pending_audio_path(self._retry_dir, raw_message_id)
-        if pending.is_file():
+        pending = find_pending_audio(self._retry_dir, raw_message_id)
+        if pending is not None:
             return pending
         try:
             downloaded = await self._downloader.download_media(media_ref)
@@ -795,7 +852,15 @@ class VoiceIngestion:
                 extra={"raw_message_id": raw_message_id, "error": type(error).__name__},
             )
             return None
-        return self._adopt(downloaded, destination=pending, raw_message_id=raw_message_id)
+        # The container the channel actually sent, not the one a voice note
+        # usually is: renaming an mp4 to `.ogg` is how the provider comes to
+        # refuse a recording it supports.
+        suffix, _ = upload_format(downloaded)
+        return self._adopt(
+            downloaded,
+            destination=pending_audio_path(self._retry_dir, raw_message_id, suffix),
+            raw_message_id=raw_message_id,
+        )
 
     def _adopt(self, downloaded: Path, *, destination: Path, raw_message_id: int) -> Path:
         """Put a fresh download where every later attempt can address it."""
@@ -939,7 +1004,7 @@ class SqlTranscriptStore:
         async with tenant_session(self._sessions, tenant_id) as session:
             result = await session.execute(
                 text(
-                    "SELECT identity_id, channel, processed_at "
+                    "SELECT identity_id, channel, answered_at "
                     "FROM raw_message WHERE id = :raw_message_id"
                 ),
                 {"raw_message_id": raw_message_id},
@@ -950,7 +1015,7 @@ class SqlTranscriptStore:
         return VoiceMessage(
             identity_id=int(row["identity_id"]),
             channel=str(row["channel"]),  # type: ignore[arg-type]  # channel_kind is the Literal
-            answered=row["processed_at"] is not None,
+            answered=row["answered_at"] is not None,
         )
 
     async def load_transcript(self, *, tenant_id: int, raw_message_id: int) -> str | None:
@@ -1019,20 +1084,21 @@ class SqlTranscriptStore:
         )
         async with tenant_session(self._sessions, tenant_id) as session:
             await session.execute(
-                text(
-                    "UPDATE raw_message SET transcript = :transcript, processed_at = now() "
-                    "WHERE id = :raw_message_id"
-                ),
+                text("UPDATE raw_message SET transcript = :transcript WHERE id = :raw_message_id"),
                 {"transcript": encrypted, "raw_message_id": raw_message_id},
             )
 
     async def mark_answered(self, *, tenant_id: int, raw_message_id: int) -> None:
-        """Stamp `processed_at`, once, so a retried drain does not reply twice."""
+        """Stamp `answered_at`, once, so a retried drain does not reply twice.
+
+        `WHERE answered_at IS NULL` keeps the first timestamp: the question is
+        whether the user was answered, not when we last looked.
+        """
         async with tenant_session(self._sessions, tenant_id) as session:
             await session.execute(
                 text(
-                    "UPDATE raw_message SET processed_at = now() "
-                    "WHERE id = :raw_message_id AND processed_at IS NULL"
+                    "UPDATE raw_message SET answered_at = now() "
+                    "WHERE id = :raw_message_id AND answered_at IS NULL"
                 ),
                 {"raw_message_id": raw_message_id},
             )

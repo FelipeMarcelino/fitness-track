@@ -57,6 +57,7 @@ from fittrack.services.stt import (
     load_prompt,
     pending_audio_path,
     purge_stale_audio,
+    upload_format,
 )
 from fittrack.services.webhook import IngressIdentity, _envelope
 from fittrack.settings import ChannelKind
@@ -82,9 +83,18 @@ _STANDARD_RECORD_FIELDS = frozenset(logging.LogRecord("", 0, "", 0, "", None, No
 class FakeDownloader:
     """A ``download_media`` that writes bytes into tmpfs, like the adapter."""
 
-    def __init__(self, directory: Path, *, fail: Exception | None = None) -> None:
+    def __init__(
+        self,
+        directory: Path,
+        *,
+        fail: Exception | None = None,
+        suffix: str = ".ogg",
+    ) -> None:
         self.directory = directory
         self.fail = fail
+        # Telegram delivers `voice` as ogg/opus, but `audio` and `video_note`
+        # are the same inbound kind and arrive as mp3, m4a or mp4 (spec 11).
+        self.suffix = suffix
         self.calls: list[str] = []
 
     async def download_media(self, media_ref: str) -> Path:
@@ -92,7 +102,7 @@ class FakeDownloader:
         if self.fail is not None:
             raise self.fail
         self.directory.mkdir(parents=True, exist_ok=True)
-        destination = self.directory / f"{uuid4()}.ogg"
+        destination = self.directory / f"{uuid4()}{self.suffix}"
         destination.write_bytes(b"ogg/opus")
         return destination
 
@@ -150,6 +160,7 @@ class FakeTranscripts:
             )
         )
         self.transcript = transcript
+        self.answered_flag = answered
         self.loaded: list[int] = []
         self.decrypted: list[int] = []
         self.saved: list[tuple[int, int, str]] = []
@@ -159,7 +170,15 @@ class FakeTranscripts:
 
     async def load(self, *, tenant_id: int, raw_message_id: int) -> VoiceMessage | None:
         self.loaded.append(raw_message_id)
-        return self.row
+        if self.row is None:
+            return None
+        # Rebuilt from current state: `save` and `mark_answered` change what a
+        # later `load` sees, which is the whole point of the D-3 scenario.
+        return VoiceMessage(
+            identity_id=self.row.identity_id,
+            channel=self.row.channel,
+            answered=self.answered_flag,
+        )
 
     async def load_transcript(self, *, tenant_id: int, raw_message_id: int) -> str | None:
         # Standing in for the decryption the SQL store does here (§22.2): what
@@ -169,11 +188,15 @@ class FakeTranscripts:
 
     async def save(self, *, tenant_id: int, raw_message_id: int, transcript: str) -> None:
         self.saved.append((tenant_id, raw_message_id, transcript))
+        # Deliberately does not touch `answered_flag`: a transcription that
+        # worked is not a fixed reply that was sent (D-3).
+        self.transcript = transcript
         if self.watch is not None:
             self.audio_existed_on_save.append(self.watch.is_file())
 
     async def mark_answered(self, *, tenant_id: int, raw_message_id: int) -> None:
         self.answered.append((tenant_id, raw_message_id))
+        self.answered_flag = True
 
 
 class FakeReplies:
@@ -658,6 +681,47 @@ async def test_a_transcript_that_cannot_be_stored_leaves_the_audio_addressable(
     assert pending_audio_path(tmp_path / "retry", RAW_MESSAGE).is_file()
 
 
+async def test_a_successful_transcription_does_not_suppress_a_later_refusal(
+    tmp_path: Path,
+) -> None:
+    """D-3. Recording a transcription is not recording an answer to the user.
+
+    Transcribe, then let the persistence fail so the drain is retried, then
+    have consent revoked in between. The consent branch must still queue the
+    fixed reply — a marker set by the successful transcription would read as
+    "already answered", swallow the only message the user was going to get,
+    and drop the item from the batch on top of it.
+    """
+    transcripts = FakeTranscripts()
+    consent = FakeConsent()
+    replies = FakeReplies()
+
+    first = await ingestion(
+        tmp_path=tmp_path,
+        transcriber=FakeTranscriber(Transcription("supino dez quilos")),
+        transcripts=transcripts,
+        consent=consent,
+        replies=replies,
+    ).ingest(voice_item(), tenant_id=TENANT)
+
+    assert first.status is VoiceStatus.TRANSCRIBED
+    assert transcripts.saved, "the transcription was not persisted"
+    assert replies.texts == [], "a successful transcription answered the user"
+
+    # The batch never got enqueued, so the same drain comes round again — and
+    # the tenant revoked `workout_data` in the meantime.
+    consent.granted = False
+    second = await ingestion(
+        tmp_path=tmp_path,
+        transcripts=transcripts,
+        consent=consent,
+        replies=replies,
+    ).ingest(voice_item(), tenant_id=TENANT)
+
+    assert second.status is VoiceStatus.NO_CONSENT
+    assert replies.texts == [load_prompt(CONSENT_PROMPT, prompt_dir=PROMPTS)]
+
+
 async def test_a_fixed_reply_is_not_sent_twice_for_the_same_recording(
     tmp_path: Path,
 ) -> None:
@@ -857,6 +921,79 @@ def test_the_channel_writes_where_the_sweep_looks() -> None:
 
     assert DEFAULT_DOWNLOAD_DIR == DEFAULT_RETRY_DIR
     assert Path("/tmp") != DEFAULT_RETRY_DIR
+
+
+@pytest.mark.parametrize(
+    ("suffix", "mime"),
+    [
+        pytest.param(".ogg", "audio/ogg", id="voice"),
+        pytest.param(".mp4", "video/mp4", id="video note"),
+        pytest.param(".m4a", "audio/mp4", id="audio m4a"),
+        pytest.param(".mp3", "audio/mpeg", id="audio mp3"),
+    ],
+)
+async def test_the_container_the_channel_sent_survives_the_upload(
+    tmp_path: Path, suffix: str, mime: str
+) -> None:
+    """D-4. `audio` and `video_note` are voice too, and are not ogg (spec 11).
+
+    A provider that picks its decoder from the multipart filename refuses a
+    recording it supports, and two inbound kinds the parser accepts become
+    `incomplete` for a reason nothing in the logs would explain.
+    """
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = request.content.decode("utf-8", "replace")
+        return httpx.Response(200, json={"text": "ok"})
+
+    audio = tmp_path / f"recording{suffix}"
+    audio.write_bytes(b"bytes")
+
+    async with groq(handler) as transcriber:
+        await transcriber.transcribe(audio, prompt="p")
+
+    assert f'filename="audio{suffix}"' in seen["body"]
+    assert mime in seen["body"]
+
+
+@pytest.mark.parametrize("suffix", [".mp4", ".m4a"])
+async def test_the_container_survives_the_retention_cycle(tmp_path: Path, suffix: str) -> None:
+    """The retry path renamed every format to `.ogg` on its way to the buffer."""
+    downloader = FakeDownloader(tmp_path / "download", suffix=suffix)
+    transcriber = FakeTranscriber(SttTransportError("timeout"))
+
+    await ingestion(tmp_path=tmp_path, downloader=downloader, transcriber=transcriber).ingest(
+        voice_item(), tenant_id=TENANT
+    )
+
+    [(first, _)] = transcriber.calls
+    assert first.suffix == suffix
+    assert first.is_file(), "the recording was not kept for the retry"
+
+    # And the retry finds it under whatever name it kept.
+    retried = FakeTranscriber(Transcription("na segunda vez"))
+    outcome = await ingestion(tmp_path=tmp_path, downloader=downloader, transcriber=retried).ingest(
+        voice_item(), tenant_id=TENANT
+    )
+
+    assert outcome.text == "na segunda vez"
+    assert downloader.calls == [MEDIA_REF], "the retry downloaded it again"
+    [(second, _)] = retried.calls
+    assert second.suffix == suffix
+
+
+def test_an_unknown_container_falls_back_to_the_channel_default(tmp_path: Path) -> None:
+    """A suffix is channel-supplied text, so it is chosen from a known set.
+
+    Telegram's `file_path` decides the local name, and it is not ours. Anything
+    outside the formats the provider documents becomes the ogg/opus that both
+    channels actually deliver for a voice note (spec 11.1).
+    """
+    assert upload_format(Path("x.ogg")) == (".ogg", "audio/ogg")
+    assert upload_format(Path("x.MP3")) == (".mp3", "audio/mpeg")
+    assert upload_format(Path("x.exe")) == (".ogg", "audio/ogg")
+    assert upload_format(Path("x")) == (".ogg", "audio/ogg")
 
 
 # --------------------------------------------------------------------------- #

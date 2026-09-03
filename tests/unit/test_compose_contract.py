@@ -303,11 +303,16 @@ APP_ENV_ALLOWLIST = {
     "CHECKPOINT_RETENTION_DAYS",
 }
 
+# What only one service may read. The worker is the only process that
+# transcribes (spec 11.1), so the transcription credential goes to it and
+# nowhere else — the blast radius of the public ingress does not grow because
+# voice was implemented.
+SERVICE_ONLY_ENV = {"worker": {"GROQ_API_KEY"}}
+
 # What must stay out: a compromise of the public ingress should not hand over
 # credentials that belong to other services.
 APP_ENV_FORBIDDEN = {
     "ANTHROPIC_API_KEY",
-    "GROQ_API_KEY",
     "OPENAI_API_KEY",
     "POSTGRES_PASSWORD",
     "LANGFUSE_ENCRYPTION_KEY",
@@ -331,13 +336,47 @@ def test_no_application_service_takes_the_whole_env_file(
     )
 
 
+def allowed_for(service: str) -> set[str]:
+    return APP_ENV_ALLOWLIST | SERVICE_ONLY_ENV.get(service, set())
+
+
+def forbidden_for(service: str) -> set[str]:
+    """Everything forbidden everywhere, plus what belongs to another service."""
+    return APP_ENV_FORBIDDEN | {
+        name for owner, names in SERVICE_ONLY_ENV.items() for name in names if owner != service
+    }
+
+
 @pytest.mark.parametrize("service", sorted(APP_SERVICES))
 def test_application_services_declare_only_what_they_read(
     base: dict[str, Any], service: str
 ) -> None:
     declared = set(base["services"][service].get("environment", {}))
-    extra = declared - APP_ENV_ALLOWLIST
+    extra = declared - allowed_for(service)
     assert not extra, f"{service} receives {sorted(extra)}, which nothing in it reads yet"
+
+
+def test_the_worker_receives_the_transcription_credential(base: dict[str, Any]) -> None:
+    """Without it the feature is dead in the topology that runs in production.
+
+    `build_voice_ingestion` reads `GROQ_API_KEY` and disables voice when it is
+    absent, on purpose (a deployment that cannot transcribe still drains text).
+    Absent from the worker's environment, that branch is the *only* branch:
+    every voice note becomes `incomplete` no matter what the operator put in
+    `.env`, and nothing fails loudly enough to notice. CI does not catch it —
+    it runs the suite with the host environment, not inside this topology.
+    """
+    declared = set(base["services"]["worker"]["environment"])
+
+    assert "GROQ_API_KEY" in declared
+
+
+@pytest.mark.parametrize("service", sorted(APP_SERVICES - {"worker"}))
+def test_only_the_worker_receives_the_transcription_credential(
+    base: dict[str, Any], service: str
+) -> None:
+    """The ingress does not transcribe, so a compromise of it must not leak the key."""
+    assert "GROQ_API_KEY" not in set(base["services"][service].get("environment", {}))
 
 
 def test_an_enabled_channel_has_its_credentials_in_the_topology(
@@ -353,7 +392,7 @@ def test_no_application_service_receives_another_service_secret(
     base: dict[str, Any], service: str
 ) -> None:
     declared = set(base["services"][service].get("environment", {}))
-    leaked = declared & APP_ENV_FORBIDDEN
+    leaked = declared & forbidden_for(service)
     assert not leaked, f"{service} receives {sorted(leaked)}"
 
 
