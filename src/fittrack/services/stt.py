@@ -41,9 +41,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from fittrack.channels.base import OutboundBlock
 from fittrack.config import SttConfig
 from fittrack.db.engine import tenant_session
-from fittrack.security.crypto import ColumnCipher, column_aad
+from fittrack.security.crypto import ColumnCipher, DecryptionError, column_aad
 from fittrack.security.tmpfile import open_no_follow, private_directory
-from fittrack.settings import ChannelKind
+from fittrack.settings import MEDIA_TMPFS_DIR, ChannelKind
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +98,13 @@ WORKOUT_DATA_CONSENT = "workout_data"
 # tmpfs, never a persistent volume: the file is the user's voice. Its own
 # directory rather than `/tmp` itself, because the retention sweep deletes what
 # it finds and must not be pointed at a directory it does not own.
-DEFAULT_RETRY_DIR = Path("/tmp/fittrack-stt-retry")
+#
+# The same directory the channel downloads into, and deliberately so: a
+# recording is swept whatever name it still carries — the channel's UUID, after
+# an interrupted download or a rename that failed, or its `raw_message_id`
+# after a failed transcription. A second directory would leave the first
+# unswept, which is half of the rule in 11.3.
+DEFAULT_RETRY_DIR = MEDIA_TMPFS_DIR
 
 AUDIO_SUFFIX = ".ogg"
 UPLOAD_MIME = "audio/ogg"
@@ -190,14 +196,16 @@ class VoiceOutcome:
 class VoiceMessage:
     """The `raw_message` row behind a buffered voice item.
 
-    It answers four questions in one query: who to reply to, on which channel,
-    whether this recording was already transcribed by an attempt that then
-    failed further down, and whether it has already been answered.
+    It answers the questions that come before the recording itself: who to
+    reply to, on which channel, and whether this message has already been
+    answered. The transcription is deliberately *not* here — reading it means
+    decrypting the user's words, and that must not happen before the consent
+    gate of 11.3 has passed. `TranscriptStore.load_transcript` is that later,
+    separate step.
     """
 
     identity_id: int
     channel: ChannelKind
-    transcript: str | None
     # `processed_at`, as a boolean. A drain is kept until the batch is persisted
     # and enqueued (§17.3), so a failure after a fixed reply was queued means
     # the same burst is processed again — and without a durable marker the user
@@ -235,7 +243,17 @@ class TranscriptStore(Protocol):
     """`raw_message.transcript`, encrypted at the application (spec 22.2)."""
 
     async def load(self, *, tenant_id: int, raw_message_id: int) -> VoiceMessage | None:
-        """The row behind a buffered item, or `None` if it is gone."""
+        """The row behind a buffered item, or `None` if it is gone.
+
+        Does not read the transcription: see :class:`VoiceMessage`.
+        """
+
+    async def load_transcript(self, *, tenant_id: int, raw_message_id: int) -> str | None:
+        """The stored transcription, decrypted, or `None` if there is none.
+
+        `None` also covers a blob that no longer opens. That is not the same
+        thing, but it is the same *answer*: produce it again.
+        """
 
     async def save(self, *, tenant_id: int, raw_message_id: int, transcript: str) -> None:
         """Persist the transcription. Called before the audio is deleted."""
@@ -601,14 +619,24 @@ class VoiceIngestion:
                 row=row,
             )
 
-        if row is not None and row.transcript:
+        # Only now, with the gate passed: reading this decrypts what the user
+        # said (§22.2), and a tenant who revoked consent must not have their
+        # words decrypted on the way to being told so.
+        stored = (
+            await self._transcripts.load_transcript(
+                tenant_id=tenant_id, raw_message_id=raw_message_id
+            )
+            if row is not None
+            else None
+        )
+        if stored:
             # A previous attempt already paid for the download and the call,
             # and the batch retry must not pay for either again.
             logger.info(
                 "voice already transcribed, reusing the stored transcript",
                 extra={"tenant_id": tenant_id, "raw_message_id": raw_message_id},
             )
-            return VoiceOutcome(VoiceStatus.TRANSCRIBED, text=row.transcript)
+            return VoiceOutcome(VoiceStatus.TRANSCRIBED, text=stored)
 
         duration_s = _duration(item)
         media_ref = item.get("media_ref")
@@ -837,12 +865,17 @@ def _row_id(item: Mapping[str, object]) -> int:
     return value
 
 
-def _duration(item: Mapping[str, object]) -> int | None:
-    """The recording length the channel declared, when it declared one."""
+def _duration(item: Mapping[str, object]) -> float | None:
+    """The recording length the channel declared, when it declared one.
+
+    Returned as it arrived. Truncating to `int` first put every length under
+    301 seconds below a 300 second ceiling, so a recording the rule refuses
+    was downloaded and transcribed anyway.
+    """
     value = item.get("duration_s")
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return int(value)
+    return float(value)
 
 
 def _discard(audio: Path) -> None:
@@ -899,10 +932,14 @@ class SqlTranscriptStore:
         self._cipher = cipher
 
     async def load(self, *, tenant_id: int, raw_message_id: int) -> VoiceMessage | None:
+        """Who to answer, on which channel, and whether we already have.
+
+        The transcript column is not read here — see `load_transcript`.
+        """
         async with tenant_session(self._sessions, tenant_id) as session:
             result = await session.execute(
                 text(
-                    "SELECT identity_id, channel, transcript, processed_at "
+                    "SELECT identity_id, channel, processed_at "
                     "FROM raw_message WHERE id = :raw_message_id"
                 ),
                 {"raw_message_id": raw_message_id},
@@ -910,25 +947,57 @@ class SqlTranscriptStore:
             row = result.mappings().one_or_none()
         if row is None:
             return None
-        blob = row["transcript"]
         return VoiceMessage(
             identity_id=int(row["identity_id"]),
             channel=str(row["channel"]),  # type: ignore[arg-type]  # channel_kind is the Literal
+            answered=row["processed_at"] is not None,
+        )
+
+    async def load_transcript(self, *, tenant_id: int, raw_message_id: int) -> str | None:
+        """The stored transcription, or `None` — including when it will not open.
+
+        A blob that does not authenticate is answered as absent rather than
+        raised, and that is a deliberate trade. There is no rotation job for
+        this column yet (see `save`), so a key retired while a drain sat
+        unprocessed leaves the row permanently unreadable. Raising here would
+        not stay local: the drain is kept until its batch is persisted (§17.3),
+        every later `flush_check` reads the same orphan and fails on it, and
+        the gated drain will not rename the buffer while an orphan exists — so
+        every subsequent message from that tenant, plain text included, would
+        sit in Redis behind one unreadable transcript. That is a silent,
+        deterministic loss of user input, which is what invariant 6 forbids.
+
+        Answering "no transcript" costs one download and one transcription, and
+        cannot confuse two rows: the associated data of 22.2 binds a blob to
+        its tenant and row, so an unreadable blob is unreadable *here* rather
+        than readable as something else. If the recording has expired too, the
+        item reaches the batch as `incomplete` — recorded, never discarded.
+        """
+        async with tenant_session(self._sessions, tenant_id) as session:
+            blob = await session.scalar(
+                text("SELECT transcript FROM raw_message WHERE id = :raw_message_id"),
+                {"raw_message_id": raw_message_id},
+            )
+        if not blob:
+            return None
+        try:
             # `key_version` is deliberately not passed: see `save`. The version
             # inside the blob is what selects the key, which is what putting it
             # there was for (spec 22.2).
-            transcript=(
-                decrypt_transcript(
-                    self._cipher,
-                    tenant_id=tenant_id,
-                    raw_message_id=raw_message_id,
-                    blob=bytes(blob),
-                )
-                if blob
-                else None
-            ),
-            answered=row["processed_at"] is not None,
-        )
+            return decrypt_transcript(
+                self._cipher,
+                tenant_id=tenant_id,
+                raw_message_id=raw_message_id,
+                blob=bytes(blob),
+            )
+        except DecryptionError:
+            # No detail, by the rule of `crypto.py`: one message for every
+            # cause. The row id is enough to find it.
+            logger.warning(
+                "a stored transcript could not be read and will be produced again",
+                extra={"tenant_id": tenant_id, "raw_message_id": raw_message_id},
+            )
+            return None
 
     async def save(self, *, tenant_id: int, raw_message_id: int, transcript: str) -> None:
         """Write the transcription, leaving the row's `key_version` alone.

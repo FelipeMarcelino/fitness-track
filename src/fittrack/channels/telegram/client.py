@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 from fittrack.channels.base import ChannelError
-from fittrack.security.tmpfile import create_private
+from fittrack.security.tmpfile import create_private, private_directory
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -184,7 +184,10 @@ class TelegramClient:
         neither it nor the URL appears in anything this method raises or logs.
         The local name is ours and keeps only the extension.
         """
-        into.mkdir(parents=True, exist_ok=True)
+        # `private_directory`, not `mkdir(exist_ok=True)`: the latter accepts a
+        # symlink *to* a directory, and the name is predictable in a shared
+        # `/tmp`, so the download would follow it (spec 11.1).
+        private_directory(into)
         destination = into / f"{uuid.uuid4()}{Path(file_path).suffix}"
         url = f"{API_ROOT}/file/bot{self._token.get_secret_value()}/{file_path}"
 

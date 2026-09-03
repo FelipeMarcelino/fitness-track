@@ -48,6 +48,9 @@ from fittrack.channels.telegram.client import (
 from fittrack.channels.telegram.markup import clip_caption, inline_keyboard, to_telegram_html
 from fittrack.channels.telegram.secret import verify_secret_header
 
+# A value, not a type: the download directory is read at import time.
+from fittrack.settings import MEDIA_TMPFS_DIR
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
@@ -70,7 +73,13 @@ MAX_AUDIO_SECONDS = 300
 
 # Media lands in tmpfs and is deleted after transcription (spec 11.1). Never a
 # persistent volume: the recording is the user's voice.
-DEFAULT_DOWNLOAD_DIR = Path("/tmp")
+#
+# The directory is shared with the transcription service, which renames the
+# file to its `raw_message_id` and expires whatever is left after six hours
+# (§11.3). Downloading into `/tmp` itself instead would put the file outside
+# the only sweep that exists — a partial download interrupted by a SIGKILL, or
+# one whose rename failed, would then sit in tmpfs until the container died.
+DEFAULT_DOWNLOAD_DIR = MEDIA_TMPFS_DIR
 
 # The emoji Telegram accepts on `setMessageReaction`. It is a fixed, published
 # list, and `✅` is not in it — which is exactly why 13.2 keeps a map per channel

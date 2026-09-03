@@ -38,6 +38,7 @@ from fittrack.security.crypto import ColumnCipher, DecryptionError, Keyring
 from fittrack.security.tmpfile import create_private, open_no_follow, private_directory
 from fittrack.services.stt import (
     CONSENT_PROMPT,
+    DEFAULT_RETRY_DIR,
     GROQ_TRANSCRIPTIONS_URL,
     INAUDIBLE_PROMPT,
     TOO_LONG_PROMPT,
@@ -133,24 +134,38 @@ class FakeTranscripts:
         transcript: str | None = None,
         answered: bool = False,
         missing: bool = False,
+        unreadable: bool = False,
     ) -> None:
+        # `unreadable` is the store having decided the blob does not decrypt:
+        # a retired key, most likely (§22.2). It answers `None`, like a row
+        # that never had a transcript.
+        self.unreadable = unreadable
         self.row = (
             None
             if missing
             else VoiceMessage(
                 identity_id=IDENTITY,
                 channel="telegram",
-                transcript=transcript,
                 answered=answered,
             )
         )
+        self.transcript = transcript
+        self.loaded: list[int] = []
+        self.decrypted: list[int] = []
         self.saved: list[tuple[int, int, str]] = []
         self.answered: list[tuple[int, int]] = []
         self.watch: Path | None = None
         self.audio_existed_on_save: list[bool] = []
 
     async def load(self, *, tenant_id: int, raw_message_id: int) -> VoiceMessage | None:
+        self.loaded.append(raw_message_id)
         return self.row
+
+    async def load_transcript(self, *, tenant_id: int, raw_message_id: int) -> str | None:
+        # Standing in for the decryption the SQL store does here (§22.2): what
+        # the test asserts is that nothing calls this before the consent gate.
+        self.decrypted.append(raw_message_id)
+        return None if self.unreadable else self.transcript
 
     async def save(self, *, tenant_id: int, raw_message_id: int, transcript: str) -> None:
         self.saved.append((tenant_id, raw_message_id, transcript))
@@ -184,7 +199,9 @@ class FakeReplies:
 def voice_item(
     *,
     media_ref: str | None = MEDIA_REF,
-    duration_s: int | None = 12,
+    # `float`, like the channel sends it: Telegram declares whole seconds, but
+    # the ceiling of §11.3 has to hold for a fractional one too.
+    duration_s: float | None = 12,
     raw_message_id: int = RAW_MESSAGE,
 ) -> dict[str, object]:
     """One buffer envelope for a voice message, as `webhook.py` writes it."""
@@ -704,6 +721,142 @@ def test_a_missing_prompt_file_fails_when_the_service_is_built(tmp_path: Path) -
             prompt_dir=PROMPTS,
             retry_dir=tmp_path / "retry",
         )
+
+
+async def test_a_transcript_that_no_longer_decrypts_is_treated_as_absent(
+    tmp_path: Path,
+) -> None:
+    """B-1. A retired key must not wedge the tenant's whole pipeline.
+
+    The drain is kept until the batch is persisted (§17.3), so a `load` that
+    raises is re-raised on every later `flush_check` — and `_GATED_DRAIN` never
+    renames the buffer while an orphan drain exists, so every later message of
+    that tenant, text included, would be stuck in Redis for good. Treating an
+    unreadable transcript as no transcript costs one re-transcription and keeps
+    the pipeline moving (invariant 6).
+    """
+    downloader = FakeDownloader(tmp_path / "download")
+
+    outcome = await ingestion(
+        tmp_path=tmp_path,
+        downloader=downloader,
+        transcripts=FakeTranscripts(unreadable=True),
+        transcriber=FakeTranscriber(Transcription("transcrito de novo")),
+    ).ingest(voice_item(), tenant_id=TENANT)
+
+    assert outcome.status is VoiceStatus.TRANSCRIBED
+    assert outcome.text == "transcrito de novo"
+    assert downloader.calls == [MEDIA_REF], "the unreadable transcript blocked the retry"
+
+
+async def test_an_unreadable_transcript_with_nothing_left_to_fetch_is_incomplete(
+    tmp_path: Path,
+) -> None:
+    """B-1, the other half: the item is still recorded, never discarded."""
+    downloader = FakeDownloader(tmp_path / "download", fail=RuntimeError("gone"))
+
+    outcome = await ingestion(
+        tmp_path=tmp_path,
+        downloader=downloader,
+        transcripts=FakeTranscripts(unreadable=True),
+    ).ingest(voice_item(), tenant_id=TENANT)
+
+    assert outcome.status is VoiceStatus.FAILED
+    assert outcome.enters_batch
+
+
+async def test_a_revoked_tenant_never_has_its_words_decrypted(tmp_path: Path) -> None:
+    """C-2. §11.3: the consent gate comes before anything reads the recording.
+
+    Nothing is disclosed either way, but decrypting the words of a tenant who
+    revoked consent, and only then noticing, is the wrong order.
+    """
+    transcripts = FakeTranscripts(transcript="ja transcrito")
+
+    outcome = await ingestion(
+        tmp_path=tmp_path,
+        consent=FakeConsent(granted=False),
+        transcripts=transcripts,
+        replies=FakeReplies(),
+    ).ingest(voice_item(), tenant_id=TENANT)
+
+    assert outcome.status is VoiceStatus.NO_CONSENT
+    assert transcripts.loaded == [RAW_MESSAGE], "the identity to reply to is still needed"
+    assert transcripts.decrypted == [], "the transcript was decrypted before the gate"
+
+
+async def test_a_consented_tenant_still_reuses_its_stored_transcript(
+    tmp_path: Path,
+) -> None:
+    """The lazy read must not cost the retry saving of criterion 7."""
+    downloader = FakeDownloader(tmp_path / "download")
+    transcripts = FakeTranscripts(transcript="ja transcrito")
+
+    outcome = await ingestion(
+        tmp_path=tmp_path, downloader=downloader, transcripts=transcripts
+    ).ingest(voice_item(), tenant_id=TENANT)
+
+    assert outcome.text == "ja transcrito"
+    assert transcripts.decrypted == [RAW_MESSAGE]
+    assert downloader.calls == []
+
+
+@pytest.mark.parametrize("duration_s", [300.9, 300.5, 300.1])
+async def test_a_fractional_second_over_the_ceiling_is_still_over_it(
+    tmp_path: Path, duration_s: float
+) -> None:
+    """C-1. Truncating to `int` let anything below 301 seconds through."""
+    downloader = FakeDownloader(tmp_path / "download")
+
+    outcome = await ingestion(tmp_path=tmp_path, downloader=downloader).ingest(
+        voice_item(duration_s=duration_s), tenant_id=TENANT
+    )
+
+    assert outcome.status is VoiceStatus.TOO_LONG
+    assert downloader.calls == []
+
+
+async def test_a_recording_left_by_a_failed_adoption_is_still_swept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B-2. The download lands where the retention sweep looks, always.
+
+    When the move into its `raw_message_id` name fails, the file keeps the
+    channel's UUID name. It has to be inside the swept directory all the same,
+    or §11.3's "and then delete it" never happens for it.
+    """
+    retry_dir = tmp_path / "retry"
+
+    def refuse(path: Path) -> Path:
+        raise OSError("the directory could not be prepared")
+
+    monkeypatch.setattr("fittrack.services.stt.private_directory", refuse)
+    transcriber = FakeTranscriber(SttTransportError("timeout"))
+
+    await ingestion(
+        tmp_path=tmp_path,
+        downloader=FakeDownloader(retry_dir),
+        transcriber=transcriber,
+    ).ingest(voice_item(), tenant_id=TENANT)
+
+    [(audio, _)] = transcriber.calls
+    assert audio.parent == retry_dir, "the recording landed outside the swept directory"
+    stale = time.time() - 7 * 3600
+    os.utime(audio, (stale, stale))
+    assert purge_stale_audio(retry_dir, max_age_s=6 * 3600) == 1
+    assert not audio.exists()
+
+
+def test_the_channel_writes_where_the_sweep_looks() -> None:
+    """B-2. One directory for voice, so nothing is downloaded outside the sweep.
+
+    A download that landed in `/tmp` itself could not be swept — the retention
+    rule deletes by age, and `/tmp` holds other processes' files.
+    """
+    from fittrack.channels.telegram.adapter import DEFAULT_DOWNLOAD_DIR
+
+    assert DEFAULT_DOWNLOAD_DIR == DEFAULT_RETRY_DIR
+    assert Path("/tmp") != DEFAULT_RETRY_DIR
 
 
 # --------------------------------------------------------------------------- #
