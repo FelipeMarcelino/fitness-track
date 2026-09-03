@@ -235,6 +235,8 @@ def build_telegram_poller(config: ChannelConfig, *, redis: Any) -> Any:
     `RedisOffsetStore` are both lazy, so this is as safe to unit test as
     `_build_telegram` is.
     """
+    import hashlib
+
     import httpx
 
     from fittrack.channels.telegram.client import DEFAULT_TIMEOUT_SECONDS, TelegramClient
@@ -244,10 +246,16 @@ def build_telegram_poller(config: ChannelConfig, *, redis: Any) -> Any:
     if token is None:
         raise MissingCredentialError("telegram polling needs TELEGRAM_BOT_TOKEN")
 
+    # Not the token itself as the key suffix — same reason `external_id` is
+    # never a Redis key elsewhere in this codebase — just enough of it to tell
+    # two bots apart if a dev Redis volume outlives a `TELEGRAM_BOT_TOKEN`
+    # change (spec 18.2 review).
+    fingerprint = hashlib.sha256(token.get_secret_value().encode()).hexdigest()[:16]
+
     http = httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_SECONDS)
     return TelegramPoller(
         client=TelegramClient(token, http=http),
-        offsets=RedisOffsetStore(redis),
+        offsets=RedisOffsetStore(redis, bot_fingerprint=fingerprint),
     )
 
 

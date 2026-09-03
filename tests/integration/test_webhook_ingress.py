@@ -410,6 +410,39 @@ async def test_a_resolver_without_invalidate_does_not_break_revocation() -> None
     assert revoker.revoked == [(41, 31)]
 
 
+async def test_a_failed_cache_invalidation_does_not_trigger_a_redelivery() -> None:
+    """A retry after a successful revoke would re-`resolve_or_create` against
+    an identity `resolve_or_create` can no longer see (spec 5.2's active-only
+    unique index) and mint a fresh tenant for the account just revoked — the
+    worse of the two outcomes invalidation failing can lead to, so this stays
+    best-effort rather than propagating (S02-T08 review).
+    """
+
+    class ExplodingIdentities:
+        async def resolve_or_create(self, *, channel: str, external_id: str) -> IngressIdentity:
+            return IngressIdentity(tenant_id=31, identity_id=41, external_id_hash=b"h")
+
+        async def invalidate(self, *, channel: str, external_id: str) -> None:
+            raise RuntimeError("redis unavailable")
+
+    seen = FakeDeduplicator()
+    revoker = FakeRevoker()
+    service = TelegramWebhookIngress(
+        channel=FakeChannel([membership_event(status="kicked", update_id=1001)]),
+        deduplicator=seen,
+        identities=ExplodingIdentities(),
+        raw_messages=FakeRawMessages(),
+        buffer=FakeBuffer(),
+        revoker=revoker,
+    )
+
+    await service.receive({"x-secret": "valid"}, b'{"update_id": 1001}')
+
+    assert revoker.revoked == [(41, 31)]
+    assert seen.released == [], "the reservation must not be released over this"
+    assert len(seen.completed) == 1, "the update must still be marked complete"
+
+
 # --------------------------------------------------------------------------- #
 # Callback acknowledgement (spec 18.2 review) — before anything is queued
 # --------------------------------------------------------------------------- #

@@ -243,9 +243,25 @@ class TelegramWebhookIngress:
                     # counter an in-flight fill also checks, so this closes
                     # the race with a concurrent resolve too, not just the
                     # stale-read case.
+                    # Best-effort: a failure here must not re-raise and
+                    # trigger a redelivery. `revoke_identity` already
+                    # committed, and `resolve_or_create` only matches active
+                    # identities (spec 5.2's partial unique index) — a retry
+                    # of *this* update would find none and mint a fresh
+                    # tenant for the account we just finished revoking. A
+                    # stale cache entry for up to its TTL is the smaller of
+                    # the two costs. Tracked for a proper fix in #29's
+                    # follow-up territory: resolving a membership-revocation
+                    # event needs a lookup that includes revoked rows, not
+                    # just a resilient cache invalidation.
                     invalidate = getattr(self._identities, "invalidate", None)
                     if callable(invalidate):
-                        await invalidate(channel=message.channel, external_id=message.external_id)
+                        try:
+                            await invalidate(
+                                channel=message.channel, external_id=message.external_id
+                            )
+                        except Exception:
+                            logger.exception("identity cache invalidation failed after revocation")
                 if not _is_processable(message):
                     continue
                 await self._buffer.append(

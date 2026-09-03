@@ -807,6 +807,30 @@ def test_build_telegram_poller_wires_a_real_poller() -> None:
     assert type(poller).__name__ == "TelegramPoller"
 
 
+def test_build_telegram_poller_namespaces_the_offset_by_bot_token() -> None:
+    """Two bots must not share one offset (S02-T08 review)."""
+    from fittrack.channels.registry import build_telegram_poller
+
+    first = build_telegram_poller(
+        telegram_config(
+            telegram_mode="polling",
+            telegram_webhook_secret=None,
+            telegram_bot_token=StubSecret("a"),
+        ),
+        redis=StubOffsetRedis(),
+    )
+    second = build_telegram_poller(
+        telegram_config(
+            telegram_mode="polling",
+            telegram_webhook_secret=None,
+            telegram_bot_token=StubSecret("b"),
+        ),
+        redis=StubOffsetRedis(),
+    )
+
+    assert first._offsets._key != second._offsets._key
+
+
 def test_build_telegram_poller_requires_the_bot_token() -> None:
     from fittrack.channels.registry import build_telegram_poller
 

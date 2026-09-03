@@ -71,17 +71,22 @@ class OffsetStore(Protocol):
 class RedisOffsetStore:
     """The offset in Redis, so a poller restart resumes instead of replaying.
 
-    The key is bot-global and carries no tenant: Telegram has one update
-    stream per bot, and the update ids in it are global to the bot (spec 18.2).
+    The key carries no tenant — Telegram has one update stream per bot, and
+    the update ids in it are global to the bot (spec 18.2) — but it does
+    carry the bot: a dev Redis volume that outlives a `TELEGRAM_BOT_TOKEN`
+    change must not hand the new bot an old bot's offset, which `getUpdates`
+    would read as "already delivered up to here" and silently discard
+    whatever the new bot's pending updates are below it (spec 18.2 review).
     """
 
-    KEY = "telegram:polling:offset"
+    KEY_PREFIX = "telegram:polling:offset"
 
-    def __init__(self, redis: Any) -> None:
+    def __init__(self, redis: Any, *, bot_fingerprint: str) -> None:
         self._redis = redis
+        self._key = f"{self.KEY_PREFIX}:{bot_fingerprint}"
 
     async def load(self) -> int | None:
-        raw = await self._redis.get(self.KEY)
+        raw = await self._redis.get(self._key)
         if raw is None:
             return None
         if isinstance(raw, bytes):
@@ -89,7 +94,7 @@ class RedisOffsetStore:
         return int(raw)
 
     async def save(self, offset: int) -> None:
-        await self._redis.set(self.KEY, str(offset))
+        await self._redis.set(self._key, str(offset))
 
 
 class TelegramPoller:

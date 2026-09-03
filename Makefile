@@ -120,6 +120,15 @@ migrate-down: ## Roll back one revision. Requires DSN=<disposable database>
 revision: ## Create a new migration: make revision M="what it does"
 	$(PYTHON) -m alembic revision -m "$(M)"
 
-bootstrap: ## Migrate and set up the LangGraph tables. Idempotent.
+# Local-dev only, like every other target in this file: it runs through
+# COMPOSE_DEV (both compose files), so the Telegram reconciliation step reads
+# TELEGRAM_MODE from .env — the dev override's value, not whatever a real,
+# separately-deployed production topology (docker-compose.yml alone,
+# TELEGRAM_MODE hardcoded to webhook) happens to be running. Pointing this at
+# a real deployment's database while .env says polling calls deleteWebhook
+# against that deployment's live bot and stops its webhook traffic (S02-T08
+# review). A real production bootstrap runs scripts.bootstrap directly, with
+# that deployment's own environment — never through this target.
+bootstrap: ## Migrate and set up the LangGraph tables. Idempotent. Local dev only.
 	$(COMPOSE_DEV) run --rm -e MIGRATION_DATABASE_URL="$(OWNER_DSN)" worker \
 		python -m scripts.bootstrap

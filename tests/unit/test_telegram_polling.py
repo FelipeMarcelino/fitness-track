@@ -276,9 +276,38 @@ async def test_run_survives_a_dispatch_failure_and_keeps_going(
     assert RETRY_PAUSE_S in sleeps
 
 
-def test_the_offset_store_names_its_key() -> None:
-    """The key is bot-global by design: Telegram has one update stream per bot."""
-    assert RedisOffsetStore.KEY == "telegram:polling:offset"
+def test_the_offset_store_names_its_key_prefix() -> None:
+    """The key is bot-scoped by design: Telegram has one update stream per bot."""
+    assert RedisOffsetStore.KEY_PREFIX == "telegram:polling:offset"
+
+
+async def test_the_offset_store_namespaces_the_key_by_bot() -> None:
+    """A dev Redis volume that outlives a `TELEGRAM_BOT_TOKEN` change (spec
+    18.2 review) must not hand the new bot the old bot's offset — Telegram
+    treats it as "already delivered up to here" and silently discards
+    whatever the new bot's pending updates are below it.
+    """
+    redis = MemoryRedisKV()
+    first = RedisOffsetStore(redis, bot_fingerprint="bot-a")
+    second = RedisOffsetStore(redis, bot_fingerprint="bot-b")
+
+    await first.save(700)
+
+    assert await first.load() == 700
+    assert await second.load() is None
+
+
+class MemoryRedisKV:
+    """The two Redis commands `RedisOffsetStore` needs, keyed for real."""
+
+    def __init__(self) -> None:
+        self._data: dict[str, str] = {}
+
+    async def get(self, name: str) -> str | None:
+        return self._data.get(name)
+
+    async def set(self, name: str, value: str) -> None:
+        self._data[name] = value
 
 
 async def test_aclose_releases_the_pollers_own_connection_pool() -> None:
