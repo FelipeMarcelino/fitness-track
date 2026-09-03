@@ -231,3 +231,124 @@ async def test_accept_runs_the_same_sequence_as_receive_without_verifying() -> N
     assert len(identities.external_ids) == 1
     assert len(persisted.messages) == 1
     assert len(buffer.envelopes) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Membership revocation (spec 18.2 review) — `my_chat_member` blocked/kicked
+# --------------------------------------------------------------------------- #
+
+
+class FakeRevoker:
+    def __init__(self) -> None:
+        self.revoked: list[tuple[int, int]] = []
+
+    async def revoke_identity(
+        self, *, identity_id: int, tenant_id: int, revoked_at: datetime
+    ) -> None:
+        self.revoked.append((identity_id, tenant_id))
+
+
+def membership_event(*, status: str, update_id: int) -> InboundMessage:
+    """What the adapter hands back for `my_chat_member` — `kind="other"`, raw intact."""
+    return InboundMessage(
+        channel="telegram",
+        external_id="private-chat-id",
+        channel_message_id=f"telegram-update:{update_id}",
+        kind="other",
+        text=None,
+        media_ref=None,
+        button_payload=None,
+        sent_at=datetime(2026, 1, 1, tzinfo=UTC),
+        raw={
+            "update_id": update_id,
+            "my_chat_member": {
+                "chat": {"id": "private-chat-id", "type": "private"},
+                "new_chat_member": {"status": status},
+            },
+        },
+    )
+
+
+async def test_a_block_event_revokes_the_resolved_identity() -> None:
+    seen = FakeDeduplicator()
+    identities = FakeIdentityResolver()
+    persisted = FakeRawMessages()
+    buffer = FakeBuffer()
+    revoker = FakeRevoker()
+    service = TelegramWebhookIngress(
+        channel=FakeChannel([membership_event(status="kicked", update_id=990)]),
+        deduplicator=seen,
+        identities=identities,
+        raw_messages=persisted,
+        buffer=buffer,
+        revoker=revoker,
+    )
+
+    await service.receive({"x-secret": "valid"}, b'{"update_id": 990}')
+
+    assert revoker.revoked == [(41, 31)]
+    assert buffer.envelopes == [], "a membership event is never buffered either way"
+
+
+async def test_a_user_leaving_also_revokes() -> None:
+    """`left` and `kicked` both mean the bot cannot reach this chat anymore."""
+    revoker = FakeRevoker()
+    service = TelegramWebhookIngress(
+        channel=FakeChannel([membership_event(status="left", update_id=994)]),
+        deduplicator=FakeDeduplicator(),
+        identities=FakeIdentityResolver(),
+        raw_messages=FakeRawMessages(),
+        buffer=FakeBuffer(),
+        revoker=revoker,
+    )
+
+    await service.receive({"x-secret": "valid"}, b'{"update_id": 994}')
+
+    assert revoker.revoked == [(41, 31)]
+
+
+async def test_an_ordinary_message_does_not_revoke() -> None:
+    revoker = FakeRevoker()
+    service = TelegramWebhookIngress(
+        channel=FakeChannel([inbound()]),
+        deduplicator=FakeDeduplicator(),
+        identities=FakeIdentityResolver(),
+        raw_messages=FakeRawMessages(),
+        buffer=FakeBuffer(),
+        revoker=revoker,
+    )
+
+    await service.receive({"x-secret": "valid"}, b'{"update_id": 991}')
+
+    assert revoker.revoked == []
+
+
+async def test_a_reachable_membership_change_does_not_revoke() -> None:
+    """`member`/`administrator`/`restricted` are still reachable — only a
+    block or a departure is (`REVOKED_MEMBER_STATUSES`).
+    """
+    revoker = FakeRevoker()
+    service = TelegramWebhookIngress(
+        channel=FakeChannel([membership_event(status="administrator", update_id=992)]),
+        deduplicator=FakeDeduplicator(),
+        identities=FakeIdentityResolver(),
+        raw_messages=FakeRawMessages(),
+        buffer=FakeBuffer(),
+        revoker=revoker,
+    )
+
+    await service.receive({"x-secret": "valid"}, b'{"update_id": 992}')
+
+    assert revoker.revoked == []
+
+
+async def test_without_a_revoker_a_block_event_is_still_persisted_but_not_acted_on() -> None:
+    """The default keeps every caller that predates this feature working."""
+    service, _, _, persisted, buffer = ingress(
+        messages=[membership_event(status="kicked", update_id=993)]
+    )
+
+    await service.receive({"x-secret": "valid"}, b'{"update_id": 993}')
+
+    assert len(persisted.messages) == 1
+    assert buffer.envelopes == []

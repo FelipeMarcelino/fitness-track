@@ -11,6 +11,7 @@ import json
 import secrets
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, ClassVar, Protocol
 
@@ -134,6 +135,15 @@ class FlushScheduler(Protocol):
         """Schedule using the stable job id ``flush:{tenant_id}``."""
 
 
+class IdentityRevoker(Protocol):
+    """Marks an identity unreachable through the security boundary of §19.1."""
+
+    async def revoke_identity(
+        self, *, identity_id: int, tenant_id: int, revoked_at: datetime
+    ) -> None:
+        """Set ``revoked_at``, idempotently, for one identity of one tenant."""
+
+
 class TelegramWebhookIngress:
     """The post-authentication protocol for one Telegram webhook update.
 
@@ -150,6 +160,7 @@ class TelegramWebhookIngress:
         identities: IngressIdentityResolver,
         raw_messages: RawMessageStore,
         buffer: TenantBuffer,
+        revoker: IdentityRevoker | None = None,
     ) -> None:
         if channel.kind != "telegram":
             raise ValueError("TelegramWebhookIngress requires the telegram channel")
@@ -158,6 +169,10 @@ class TelegramWebhookIngress:
         self._identities = identities
         self._raw_messages = raw_messages
         self._buffer = buffer
+        # Optional so every existing fixture that builds one of these keeps
+        # working: a deployment that omits it just never revokes on a block,
+        # which is the status quo `ingress_wiring.py`'s production wiring fixes.
+        self._revoker = revoker
 
     async def receive(self, headers: Mapping[str, str], body: bytes) -> None:
         """Verify, deduplicate and durably accept a Telegram update.
@@ -194,6 +209,17 @@ class TelegramWebhookIngress:
                     identity=identity,
                     message=message,
                 )
+                if self._revoker is not None and _is_membership_revocation(message):
+                    # Ahead of the `_is_processable` gate below: this kind is
+                    # never buffered either way, and revocation is the whole
+                    # reason `my_chat_member` is in `ALLOWED_UPDATES` (spec
+                    # 18.2) — without it, `revoked_at` never moves until the
+                    # next outbound send fails.
+                    await self._revoker.revoke_identity(
+                        identity_id=identity.identity_id,
+                        tenant_id=identity.tenant_id,
+                        revoked_at=datetime.now(UTC),
+                    )
                 if not _is_processable(message):
                     continue
                 await self._buffer.append(
@@ -490,6 +516,33 @@ class SqlRawMessageStore:
         return int(existing)
 
 
+class SqlIdentityRevoker:
+    """`revoke_channel_identity` (migration 0004), reached from the ingress.
+
+    The same SQL function `PostgresOutboundQueueStore.revoke_identity`
+    (services/outbound.py) calls when a send discovers the block reactively.
+    A separate, narrow class rather than reusing that one: it bundles retry
+    and dead-letter concerns the ingress has no reason to depend on, and this
+    is the one method of it ingress needs.
+    """
+
+    def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
+        self._sessions = sessions
+
+    async def revoke_identity(
+        self, *, identity_id: int, tenant_id: int, revoked_at: datetime
+    ) -> None:
+        from fittrack.db.engine import tenant_session
+
+        async with tenant_session(self._sessions, tenant_id) as session:
+            revoked = await session.scalar(
+                text("SELECT revoke_channel_identity(:identity_id, :tenant_id, :revoked_at)"),
+                {"identity_id": identity_id, "tenant_id": tenant_id, "revoked_at": revoked_at},
+            )
+            if revoked is not True:
+                raise LookupError("identity does not belong to tenant")
+
+
 _COMPLETE_RESERVATION = """
 if redis.call('GET', KEYS[1]) == ARGV[1] then
   redis.call('SET', KEYS[1], 'completed', 'EX', ARGV[2])
@@ -588,6 +641,33 @@ def _seen_key(update_id: int) -> str:
 def _is_processable(message: InboundMessage) -> bool:
     """Keep reactions and unsupported media out of the graph buffer."""
     return message.kind in {"text", "voice", "button_reply"}
+
+
+# The statuses that mean the bot can no longer reach this chat. `restricted`
+# and `administrator` are membership changes too, but reachable ones — only
+# these two say every future send from `deliver` would refuse (spec 18.4's
+# ACCOUNT class), which is the same condition an outbound failure discovers
+# reactively, just found out about it first (spec 18.2).
+REVOKED_MEMBER_STATUSES = frozenset({"kicked", "left"})
+
+
+def _is_membership_revocation(message: InboundMessage) -> bool:
+    """Whether this is Telegram's `my_chat_member` telling us we were blocked.
+
+    Read from `message.raw`, deliberately: the adapter leaves `kind="other"`
+    here on purpose (S02-T02's `test_a_block_is_recorded_so_the_identity_can_
+    be_revoked`; "the adapter writes nothing, it makes the event visible with
+    its payload intact so the layer that owns identity can act on it") —
+    translating the raw event into a neutral `kind` would be a channel
+    deciding, at parse time, something only this Telegram-specific ingress
+    needs to know. `TelegramWebhookIngress` already knows it is Telegram; a
+    channel-neutral caller of `_is_processable` never would.
+    """
+    event = message.raw.get("my_chat_member")
+    if not isinstance(event, dict):
+        return False
+    new_status = (event.get("new_chat_member") or {}).get("status")
+    return new_status in REVOKED_MEMBER_STATUSES
 
 
 def _envelope(

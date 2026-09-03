@@ -3,14 +3,17 @@
 This is the claim the sprint's exit criterion makes about the whole pipeline,
 not about any one piece of it: a Telegram update handed to the real,
 fully-wired ingress ends up as a `processing_batch` row marked `done`, through
-real Postgres and real Redis.
+the real ARQ queue the worker container consumes — real Postgres and real
+Redis, and the same `flush_check`/`process_batch` job functions, `on_startup`
+and `on_shutdown` the deployed worker registers (`fittrack.worker.WorkerSettings`).
 
-`flush_check` and `process_batch` are called directly rather than through
-ARQ's queue: the point here is the pipeline's correctness end to end, and
-ARQ's own wiring (job ids, retries, the worker's `ctx`) is already
-`tests/integration/test_process_batch.py`'s job. Calling the same production
-functions the worker calls, just not through the queue, is what keeps this a
-smoke test of the pipeline instead of a second copy of that suite.
+Driven with `arq`'s own `Worker` in burst mode rather than by calling
+`flush_check`/`process_batch` as plain functions: a version of this test that
+called them directly passed even while the worker's container command ran
+only a heartbeat loop and never started the ARQ consumer at all (the bug
+S02-T08 review found) — updates sat in the Redis buffer forever in that
+deployment, and a direct-call test could not have caught it. Going through
+the queue is what makes this a smoke test of the *deployed* path.
 """
 
 from __future__ import annotations
@@ -24,15 +27,13 @@ from pathlib import Path
 
 import asyncpg
 import pytest
+from arq.worker import Worker
 
-from fittrack.db.engine import session_factory
+from fittrack import worker as worker_module
 from fittrack.ingress_wiring import open_telegram_runtime
-from fittrack.security.crypto import ColumnCipher, Keyring
 from fittrack.security.identity_hash import identity_hash
-from fittrack.services.batch import PostgresBatchStore, persist_batch, process_batch
-from fittrack.services.debounce import flush_check
+from fittrack.services.batch import PostgresBatchStore
 from fittrack.settings import Settings
-from fittrack.worker import ArqFlushScheduler
 from tests.conftest import HOST, verified_dsn
 
 CONFIG_DIR = Path(__file__).resolve().parents[2] / "config"
@@ -141,30 +142,41 @@ async def test_a_webhook_update_becomes_a_done_batch(
         )
         assert raw_message_count == 1
 
-        # The debounce window above is 1s; outlast it so `flush_check` drains
-        # instead of re-enqueuing (spec 17.1).
+        # `accept()` scheduled a real `flush_check` job, deferred by the 1s
+        # debounce window above; outlast it so the burst worker below finds it
+        # ready rather than still in the future (spec 17.1).
         await asyncio.sleep(1.2)
 
-        drain = await flush_check(
-            tenant_id=tenant_id,
-            redis=runtime.redis,
-            scheduler=ArqFlushScheduler(runtime.redis, chained=True),
-            debounce_window_s=settings.debounce_window_s,
+        # The same functions, `on_startup` and `on_shutdown`
+        # `fittrack.worker.WorkerSettings` registers — burst mode drains the
+        # queue and returns, which is what makes this the worker container's
+        # actual consumption path rather than a hand assembled substitute.
+        # `flush_check`'s own job enqueues `process_batch` mid-run; burst mode
+        # keeps polling until the queue is empty, so it catches that too.
+        burst_worker = Worker(
+            functions=[worker_module.flush_check, worker_module.process_batch],
+            redis_pool=runtime.redis,
+            on_startup=worker_module.worker_startup,
+            on_shutdown=worker_module.worker_shutdown,
+            burst=True,
+            poll_delay=0.1,
+            handle_signals=False,
         )
-        assert drain is not None, "the buffer must have held the message accept() appended"
-        assert len(drain.items) == 1
+        try:
+            await burst_worker.async_run()
+            store = burst_worker.ctx["batch_store"]
+            assert isinstance(store, PostgresBatchStore)
 
-        cipher = ColumnCipher(Keyring.from_settings(settings))
-        store = PostgresBatchStore(session_factory(runtime.engine))
-        batch_id = await persist_batch(drain=drain, tenant_id=tenant_id, cipher=cipher, store=store)
-        assert batch_id is not None
+            batch_id = await owner.fetchval(
+                "SELECT id FROM processing_batch WHERE tenant_id = $1 ORDER BY id DESC LIMIT 1",
+                tenant_id,
+            )
+            assert batch_id is not None, "flush_check must have persisted a batch"
 
-        await process_batch(
-            tenant_id=tenant_id, batch_id=batch_id, redis=runtime.redis, store=store
-        )
-
-        row = await store.get(batch_id=batch_id, tenant_id=tenant_id)
-        assert row is not None
-        assert row.status == "done"
+            row = await store.get(batch_id=batch_id, tenant_id=tenant_id)
+            assert row is not None
+            assert row.status == "done"
+        finally:
+            await burst_worker.close()
     finally:
         await runtime.aclose()

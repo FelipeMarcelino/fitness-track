@@ -27,6 +27,7 @@ from fittrack.services.webhook import (
     CachedIdentityResolver,
     RedisTenantBuffer,
     RedisUpdateDeduplicator,
+    SqlIdentityRevoker,
     SqlRawMessageStore,
     TelegramWebhookIngress,
 )
@@ -81,6 +82,9 @@ def test_build_telegram_components_wires_the_documented_collaborators() -> None:
     assert isinstance(ingress._identities, CachedIdentityResolver)
     assert isinstance(ingress._raw_messages, SqlRawMessageStore)
     assert isinstance(ingress._buffer, RedisTenantBuffer)
+    # Without this, a `my_chat_member` block is persisted and never acted on
+    # (spec 18.2 review) — `revoked_at` would only ever move reactively.
+    assert isinstance(ingress._revoker, SqlIdentityRevoker)
 
 
 def test_build_telegram_components_hashes_identities_with_the_given_pepper() -> None:

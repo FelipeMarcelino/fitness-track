@@ -39,6 +39,7 @@ from fittrack.services.webhook import (
     DatabaseIdentityResolver,
     RedisTenantBuffer,
     RedisUpdateDeduplicator,
+    SqlIdentityRevoker,
     SqlRawMessageStore,
     TelegramWebhookIngress,
 )
@@ -88,6 +89,11 @@ def build_telegram_components(
         buffer=RedisTenantBuffer(
             redis=redis, scheduler=scheduler, debounce_window_s=debounce_window_s
         ),
+        # Without this, `revoked_at` only ever moves reactively, from a failed
+        # send (services/outbound.py) — never from Telegram telling us
+        # directly via `my_chat_member`, which is the whole reason that update
+        # type is in `ALLOWED_UPDATES` (spec 18.2 review).
+        revoker=SqlIdentityRevoker(sessions),
     )
 
 

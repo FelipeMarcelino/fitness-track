@@ -50,9 +50,11 @@ ALLOWED_UPDATES = ("message", "callback_query", "message_reaction", "my_chat_mem
 # would turn it into an error loop.
 POLL_TIMEOUT_S = 25
 
-# The pause after an API-level refusal. A 409 or a 5xx retried at full speed
-# is a busy loop with a log line; the webhook reconciliation is a human fix,
-# and the backoff only needs to keep the loop polite while it waits.
+# The pause after any failed attempt — a 409, a refused connection, a
+# malformed response, or `dispatch` itself raising. Every one of them retried
+# at full speed is a busy loop with a log line; the fix for most of them is a
+# human's (the webhook reconciliation, a database coming back), and the
+# backoff only needs to keep the loop polite while it waits.
 RETRY_PAUSE_S = 5.0
 
 
@@ -142,32 +144,53 @@ class TelegramPoller:
         await self._client.aclose()
 
     async def run(self, dispatch: Any) -> None:
-        """Poll until cancelled. A transport error is retried, never fatal.
+        """Poll until cancelled. Nothing short of cancellation is fatal.
 
-        A 409 or a repeated API error is logged and paused rather than raised:
+        A refused connection, a malformed response, a 409, or `dispatch`
+        itself failing (a transient Redis or Postgres outage, an
+        `UpdateInFlightError`) are all logged and paused rather than raised:
         this loop is the process's reason to exist, and the alternative — a
-        poller that dies on the first hiccup — turns a dev machine into a
-        silent no-op until somebody notices the bot stopped answering.
+        background task that dies quietly on the first hiccup while the
+        ingress keeps answering `/health` — turns a dev machine into a silent
+        no-op until somebody notices the bot stopped answering. `poll_once`
+        already leaves the offset unadvanced on any of these, so Telegram
+        replays the update once the loop is polling again; the guarantee this
+        method exists to keep is that it *is* polling again.
 
-        One `sleep(0)` per iteration is a yield point, not a pause: a real
-        `getUpdates` suspends for the whole long poll, but a transport that
-        answers instantly (a fake in a test, a broken intermediary) would
-        otherwise spin this loop without ever returning to the event loop —
-        starving the very shutdown that is supposed to stop it.
+        Every branch pauses `RETRY_PAUSE_S` before the next attempt — a
+        refused connection or a DNS failure returns instantly, and retrying
+        it with no delay is a busy loop with a log line, not a poller. The
+        long poll's own client-side timeout lands in the same branch, and
+        pays the same pause on the rare occasion it fires; that is the cost
+        of one bound serving every kind of transport failure instead of
+        needing to tell them apart.
+
+        One `sleep(0)` at the top of every iteration is a yield point, not a
+        pause: a real `getUpdates` suspends for the whole long poll, but a
+        transport that answers instantly (a fake in a test, a broken
+        intermediary) would otherwise spin this loop without ever returning
+        to the event loop — starving the very shutdown that is supposed to
+        stop it.
         """
         while True:
             await asyncio.sleep(0)
             try:
                 await self.poll_once(dispatch)
             except TelegramTransportError as error:
-                # The long poll's own timeout arrives here when no update came;
-                # logging it at INFO would be a line per quiet half-minute.
                 logger.debug("poll interrupted, retrying", exc_info=error)
+                await asyncio.sleep(RETRY_PAUSE_S)
             except TelegramApiError as error:
                 logger.error(
                     "getUpdates refused; is a webhook still registered? (bootstrap reconciles)",
                     extra={"status_code": error.status_code},
                 )
+                await asyncio.sleep(RETRY_PAUSE_S)
+            except Exception:
+                # `dispatch` is `ingress.accept`: a bug in it, or the database
+                # or Redis it depends on, must pause and retry exactly like a
+                # transport failure — not end the task the ingress never
+                # awaits and so never learns died (spec 18.2 review).
+                logger.exception("dispatch failed; the update will be replayed")
                 await asyncio.sleep(RETRY_PAUSE_S)
 
     # --- internals --------------------------------------------------------- #

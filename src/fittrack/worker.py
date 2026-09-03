@@ -19,13 +19,20 @@ happen.  Two rules run through this module:
 * ``Retry`` is the only way a handler asks to be run again; returning normally
   after a failure is ARQ's definition of success.
 
-NOTE: The production entry point (main → run_until_signalled) does not yet
-start the registered ARQ consumer. S02-T08 switches the container entry point
-to ``arq fittrack.worker.WorkerSettings`` during bootstrap integration.
+``main()`` runs the registered ARQ consumer via ``arq``'s own ``run_worker``
+(S02-T08) — the container entry point (``python -m fittrack.worker``) needs no
+change, since ``run_worker`` is what ``arq fittrack.worker.WorkerSettings``
+calls internally too. The heartbeat rides along inside it: ``worker_startup``
+starts ``heartbeat_loop`` as a background task and ``worker_shutdown`` cancels
+it, so the container healthcheck keeps working under a process that spends
+almost all of its time polling Redis rather than sleeping in a loop of its
+own.
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 from dataclasses import replace
 from datetime import timedelta
@@ -36,13 +43,13 @@ import httpx
 from arq import ArqRedis, Retry, cron, func
 from arq.connections import RedisSettings
 from arq.cron import CronJob
-from arq.worker import Function
+from arq.worker import Function, run_worker
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from fittrack.channels.registry import ChannelRegistry, ChannelRegistryError
 from fittrack.config import Config, ConfigError
 from fittrack.db.engine import get_engine, session_factory
-from fittrack.runtime import DEFAULT_INTERVAL_S, heartbeat_loop, run_until_signalled
+from fittrack.runtime import DEFAULT_INTERVAL_S, heartbeat_loop
 from fittrack.security.crypto import ColumnCipher, Keyring
 from fittrack.services.batch import (
     BatchEnqueuer,
@@ -264,12 +271,22 @@ def build_voice_ingestion(
 
 
 async def worker_startup(ctx: dict[str, Any]) -> None:
-    """Validate configuration and inject durable ARQ worker dependencies."""
+    """Validate configuration and inject durable ARQ worker dependencies.
+
+    An invalid deployment must not report healthy: `startup` runs before the
+    heartbeat task does, so a bad environment fails the container before it
+    ever beats — the same guarantee `run_until_signalled` gives the ingress
+    and the scheduler.
+    """
     settings, config = startup("worker")
     engine = get_engine(settings)
     ctx["db_engine"] = engine
     ctx["batch_store"] = PostgresBatchStore(session_factory(engine))
     ctx["voice"] = build_voice_ingestion(ctx, settings, config)
+    # ARQ's own loop spends most of its time polling Redis, not sleeping in a
+    # loop of its own — the heartbeat needs to run alongside it, inside the
+    # same event loop `on_startup`/`on_shutdown` already run in.
+    ctx["_heartbeat_task"] = asyncio.create_task(heartbeat_loop(HEARTBEAT))
 
 
 async def sweep_voice_audio(ctx: dict[str, Any]) -> None:
@@ -290,6 +307,11 @@ async def sweep_voice_audio(ctx: dict[str, Any]) -> None:
 
 async def worker_shutdown(ctx: dict[str, Any]) -> None:
     """Dispose the worker's database pool and HTTP clients cleanly."""
+    heartbeat_task = ctx.pop("_heartbeat_task", None)
+    if isinstance(heartbeat_task, asyncio.Task):
+        heartbeat_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat_task
     engine = ctx.pop("db_engine", None)
     ctx.pop("batch_store", None)
     ctx.pop("voice", None)
@@ -456,10 +478,13 @@ async def run(heartbeat: Path = HEARTBEAT, interval_s: float = DEFAULT_INTERVAL_
 
 
 def main() -> None:
-    # Before the first beat: a service that reports healthy on an invalid
-    # deployment is worse than one that never starts.
+    # Before the first job: a service that reports healthy on an invalid
+    # deployment is worse than one that never starts. `worker_startup` (ARQ's
+    # `on_startup` hook, below) validates again once the consumer itself is
+    # running — that second check is what actually gates the heartbeat and the
+    # first job, this one is the fast fail before a Redis pool is even opened.
     startup("worker")
-    run_until_signalled(HEARTBEAT)
+    run_worker(_worker_settings())
 
 
 if __name__ == "__main__":

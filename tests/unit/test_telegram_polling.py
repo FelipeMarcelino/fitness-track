@@ -29,6 +29,7 @@ from fittrack.channels.telegram.client import TelegramApiError, TelegramClient
 from fittrack.channels.telegram.polling import (
     ALLOWED_UPDATES,
     POLL_TIMEOUT_S,
+    RETRY_PAUSE_S,
     RedisOffsetStore,
     TelegramPoller,
 )
@@ -184,12 +185,33 @@ async def test_a_webhook_conflict_is_reported_not_swallowed() -> None:
     assert caught.value.status_code == 409
 
 
-async def test_run_survives_a_transport_error_and_keeps_going() -> None:
-    """A long poll that times out is the quiet case, not a crash of the service."""
+async def test_run_survives_a_transport_error_and_keeps_going(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refused connection or a client timeout pauses and retries, not dies.
+
+    The pause itself is faked out — a real `RETRY_PAUSE_S` here would make
+    this test slow without proving anything the recorded call doesn't already
+    prove — but its *use* is exactly the review finding this guards: a
+    transport failure that returned instantly must not spin the loop at full
+    speed (spec 18.2 review).
+    """
     import asyncio
 
     script = Scripted([httpx.ReadTimeout("long poll expired"), [update(900)], []])
     offsets = MemoryOffsets()
+    sleeps: list[float] = []
+
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(delay: float) -> None:
+        # Records the requested pause without actually waiting it out — but
+        # still yields once, for real: a fake with no `await` inside never
+        # suspends, and the task under test would then never get a turn.
+        sleeps.append(delay)
+        await real_sleep(0)
+
+    monkeypatch.setattr("fittrack.channels.telegram.polling.asyncio.sleep", fake_sleep)
 
     async def dispatch(payload: dict[str, Any]) -> None:
         return None
@@ -204,6 +226,54 @@ async def test_run_survives_a_transport_error_and_keeps_going() -> None:
         await task
 
     assert offsets.saved == [901]
+    assert RETRY_PAUSE_S in sleeps
+
+
+async def test_run_survives_a_dispatch_failure_and_keeps_going(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`dispatch` failing — a transient Redis or Postgres outage, an
+    `UpdateInFlightError` — must pause and retry, the same as a transport
+    failure, rather than silently end the task the ingress never awaits and
+    so never learns died (spec 18.2 review).
+    """
+    import asyncio
+
+    script = Scripted([[update(950)], [update(950)], []])
+    offsets = MemoryOffsets()
+    sleeps: list[float] = []
+    attempts = 0
+
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(delay: float) -> None:
+        # Records the requested pause without actually waiting it out — but
+        # still yields once, for real: a fake with no `await` inside never
+        # suspends, and the task under test would then never get a turn.
+        sleeps.append(delay)
+        await real_sleep(0)
+
+    monkeypatch.setattr("fittrack.channels.telegram.polling.asyncio.sleep", fake_sleep)
+
+    async def flaky_dispatch(payload: dict[str, Any]) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("redis unavailable")
+
+    task = asyncio.create_task(poller(script, offsets).run(flaky_dispatch))
+    for _ in range(200):
+        if offsets.saved:
+            break
+        await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert attempts >= 2, "the loop must retry dispatch rather than end the task"
+    # 950 replayed (never confirmed) until the second attempt confirmed it.
+    assert offsets.saved == [951]
+    assert RETRY_PAUSE_S in sleeps
 
 
 def test_the_offset_store_names_its_key() -> None:
