@@ -183,6 +183,46 @@ async def test_flush_check_drains_buffer_when_debounce_expired() -> None:
     assert await redis.get("lock:1") is None
 
 
+async def test_flush_check_reschedules_a_buffer_refilled_during_the_drain_handler() -> None:
+    """A message that arrives while `drain_handler` is still running (voice
+    transcription is not instant) renews `buffer:1` under this job's own
+    stable id — which ARQ's `enqueue_job` dedup silently swallows while the
+    id is held (spec 18.2 review). Without this, nothing checks the buffer
+    again until `BUFFER_TTL_S` quietly discards it.
+    """
+    redis = FakeRedis()
+    scheduler = FakeScheduler()
+    await redis.rpush("buffer:1", _buffer_item(1))
+
+    async def handler(drain: DrainResult) -> None:
+        # Simulates the ingress appending while this handler is still running.
+        await redis.rpush("buffer:1", _buffer_item(99))
+
+    result = await flush_check(
+        tenant_id=1,
+        redis=redis,
+        scheduler=scheduler,
+        debounce_window_s=10,
+        drain_handler=handler,
+    )
+
+    assert result is not None
+    assert len(result.items) == 1
+    assert scheduler.calls == [(1, 10)]
+
+
+async def test_flush_check_does_not_reschedule_an_empty_buffer_after_a_clean_drain() -> None:
+    """The common case: nothing arrived during the drain, nothing to chase."""
+    redis = FakeRedis()
+    scheduler = FakeScheduler()
+    await redis.rpush("buffer:1", _buffer_item(1))
+
+    result = await flush_check(tenant_id=1, redis=redis, scheduler=scheduler, debounce_window_s=10)
+
+    assert result is not None
+    assert scheduler.calls == []
+
+
 async def test_flush_check_reenqueues_when_lock_is_busy() -> None:
     """Another worker holds the lock → re-enqueue with shorter delay (§17.3)."""
     redis = FakeRedis()

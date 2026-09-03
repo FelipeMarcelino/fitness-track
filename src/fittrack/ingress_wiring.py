@@ -14,8 +14,8 @@ Split in two on purpose:
   a unit test.
 
 Neither function names a concrete Telegram type. `fittrack.channels.registry`
-— `ChannelRegistry` and `build_telegram_poller` — is the one door into
-`channels/` this module uses, exactly as
+— `ChannelRegistry`, `build_telegram_poller`, `bot_fingerprint` — is the one
+door into `channels/` this module uses, exactly as
 `tests/unit/test_channel_contract.py` requires of everything outside it.
 """
 
@@ -30,7 +30,7 @@ from typing import Any
 from arq import create_pool
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from fittrack.channels.registry import ChannelRegistry, build_telegram_poller
+from fittrack.channels.registry import ChannelRegistry, bot_fingerprint, build_telegram_poller
 from fittrack.db.engine import get_engine, session_factory
 from fittrack.security.crypto import ColumnCipher, Keyring
 from fittrack.security.identity_hash import identity_hash
@@ -64,6 +64,7 @@ def build_telegram_components(
     cipher: ColumnCipher,
     pepper: bytes,
     debounce_window_s: int,
+    bot_fingerprint: str,
 ) -> TelegramWebhookIngress:
     """Compose the webhook ingress from already-open collaborators.
 
@@ -71,6 +72,10 @@ def build_telegram_components(
     buffer, and the identity cache — because all three are the same handful
     of Redis commands against the same pool; splitting it into three clients
     would only be three pools to open and close for no isolation gained.
+
+    `bot_fingerprint` is the same value `channels.registry.bot_fingerprint`
+    derives for the poller's offset store — the dedup reservation is
+    namespaced by it too, for the identical reason (spec 18.2 review).
     """
     scheduler = ArqFlushScheduler(redis)
     identities = CachedIdentityResolver(
@@ -83,7 +88,7 @@ def build_telegram_components(
     )
     return TelegramWebhookIngress(
         channel=channel,
-        deduplicator=RedisUpdateDeduplicator(redis),
+        deduplicator=RedisUpdateDeduplicator(redis, bot_fingerprint=bot_fingerprint),
         identities=identities,
         raw_messages=SqlRawMessageStore(sessions=sessions, cipher=cipher),
         buffer=RedisTenantBuffer(
@@ -149,6 +154,10 @@ async def open_telegram_runtime(settings: Settings) -> TelegramRuntime | None:
     sessions = session_factory(engine)
     cipher = ColumnCipher(Keyring.from_settings(settings))
     pepper = settings.fittrack_identity_pepper.get_secret_value().encode()
+    token = settings.telegram_bot_token
+    if token is None:  # pragma: no cover - Settings already refuses to boot without it
+        raise RuntimeError("telegram is enabled but TELEGRAM_BOT_TOKEN is unset")
+    fingerprint = bot_fingerprint(token)
 
     # Pings on construction (spec 18.2's "fail before serving"): a Redis this
     # process cannot reach must stop the ingress from reporting healthy, the
@@ -162,6 +171,7 @@ async def open_telegram_runtime(settings: Settings) -> TelegramRuntime | None:
         cipher=cipher,
         pepper=pepper,
         debounce_window_s=settings.debounce_window_s,
+        bot_fingerprint=fingerprint,
     )
 
     runtime = TelegramRuntime(ingress=ingress, channel=channel, redis=redis, engine=engine)

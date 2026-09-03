@@ -57,6 +57,7 @@ __all__ = [
     "ChannelRegistryError",
     "ChannelUnavailableError",
     "MissingCredentialError",
+    "bot_fingerprint",
     "build_telegram_poller",
 ]
 
@@ -223,6 +224,20 @@ def _build_telegram(config: ChannelConfig) -> Channel:
     )
 
 
+def bot_fingerprint(token: SecretStr) -> str:
+    """Enough of `TELEGRAM_BOT_TOKEN` to tell two bots apart, never the token.
+
+    Not the token itself — same reason `external_id` is never a Redis key
+    elsewhere in this codebase. Every Redis key this process derives from the
+    bot (the poller's offset, the webhook dedup reservation) is namespaced by
+    this, so a dev Redis volume that outlives a `TELEGRAM_BOT_TOKEN` change
+    cannot hand the new bot the old bot's state (spec 18.2 review).
+    """
+    import hashlib
+
+    return hashlib.sha256(token.get_secret_value().encode()).hexdigest()[:16]
+
+
 def build_telegram_poller(config: ChannelConfig, *, redis: Any) -> Any:
     """The dev-only `getUpdates` transport of S02-T08, wired the way `_build_telegram` is.
 
@@ -235,8 +250,6 @@ def build_telegram_poller(config: ChannelConfig, *, redis: Any) -> Any:
     `RedisOffsetStore` are both lazy, so this is as safe to unit test as
     `_build_telegram` is.
     """
-    import hashlib
-
     import httpx
 
     from fittrack.channels.telegram.client import DEFAULT_TIMEOUT_SECONDS, TelegramClient
@@ -246,11 +259,7 @@ def build_telegram_poller(config: ChannelConfig, *, redis: Any) -> Any:
     if token is None:
         raise MissingCredentialError("telegram polling needs TELEGRAM_BOT_TOKEN")
 
-    # Not the token itself as the key suffix — same reason `external_id` is
-    # never a Redis key elsewhere in this codebase — just enough of it to tell
-    # two bots apart if a dev Redis volume outlives a `TELEGRAM_BOT_TOKEN`
-    # change (spec 18.2 review).
-    fingerprint = hashlib.sha256(token.get_secret_value().encode()).hexdigest()[:16]
+    fingerprint = bot_fingerprint(token)
 
     http = httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_SECONDS)
     return TelegramPoller(

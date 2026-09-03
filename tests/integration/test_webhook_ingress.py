@@ -14,6 +14,7 @@ from fittrack.services.webhook import (
     DedupReservation,
     DedupState,
     IngressIdentity,
+    RedisUpdateDeduplicator,
     TelegramWebhookIngress,
     UpdateInFlightError,
 )
@@ -540,3 +541,40 @@ async def test_a_channel_without_answer_callback_does_not_break_button_replies()
     await service.receive({"x-secret": "valid"}, b'{"update_id": 1000}')
 
     assert len(buffer.envelopes) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Deduplication namespaced by bot (spec 18.2 review)
+# --------------------------------------------------------------------------- #
+
+
+class KeyRecordingRedis:
+    """The Redis surface `RedisUpdateDeduplicator.reserve` needs, kept real."""
+
+    def __init__(self) -> None:
+        self._data: dict[str, str] = {}
+
+    async def set(self, name: str, value: str, *, ex: int, nx: bool = False) -> bool | None:
+        if nx and name in self._data:
+            return False
+        self._data[name] = value
+        return True
+
+    async def get(self, name: str) -> str | None:
+        return self._data.get(name)
+
+
+async def test_the_deduplicator_namespaces_its_key_by_bot() -> None:
+    """A dev Redis volume that outlives a `TELEGRAM_BOT_TOKEN` change must not
+    hand the new bot the old bot's completed reservation — `reserve` would
+    report an update the new bot never saw as an already-processed duplicate
+    and silently drop it.
+    """
+    redis = KeyRecordingRedis()
+    old_bot = RedisUpdateDeduplicator(redis, bot_fingerprint="bot-a")  # type: ignore[arg-type]
+    new_bot = RedisUpdateDeduplicator(redis, bot_fingerprint="bot-b")  # type: ignore[arg-type]
+
+    await old_bot.reserve(500)
+    reservation = await new_bot.reserve(500)
+
+    assert reservation.state is DedupState.ACQUIRED

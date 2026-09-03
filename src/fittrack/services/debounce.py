@@ -252,4 +252,13 @@ async def flush_check(
         if drain_handler is not None:
             await drain_handler(result)
         await redis.delete(drain_key)
+        # A message can arrive while `drain_handler` runs (voice transcription
+        # is not instant): the ingress renews `buffer:{tenant_id}` under this
+        # job's own stable id, which ARQ's `enqueue_job` dedup silently
+        # swallows while that id is still held (worker.py's module
+        # docstring) — so this successful return is the last chance to
+        # notice a refilled buffer before nothing checks it again until
+        # BUFFER_TTL_S quietly discards it (spec 18.2 review).
+        if await redis.lrange(buffer_key, 0, 0):
+            await scheduler.schedule_flush_check(tenant_id=tenant_id, delay_s=debounce_window_s)
         return result

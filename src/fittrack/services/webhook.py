@@ -357,26 +357,39 @@ class CachedIdentityResolver:
 
 
 class RedisUpdateDeduplicator:
-    """Redis ``SET NX EX`` reservation for global Telegram update ids."""
+    """Redis ``SET NX EX`` reservation for global Telegram update ids.
+
+    Namespaced by ``bot_fingerprint``: update ids are global to *one* bot's
+    stream (module docstring of the key builder below), and a dev Redis
+    volume that outlives a `TELEGRAM_BOT_TOKEN` change must not let the new
+    bot inherit the old one's completed reservations — that would make
+    `reserve` report an update the new bot never saw as an already-processed
+    duplicate, silently dropping it (spec 18.2 review).
+    """
 
     def __init__(
         self,
         redis: RedisIngressClient,
         *,
+        bot_fingerprint: str,
         ttl_s: int = DEDUP_TTL_S,
         processing_ttl_s: int = PROCESSING_TTL_S,
     ) -> None:
         if ttl_s <= 0 or processing_ttl_s <= 0:
             raise ValueError("deduplication TTL must be positive")
         self._redis = redis
+        self._bot_fingerprint = bot_fingerprint
         self._ttl_s = ttl_s
         self._processing_ttl_s = processing_ttl_s
+
+    def _key(self, update_id: int) -> str:
+        return _seen_key(update_id, self._bot_fingerprint)
 
     async def reserve(self, update_id: int) -> DedupReservation:
         if update_id < 0:
             raise ValueError("Telegram update_id must be non-negative")
         token = f"processing:{secrets.token_urlsafe(16)}"
-        key = _seen_key(update_id)
+        key = self._key(update_id)
         reserved = await self._redis.set(key, token, nx=True, ex=self._processing_ttl_s)
         if reserved:
             return DedupReservation(update_id, DedupState.ACQUIRED, token)
@@ -391,7 +404,7 @@ class RedisUpdateDeduplicator:
         changed = await self._redis.eval(
             _COMPLETE_RESERVATION,
             1,
-            _seen_key(reservation.update_id),
+            self._key(reservation.update_id),
             reservation.token,
             self._ttl_s,
         )
@@ -401,7 +414,7 @@ class RedisUpdateDeduplicator:
         if reservation.state is not DedupState.ACQUIRED or reservation.token is None:
             return
         await self._redis.eval(
-            _RELEASE_RESERVATION, 1, _seen_key(reservation.update_id), reservation.token
+            _RELEASE_RESERVATION, 1, self._key(reservation.update_id), reservation.token
         )
 
 
@@ -675,9 +688,9 @@ def _update_id(payload: Mapping[str, Any]) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 
-def _seen_key(update_id: int) -> str:
-    """Telegram update ids are bot-global, so no external identifier is needed."""
-    return f"seen:telegram:{update_id}"
+def _seen_key(update_id: int, bot_fingerprint: str) -> str:
+    """Telegram update ids are global to one bot's stream, not across bots."""
+    return f"seen:telegram:{bot_fingerprint}:{update_id}"
 
 
 def _is_processable(message: InboundMessage) -> bool:

@@ -74,6 +74,7 @@ def test_build_telegram_components_wires_the_documented_collaborators() -> None:
         cipher=cipher,
         pepper=b"p" * 32,
         debounce_window_s=10,
+        bot_fingerprint="abc123",
     )
 
     assert isinstance(ingress, TelegramWebhookIngress)
@@ -85,6 +86,10 @@ def test_build_telegram_components_wires_the_documented_collaborators() -> None:
     # Without this, a `my_chat_member` block is persisted and never acted on
     # (spec 18.2 review) — `revoked_at` would only ever move reactively.
     assert isinstance(ingress._revoker, SqlIdentityRevoker)
+    # Without this, a dev Redis volume that outlives a TELEGRAM_BOT_TOKEN
+    # change hands the new bot the old bot's completed reservations (spec
+    # 18.2 review).
+    assert ingress._deduplicator._bot_fingerprint == "abc123"
 
 
 def test_build_telegram_components_hashes_identities_with_the_given_pepper() -> None:
@@ -105,6 +110,7 @@ def test_build_telegram_components_hashes_identities_with_the_given_pepper() -> 
         cipher=cipher,
         pepper=b"p" * 32,
         debounce_window_s=10,
+        bot_fingerprint="abc123",
     )
 
     resolver: Any = ingress._identities
