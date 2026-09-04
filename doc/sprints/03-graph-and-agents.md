@@ -622,16 +622,23 @@ função SQL `SECURITY DEFINER` com `FOR UPDATE SKIP LOCKED`, lease e ordenaçã
 de `outbound_queue` — a policy da `_0002` compara `tenant_id = NULLIF(current_setting(...))`, e `NULL`
 nunca é verdadeiro. **A query global de elegibilidade da §18.4 não pode ser emitida pela aplicação.**
 Precisa da fronteira pré-tenant da §19.1. Este é o achado que une esta tarefa à T18 e às
-[ambiguidades #5 e #8](#a-fronteira-de-manutenção-cross-tenant).
+[ambiguidades #5 e #8](#a-fronteira-de-manutenção-cross-tenant). E trocar o papel efetivo não basta:
+`FORCE ROW LEVEL SECURITY` vale também para o dono da tabela, e uma função `SECURITY DEFINER` de dono
+`NOBYPASSRLS` continuaria vendo zero linhas — o mecanismo efetivo da fronteira é o `BYPASSRLS` do dono,
+num papel `NOLOGIN` de raio limitado por grants, exatamente como a `fittrack_identity` da `_0002`
+(o comentário da migração é explícito: `BYPASSRLS` existe "so the two functions can see
+`channel_identity` before there is an `app.tenant_id` to see it with").
 
 **Spec.** §18.4, §17.4, §19.1, §5.2. Issue #29.
 
 **Depende de:** nada fora da trilha.
 
 **Arquivos previstos:** criar `db/migrations/versions/_0006_outbound_claim.py` (role
-`fittrack_outbound` `NOLOGIN NOSUPERUSER NOBYPASSRLS`, função
+`fittrack_outbound` `NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE BYPASSRLS` — espelho da
+`fittrack_identity` da `_0002:129`, porque sem o `BYPASSRLS` efetivo a função vê zero linhas; função
 `claim_due_outbound(p_now, p_lease, p_limit)`, grants coluna-a-coluna no estilo `_0004`,
-`REVOKE ... FROM PUBLIC` + `GRANT EXECUTE TO fittrack_app` + `ALTER ... OWNER`) e
+`REVOKE ... FROM PUBLIC` + `GRANT EXECUTE TO fittrack_app` + `ALTER ... OWNER` + a guarda da `_0002`
+que revoga qualquer membro do papel, para o `BYPASSRLS` não ficar alcançável por `SET ROLE`) e
 `tests/integration/test_outbound_claim.py`; modificar `services/outbound.py` (`claim_due` no store e
 no protocolo).
 
@@ -652,6 +659,7 @@ linha com lease promovido.
 **Critérios de aceite:** linha com `scheduled_at` futuro não é reivindicada; `sent_at`/`dead_at`
 preenchidos nunca; `seq 1` não sai enquanto `seq 0` do grupo não tem `sent_at`; **teste provando que
 `fittrack_runtime` não lê `outbound_queue` sem `app.tenant_id` e só alcança linhas via a função**;
+atributos da role e ausência de membros provados por teste, no padrão da guarda da `_0002`;
 payload e `external_id` voltam cifrados; `alembic upgrade`/`downgrade` idempotentes.
 
 **Tamanho:** M.
@@ -743,26 +751,43 @@ identidade novos. O comentário em `webhook.py` já registra isso como débito.
 **Depende de:** nada. **Paraleliza com tudo** — pode subir primeiro se o time priorizar o bug latente.
 
 **Arquivos previstos:** criar `db/migrations/versions/_0007_membership_identity_resolution.py`
-(função `resolve_tenant_for_membership_event(p_channel, p_external_id_hash)` devolvendo a linha mais
-recente, revogada ou não — **só `SELECT`**, e é esse "nada a criar" que mata o órfão) e
+(função `resolve_tenant_for_membership_event(p_channel, p_external_id_hash, p_channel_message_id)`,
+**só `SELECT`** — e é esse "nada a criar" que mata o órfão —, resolvendo em dois degraus: primeiro
+pela **cópia persistida do evento**, `SELECT tenant_id, identity_id FROM raw_message WHERE channel =
+p_channel AND channel_message_id = p_channel_message_id ORDER BY id LIMIT 1`, que amarra a reentrega
+à identidade original; sem cópia, a linha mais recente de `channel_identity` para
+`(channel, external_id_hash)`, revogada ou não) e
 `tests/integration/test_membership_revocation.py`; modificar `services/identity.py`,
 `services/webhook.py`, testes de ingress e de cache.
 
 **Plano de implementação.** Em `accept()`, eventos de revogação usam o resolvedor novo **em vez de**
-`resolve_or_create`: sem linha → evento sem efeito (nada a revogar; log + métrica); com linha →
-persiste raw sob aquele tenant, revoga aquele `identity_id` (idempotente via `coalesce`), invalida
-cache. O `CachedIdentityResolver` **não** preenche o cache ativo com identidade revogada.
+`resolve_or_create`, com o `channel_message_id` do evento (`update:<id>`): sem linha → evento sem
+efeito (nada a revogar; log + métrica); com linha → persiste raw sob aquele tenant — a cópia antiga é
+devolvida pelo `ON CONFLICT (identity_id, channel_message_id)`, não duplicada —, revoga aquele
+`identity_id` (idempotente via `coalesce`), invalida cache. O `CachedIdentityResolver` **não** preenche
+o cache ativo com identidade revogada. **Por que a cópia persistida decide, e não "a mais recente":**
+a tentativa original de um `kicked` sempre persiste o raw **antes** de revogar, então a cópia amarra o
+evento à identidade de origem. Escolher cegamente a linha mais recente escolheria a identidade
+**fresca e ativa** que uma mensagem posterior criou — o usuário desbloqueou, mandou mensagem, e a
+reentrega do `kicked` vencido revogaria a identidade nova. O fallback "mais recente, revogada ou não"
+só roda quando não há cópia nenhuma — evento nunca persistido, logo sem revogação anterior a respeitar.
 
 **Primeiro teste que deve falhar — e deve falhar pelo bug real.**
 `test_a_redelivered_block_event_does_not_mint_a_second_tenant` — entrega um `my_chat_member kicked`,
 força falha no `deduplicator.complete`, reentrega o mesmo evento; `count(*) FROM tenant` não cresce e
 a identidade continua exatamente uma. **Rodar contra o código atual prova o órfão.**
+`test_a_kicked_event_retried_after_unblock_targets_the_original_identity` — processa o `kicked`,
+desbloqueia, manda mensagem (identidade nova e ativa), reentrega o `kicked` antigo; a revogação recai
+sobre a identidade **original** — decidida pela cópia em `raw_message`, não pela linha mais recente —,
+a identidade nova permanece ativa e não ganha cópia do evento.
 
 **Critérios de aceite:** reentrega persistente não cria segundo tenant nem segunda identidade; a
-função devolve a linha mais recente mesmo revogada e vazio para `(channel, hash)` inexistente; grants
+função devolve a cópia original do evento quando ela existe e, sem cópia, a linha mais recente mesmo
+revogada — vazio para `(channel, hash)` sem linha alguma; grants
 exatos provados por teste; a tabela de "identidade revogada" em `test_identity_bootstrap.py` continua
 verde; **unblock + nova mensagem continua criando identidade nova** (§18.5 preservada) — só o *evento
-de revogação* usa a função nova.
+de revogação* usa a função nova, e a reentrega de um `kicked` após o desbloqueio **não** revoga a
+identidade nova.
 
 **Tamanho:** M.
 
@@ -788,7 +813,16 @@ junto com a trilha A.
 
 **Plano de implementação.** `scheduled_at = now + Σ delays` implementa o espaçamento do §13.6 (o rate
 limiter por chat é o piso de 1s em runtime); reação de ack vira `OutboundBlock(kind="reaction")`; ao
-fim, enfileira `drain:kick` por porta injetada.
+fim, enfileira `drain:kick` por porta injetada — **best-effort**: kick que falha loga e não derruba o
+nó, porque o cron do drain (T16) é a rede de recuperação e um kick re-disparado pelo retry é inócuo.
+
+**O `group_id` é derivado, nunca sorteado.** O padrão de `enqueue_response()` gera um UUID fresco
+(`services/outbound.py:299,332`), e o registro do nó dá `RetryPolicy(max_attempts=3)`: enqueue
+commitado + kick ou write de checkpoint falho → o retry do nó mintaria um **segundo** grupo e as duas
+cópias sairiam. Toda resposta do grafo chega com `group_id = uuid5(namespace fixo, f"{batch_id}")` —
+o `batch_id` é entrada imutável do estado (§8.2), idêntico em toda repetição do nó e em todo
+reprocesso do batch (§18.4), e a `UNIQUE (group_id, seq)` da §5.2 transforma a segunda tentativa em
+no-op, não em bolha nova. Mesmo padrão do `_reply_group` do STT (`stt.py:1122`) e do derivado da T17.
 
 **Primeiro teste que deve falhar.**
 `test_deliver_enqueues_one_group_per_response_with_staggered_bubble_scheduling` — 3 bolhas → 1
@@ -796,7 +830,9 @@ fim, enfileira `drain:kick` por porta injetada.
 
 **Critérios de aceite:** nenhum enfileiramento fora de `deliver` — `make test-architecture` verde com
 o nó presente; e2e (com A+B+D): rajada → batch → grafo → `voice_agent` → `deliver` → drain → bolhas no
-fake de canal, na ordem e espaçadas; `RetryPolicy(max_attempts=3)` no registro do nó.
+fake de canal, na ordem e espaçadas; o nó que falha **depois** do enqueue (kick ou checkpoint) e é
+repetido não cria segundo grupo — a segunda execução cai no `ON CONFLICT (group_id, seq) DO NOTHING`;
+`RetryPolicy(max_attempts=3)` no registro do nó.
 
 **Tamanho:** M isolado; G contando a integração.
 
@@ -862,10 +898,10 @@ checkpoint.**
 
 | `mode` | `deliver` enfileira |
 | --- | --- |
-| `reaction` | um `OutboundBlock(kind="reaction", emoji=…, reply_to=state["reply_to"])` |
+| `reaction` | um `OutboundBlock(kind="reaction", emoji=…, text=fallback_text, reply_to=state["reply_to"])` — o `text` do bloco só é usado pelo adaptador após falha de protocolo (decisão #24, ADR-0015) |
 | `text` | `split` se existir, senão `[text]`, em um grupo com `seq` crescente |
 | `buttons` | um `OutboundBlock(kind="buttons", text=…, buttons=tuple(…), reply_to=…)` |
-| `media` | um `OutboundBlock(kind="media", text=<legenda>, media_path=…)`, sujeito ao ADR-0005 |
+| `media` | **nada nesta fase** — `enqueue_response()` recusa `media_path` local (`services/outbound.py:330`, ADR-0005); pelo caminho durável o `voice` degrada o gráfico de progresso para texto — a leitura vai, o PNG espera blob storage durável (condição de revisão do ADR-0005) |
 | `silent` | nenhum bloco, nenhuma chamada de enqueue |
 
 O nó `voice` valida **antes** de escrever a chave que `len(buttons) <= caps.max_buttons`,
@@ -888,16 +924,21 @@ T28 — é o contrato que todo mundo espera.
 `agents/__init__.py`.
 
 **Plano.** `Target`, intents fechados e `RouteStep`/`RoutingPlan` validados contra a tabela da §9.4,
-com `extra="forbid"`. `VoiceOutput` com validação **por modo** (`reaction` exige emoji e proíbe
-split; `text` proíbe emoji/botões/mídia; `buttons` exige pergunta e opções; `media` exige
-`media_path` e trata `text` como legenda opcional; `silent` não carrega nada). `voice_output`
+com `extra="forbid"`. `VoiceOutput` com validação **por modo** (`reaction` exige emoji **e**
+`fallback_text` — decisão #24/ADR-0015: quem redige o texto de degradação de uma reação recusada ou
+sem mensagem-alvo é o `voice`; exigir que o adaptador invente palavra visível ao usuário viola a
+invariante 2 — e proíbe split; `text` proíbe emoji/botões/mídia; `buttons` exige pergunta e opções;
+`media` exige `media_path` e trata `text` como legenda opcional, mas **não é emitido nesta sprint**:
+pelo caminho durável o enqueue recusa mídia local (ADR-0005) e o progresso degrada para texto;
+`silent` não carrega nada). `voice_output`
 declarado **sem** `Annotated`, com o escritor único documentado no próprio schema.
 
-**Primeiro teste que deve falhar.** `test_reaction_shape_requires_an_emoji` — hoje falha porque
-`VoiceOutput` não existe; depois vira `pytest.raises(ValueError)`, deixando o contrato inválido
-explícito em vez de implícito.
+**Primeiro teste que deve falhar.** `test_reaction_shape_requires_an_emoji_and_fallback_text` — hoje
+falha porque `VoiceOutput` não existe; depois vira `pytest.raises(ValueError)`, deixando o contrato
+inválido explícito em vez de implícito.
 
-**Critérios de aceite:** payload com campo extra e toda combinação inválida de modo reprovam;
+**Critérios de aceite:** payload com campo extra, `reaction` sem `fallback_text` e toda combinação
+inválida de modo reprovam;
 `tests/test_graph_reducers.py` demonstra que só `outbound` usa reducer nesta fronteira;
 `uv run mypy src/fittrack/agents src/fittrack/graph/state.py` passa.
 
