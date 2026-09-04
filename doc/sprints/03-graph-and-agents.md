@@ -713,8 +713,14 @@ Precisa da fronteira pré-tenant da §19.1. Este é o achado que une esta tarefa
 `tests/integration/test_outbound_claim.py`; modificar `services/outbound.py` (`claim_due` no store e
 no protocolo).
 
-> **Colisão de numeração de migração:** T04 e T15 propõem ambas `_0006`. Quem mergear primeiro fica
-> com `_0006`; a segunda vira `_0007`, e a T18 vira `_0008`. Resolver no merge, não na branch.
+> **Colisão de numeração de migração:** quatro tarefas de trilhas paralelas propõem migração sem
+> coordenar número entre si — T04 (`_0006_langgraph_grants`), T15 (`_0006_outbound_claim`), T12
+> (`_0006_exercise_set_source`, ADR-0012) e T23 (`_0007_health_report_idempotency`), além de T18
+> (`_0007_membership_identity_resolution`), que já nasceu depois das duas primeiras. Nenhuma delas
+> depende do conteúdo de outra, então não há ordem "correta" — só ordem de merge. **Resolver no
+> merge, não na branch:** a primeira PR a mergear fica com o número que já tem; cada PR seguinte cujo
+> número colide renumeia o próprio arquivo (nome e `down_revision`) para o próximo livre antes de
+> abrir o merge. É renumeração mecânica, nunca reordenação de conteúdo.
 
 **Desenho.** A função executa a query da §18.4 (elegível = `sent_at IS NULL AND dead_at IS NULL AND
 scheduled_at <= now AND next_retry_at <= now`, mais o `NOT EXISTS` que só libera `seq n+1` quando
@@ -1704,7 +1710,7 @@ km → m e `ROUND_HALF_UP` para duas casas no limite de persistência. Bloqueia 
 | `checkpoint_blobs` domina o banco | Médio — guarda o estado inteiro por super-step, e o `GraphState` carrega `raw_fragments` + `messages` + `outbound` | Poda diária na T04 + métrica `graph_checkpoint_bytes` como acompanhamento |
 | Determinismo de LLM em teste | Médio — suíte instável | `temperature=0` reduz variância mas não a elimina: unitários usam providers falsos; golden set mede ao vivo, separado |
 | Custo do judge em toda PR da trilha A | Baixo — o filtro do CI inclui `src/fittrack/graph/` | Não mudar o filtro; **saber**: contar o custo no encerramento e não confundir "judge não calibrado" com regressão |
-| Colisão de numeração de migração `_0006` | Baixo — T04 e T15 propõem a mesma | Resolver no merge; a segunda vira `_0007` e a T18 `_0008` |
+| Colisão de numeração de migração `_0006`/`_0007` | Baixo — T04, T15 e T12 propõem `_0006`; T18 e T23 propõem `_0007` | Resolver no merge: primeira a mergear fica com o número, as demais renumeiam o próprio arquivo (nome e `down_revision`) |
 | Trilha D chegar tarde e bloquear T19 | Alto — `deliver` sem `VoiceOutput` não integra | **Mitigado:** T21 é só contrato e sobe na onda 2. T19 continua escrita contra estado fake; a colagem no grafo é PR separada |
 | T28 subir antes de `voice → deliver` estar coberto | **Crítico** — desliga o único caminho de resposta que existe hoje e o substituto não está provado; o sintoma é **silêncio**, não erro | T28 é a última PR da sprint, com teste de integração dos cinco motivos de recusa antes do merge |
 | Cortar T27 por parecer "produto" | **Crítico** — sem onboarding ninguém consente `workout_data`, e toda nota de voz é recusada para sempre | **Resolvido:** T27 declarada não-cortável no escopo decidido |
