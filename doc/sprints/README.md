@@ -65,3 +65,11 @@ Uma tarefa está concluída quando:
 | --- | --- | --- | --- |
 | [Sprint 01 — Executable Foundation](01-foundation.md) | 1.0 | Fundação local, dados e segurança multi-tenant | `done` |
 | [Sprint 02 — Telegram Inbound Pipeline](02-telegram-pipeline.md) | 1.0 | Webhook verificado, buffer/debounce e batch persistido | `planned` |
+| [Sprint 03 — LangGraph Core, Ingestion Agents and the Output Path](03-graph-and-agents.md) | 1.0 | Grafo, agentes de ingestão e decisão, e a resposta chegando ao usuário | `planned` |
+
+> A Sprint 03 teve o **escopo fechado em 2026-09-04**: 22 das 28 tarefas planejadas, com 5 herdadas
+> pela Sprint 04 e uma cortada. As 26 ambiguidades levantadas no planejamento estão todas decididas.
+> Antes da primeira PR de código, a sprint exige **ADR-0010 a ADR-0015** e uma PR de erratas da spec.
+> Ela também resolve o vencimento do [ADR-0009](../adr/0009-respostas-fixas-antes-do-grafo.md) e as
+> issues [#29](https://github.com/FelipeMarcelino/fitness-track/issues/29) e
+> [#30](https://github.com/FelipeMarcelino/fitness-track/issues/30).

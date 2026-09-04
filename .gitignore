@@ -221,3 +221,6 @@ __marimo__/
 # private key would let anyone mint a certificate that every developer and CI
 # environment trusts.
 certs/
+
+# polly orchestration artifacts (planning reports, task registry)
+.polly/
