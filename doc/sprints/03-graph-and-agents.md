@@ -700,16 +700,23 @@ função SQL `SECURITY DEFINER` com `FOR UPDATE SKIP LOCKED`, lease e ordenaçã
 de `outbound_queue` — a policy da `_0002` compara `tenant_id = NULLIF(current_setting(...))`, e `NULL`
 nunca é verdadeiro. **A query global de elegibilidade da §18.4 não pode ser emitida pela aplicação.**
 Precisa da fronteira pré-tenant da §19.1. Este é o achado que une esta tarefa à T18 e às
-[ambiguidades #5 e #8](#a-fronteira-de-manutenção-cross-tenant).
+[ambiguidades #5 e #8](#a-fronteira-de-manutenção-cross-tenant). E trocar o papel efetivo não basta:
+`FORCE ROW LEVEL SECURITY` vale também para o dono da tabela, e uma função `SECURITY DEFINER` de dono
+`NOBYPASSRLS` continuaria vendo zero linhas — o mecanismo efetivo da fronteira é o `BYPASSRLS` do dono,
+num papel `NOLOGIN` de raio limitado por grants, exatamente como a `fittrack_identity` da `_0002`
+(o comentário da migração é explícito: `BYPASSRLS` existe "so the two functions can see
+`channel_identity` before there is an `app.tenant_id` to see it with").
 
 **Spec.** §18.4, §17.4, §19.1, §5.2. Issue #29.
 
 **Depende de:** nada fora da trilha.
 
 **Arquivos previstos:** criar `db/migrations/versions/_0006_outbound_claim.py` (role
-`fittrack_outbound` `NOLOGIN NOSUPERUSER NOBYPASSRLS`, função
+`fittrack_outbound` `NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE BYPASSRLS` — espelho da
+`fittrack_identity` da `_0002:129`, porque sem o `BYPASSRLS` efetivo a função vê zero linhas; função
 `claim_due_outbound(p_now, p_lease, p_limit)`, grants coluna-a-coluna no estilo `_0004`,
-`REVOKE ... FROM PUBLIC` + `GRANT EXECUTE TO fittrack_app` + `ALTER ... OWNER`) e
+`REVOKE ... FROM PUBLIC` + `GRANT EXECUTE TO fittrack_app` + `ALTER ... OWNER` + a guarda da `_0002`
+que revoga qualquer membro do papel, para o `BYPASSRLS` não ficar alcançável por `SET ROLE`) e
 `tests/integration/test_outbound_claim.py`; modificar `services/outbound.py` (`claim_due` no store e
 no protocolo).
 
@@ -736,6 +743,7 @@ linha com lease promovido.
 **Critérios de aceite:** linha com `scheduled_at` futuro não é reivindicada; `sent_at`/`dead_at`
 preenchidos nunca; `seq 1` não sai enquanto `seq 0` do grupo não tem `sent_at`; **teste provando que
 `fittrack_runtime` não lê `outbound_queue` sem `app.tenant_id` e só alcança linhas via a função**;
+atributos da role e ausência de membros provados por teste, no padrão da guarda da `_0002`;
 payload e `external_id` voltam cifrados; `alembic upgrade`/`downgrade` idempotentes.
 
 **Tamanho:** M.
@@ -827,26 +835,54 @@ identidade novos. O comentário em `webhook.py` já registra isso como débito.
 **Depende de:** nada. **Paraleliza com tudo** — pode subir primeiro se o time priorizar o bug latente.
 
 **Arquivos previstos:** criar `db/migrations/versions/_0007_membership_identity_resolution.py`
-(função `resolve_tenant_for_membership_event(p_channel, p_external_id_hash)` devolvendo a linha mais
-recente, revogada ou não — **só `SELECT`**, e é esse "nada a criar" que mata o órfão) e
+(função `resolve_tenant_for_membership_event(p_channel, p_external_id_hash, p_channel_message_id)`,
+**só `SELECT`** — e é esse "nada a criar" que mata o órfão —, resolvendo em dois degraus: primeiro
+pela **cópia persistida do evento**, `SELECT rm.tenant_id, rm.identity_id FROM raw_message AS rm JOIN
+channel_identity AS ci ON (ci.id, ci.tenant_id, ci.channel) = (rm.identity_id, rm.tenant_id,
+rm.channel) WHERE rm.channel = p_channel AND rm.channel_message_id = p_channel_message_id AND
+ci.external_id_hash = p_external_id_hash ORDER BY rm.id LIMIT 1`. O join e o predicado do hash são
+obrigatórios: `channel_message_id` identifica o update dentro de uma conta de bot, e pode repetir
+depois de rotação do token; uma cópia só amarra a reentrega se também pertencer à identidade externa
+recebida. A função pertence à fronteira `fittrack_identity` da `_0002`; a migração concede a ela
+somente `SELECT (id, tenant_id, identity_id, channel, channel_message_id)` em `raw_message`. Sem cópia
+da **mesma identidade externa**, o segundo degrau escolhe a linha mais recente de `channel_identity`
+para `(channel, external_id_hash)`, revogada ou não) e
 `tests/integration/test_membership_revocation.py`; modificar `services/identity.py`,
 `services/webhook.py`, testes de ingress e de cache.
 
 **Plano de implementação.** Em `accept()`, eventos de revogação usam o resolvedor novo **em vez de**
-`resolve_or_create`: sem linha → evento sem efeito (nada a revogar; log + métrica); com linha →
-persiste raw sob aquele tenant, revoga aquele `identity_id` (idempotente via `coalesce`), invalida
-cache. O `CachedIdentityResolver` **não** preenche o cache ativo com identidade revogada.
+`resolve_or_create`, com o `channel_message_id` do evento (`telegram-update:<id>`): sem linha → evento
+sem efeito (nada a revogar; log + métrica); com linha → persiste raw sob aquele tenant — a cópia antiga
+é devolvida pelo `ON CONFLICT (identity_id, channel_message_id)`, não duplicada —, revoga aquele
+`identity_id` (idempotente via `coalesce`), invalida cache. O `CachedIdentityResolver` **não** preenche
+o cache ativo com identidade revogada. **Por que a cópia persistida decide, e não "a mais recente":**
+a tentativa original de um `kicked` sempre persiste o raw **antes** de revogar, então a cópia amarra o
+evento à identidade de origem. Escolher cegamente a linha mais recente escolheria a identidade
+**fresca e ativa** que uma mensagem posterior criou — o usuário desbloqueou, mandou mensagem, e a
+reentrega do `kicked` vencido revogaria a identidade nova. O fallback "mais recente, revogada ou não"
+só roda quando não há cópia nenhuma — evento nunca persistido, logo sem revogação anterior a respeitar.
 
 **Primeiro teste que deve falhar — e deve falhar pelo bug real.**
 `test_a_redelivered_block_event_does_not_mint_a_second_tenant` — entrega um `my_chat_member kicked`,
 força falha no `deduplicator.complete`, reentrega o mesmo evento; `count(*) FROM tenant` não cresce e
 a identidade continua exatamente uma. **Rodar contra o código atual prova o órfão.**
+`test_a_kicked_event_retried_after_unblock_targets_the_original_identity` — processa o `kicked`,
+desbloqueia, manda mensagem (identidade nova e ativa), reentrega o `kicked` antigo; a revogação recai
+sobre a identidade **original** — decidida pela cópia em `raw_message`, não pela linha mais recente —,
+a identidade nova permanece ativa e não ganha cópia do evento.
+`test_a_reused_update_id_after_bot_rotation_stays_scoped_to_the_external_identity` — deixa uma cópia
+`telegram-update:N` para a identidade A, recebe do bot novo um evento com o mesmo `update_id` para a
+identidade B e prova que o resolvedor não devolve a linha de A; o fallback resolve B e só B é revogada.
 
 **Critérios de aceite:** reentrega persistente não cria segundo tenant nem segunda identidade; a
-função devolve a linha mais recente mesmo revogada e vazio para `(channel, hash)` inexistente; grants
-exatos provados por teste; a tabela de "identidade revogada" em `test_identity_bootstrap.py` continua
+função devolve a cópia original do evento quando ela existe **para o mesmo `(channel,
+external_id_hash)`** e, sem essa cópia, a linha mais recente mesmo revogada — vazio para `(channel,
+hash)` sem linha alguma; colisão de `channel_message_id` entre hashes externos nunca atravessa
+identidades; grants exatos provados por teste; a tabela de "identidade revogada" em
+`test_identity_bootstrap.py` continua
 verde; **unblock + nova mensagem continua criando identidade nova** (§18.5 preservada) — só o *evento
-de revogação* usa a função nova.
+de revogação* usa a função nova, e a reentrega de um `kicked` após o desbloqueio **não** revoga a
+identidade nova.
 
 **Tamanho:** M.
 
@@ -868,11 +904,31 @@ S03-T26 (o nó que o produz). O teste unitário do nó não depende delas; a int
 
 **Arquivos previstos:** criar `graph/nodes/deliver.py` (o caminho **já está reservado** como exceção
 em `tests/test_channel_isolation.py`) e `tests/unit/test_deliver_node.py`; modificar a topologia raiz
-junto com a trilha A.
+junto com a trilha A, `channels/telegram/adapter.py` e `tests/unit/test_telegram_adapter.py`.
 
 **Plano de implementação.** `scheduled_at = now + Σ delays` implementa o espaçamento do §13.6 (o rate
-limiter por chat é o piso de 1s em runtime); reação de ack vira `OutboundBlock(kind="reaction")`; ao
-fim, enfileira `drain:kick` por porta injetada.
+limiter por chat é o piso de 1s em runtime); reação de ack vira `OutboundBlock(kind="reaction",
+emoji=…, text=fallback_text, reply_to=…)`; ao fim, enfileira `drain:kick` por porta injetada —
+**best-effort**: kick que falha loga e não derruba o nó, porque o cron do drain (T16) é a rede de
+recuperação e um kick re-disparado pelo retry é inócuo.
+
+**A degradação de reação fecha no adaptador.** `deliver` copia `VoiceOutput.fallback_text` para
+`OutboundBlock.text` e persiste o campo cifrado com o restante do payload. Quando o Telegram rejeita
+o emoji ou a mensagem-alvo já desapareceu, `TelegramAdapter._send_degraded()` envia `block.text`, não
+o próprio emoji; o emoji só permanece como fallback de compatibilidade para uma linha antiga sem
+`text`. O adaptador continua decidindo **quando** degradar, porque isso é protocolo; o `voice` continua
+sendo o único autor de **o que dizer**, porque isso é conteúdo (invariantes 2 e 11). Os dois caminhos
+de falha têm teste no adaptador. Um `VoiceOutput(mode="media")` que atravesse essa fronteira por bug
+falha explicitamente antes do enqueue; não vira silêncio. A T26 garante que progresso com gráfico
+chega aqui como texto nesta fase.
+
+**O `group_id` é derivado, nunca sorteado.** O padrão de `enqueue_response()` gera um UUID fresco
+(`services/outbound.py:299,332`), e o registro do nó dá `RetryPolicy(max_attempts=3)`: enqueue
+commitado + kick ou write de checkpoint falho → o retry do nó mintaria um **segundo** grupo e as duas
+cópias sairiam. Toda resposta do grafo chega com `group_id = uuid5(namespace fixo, f"{batch_id}")` —
+o `batch_id` é entrada imutável do estado (§8.2), idêntico em toda repetição do nó e em todo
+reprocesso do batch (§18.4), e a `UNIQUE (group_id, seq)` da §5.2 transforma a segunda tentativa em
+no-op, não em bolha nova. Mesmo padrão do `_reply_group` do STT (`stt.py:1122`) e do derivado da T17.
 
 **Primeiro teste que deve falhar.**
 `test_deliver_enqueues_one_group_per_response_with_staggered_bubble_scheduling` — 3 bolhas → 1
@@ -880,7 +936,11 @@ fim, enfileira `drain:kick` por porta injetada.
 
 **Critérios de aceite:** nenhum enfileiramento fora de `deliver` — `make test-architecture` verde com
 o nó presente; e2e (com A+B+D): rajada → batch → grafo → `voice_agent` → `deliver` → drain → bolhas no
-fake de canal, na ordem e espaçadas; `RetryPolicy(max_attempts=3)` no registro do nó.
+fake de canal, na ordem e espaçadas; o nó que falha **depois** do enqueue (kick ou checkpoint) e é
+repetido não cria segundo grupo — a segunda execução cai no `ON CONFLICT (group_id, seq) DO NOTHING`;
+`RetryPolicy(max_attempts=3)` no registro do nó; reação rejeitada pelo conjunto do Telegram e reação
+cujo alvo desapareceu enviam o `fallback_text` redigido pelo `voice`; `mode="media"` inesperado falha
+alto e não enfileira nem descarta silenciosamente.
 
 **Tamanho:** M isolado; G contando a integração.
 
@@ -946,10 +1006,10 @@ checkpoint.**
 
 | `mode` | `deliver` enfileira |
 | --- | --- |
-| `reaction` | um `OutboundBlock(kind="reaction", emoji=…, reply_to=state["reply_to"])` |
+| `reaction` | um `OutboundBlock(kind="reaction", emoji=…, text=fallback_text, reply_to=state["reply_to"])` — o `text` do bloco só é usado pelo adaptador após falha de protocolo (decisão #24, ADR-0015) |
 | `text` | `split` se existir, senão `[text]`, em um grupo com `seq` crescente |
 | `buttons` | um `OutboundBlock(kind="buttons", text=…, buttons=tuple(…), reply_to=…)` |
-| `media` | um `OutboundBlock(kind="media", text=<legenda>, media_path=…)`, sujeito ao ADR-0005 |
+| `media` | **nenhum enqueue e erro explícito nesta fase** — `enqueue_response()` recusa `media_path` local (`services/outbound.py:330`, ADR-0005); pelo caminho durável o `voice` degrada o gráfico de progresso para texto — a leitura vai, o PNG espera blob storage durável (condição de revisão do ADR-0005) |
 | `silent` | nenhum bloco, nenhuma chamada de enqueue |
 
 O nó `voice` valida **antes** de escrever a chave que `len(buttons) <= caps.max_buttons`,
@@ -972,16 +1032,21 @@ T28 — é o contrato que todo mundo espera.
 `agents/__init__.py`.
 
 **Plano.** `Target`, intents fechados e `RouteStep`/`RoutingPlan` validados contra a tabela da §9.4,
-com `extra="forbid"`. `VoiceOutput` com validação **por modo** (`reaction` exige emoji e proíbe
-split; `text` proíbe emoji/botões/mídia; `buttons` exige pergunta e opções; `media` exige
-`media_path` e trata `text` como legenda opcional; `silent` não carrega nada). `voice_output`
+com `extra="forbid"`. `VoiceOutput` com validação **por modo** (`reaction` exige emoji **e**
+`fallback_text` — decisão #24/ADR-0015: quem redige o texto de degradação de uma reação recusada ou
+sem mensagem-alvo é o `voice`; exigir que o adaptador invente palavra visível ao usuário viola a
+invariante 2 — e proíbe split; `text` proíbe emoji/botões/mídia; `buttons` exige pergunta e opções;
+`media` exige `media_path` e trata `text` como legenda opcional, mas **não é emitido nesta sprint**:
+pelo caminho durável o enqueue recusa mídia local (ADR-0005), o progresso degrada para texto e
+`deliver` rejeita explicitamente um `media` inesperado; `silent` não carrega nada). `voice_output`
 declarado **sem** `Annotated`, com o escritor único documentado no próprio schema.
 
-**Primeiro teste que deve falhar.** `test_reaction_shape_requires_an_emoji` — hoje falha porque
-`VoiceOutput` não existe; depois vira `pytest.raises(ValueError)`, deixando o contrato inválido
-explícito em vez de implícito.
+**Primeiro teste que deve falhar.** `test_reaction_shape_requires_an_emoji_and_fallback_text` — hoje
+falha porque `VoiceOutput` não existe; depois vira `pytest.raises(ValueError)`, deixando o contrato
+inválido explícito em vez de implícito.
 
-**Critérios de aceite:** payload com campo extra e toda combinação inválida de modo reprovam;
+**Critérios de aceite:** payload com campo extra, `reaction` sem `fallback_text` e toda combinação
+inválida de modo reprovam;
 `tests/test_graph_reducers.py` demonstra que só `outbound` usa reducer nesta fronteira;
 `uv run mypy src/fittrack/agents src/fittrack/graph/state.py` passa.
 
@@ -1211,17 +1276,22 @@ ou degradado desde o primeiro dia. **Bloqueia** a colagem final de T19.
 
 **Plano.** `graph/nodes/voice.py` é o **único** lugar que lê `state["channel_caps"]` e converte
 `ChannelCaps` em restrições explícitas de renderização. A tabela de modo da §13.2 é implementada
-literalmente: ack confiante pode reagir; conjunto incompleto ou baixa confiança **força texto**;
-clarificação vira botões se couber e lista numerada se não couber; progresso com mídia vira mídia; o
-resto é texto. `split` é a lista final de bolhas e é proibido em sessão ativa, erro, clarificação e
-reação. O nó escreve `{"voice_output": output.model_dump(mode="json")}` e retorna — não importa
-`OutboundService`, não resolve identidade, não abre conexão.
+com a restrição física do ADR-0005 nesta fase: ack confiante pode reagir; conjunto incompleto ou baixa
+confiança **força texto**; clarificação vira botões se couber e lista numerada se não couber;
+**progresso com `chart_path` também força `mode="text"`**, verbalizando a leitura determinística que
+acompanha o gráfico, porque o único caminho de entrega é durável e não aceita arquivo local; o PNG só
+volta quando existir blob storage durável. O nó não emite `mode="media"` nesta sprint. O resto é texto.
+`split` é a lista final de bolhas e é proibido em sessão ativa, erro, clarificação e reação. O nó
+escreve `{"voice_output": output.model_dump(mode="json")}` e retorna — não importa `OutboundService`,
+não resolve identidade, não abre conexão.
 
 **Primeiro teste que deve falhar.**
 `test_clarification_degrades_to_numbered_text_when_options_exceed_cap` — `assert output.mode == "text"`.
 
-**Critérios de aceite:** reação, texto, botões, mídia, silêncio, baixa confiança e split cobertos;
-`test_channel_isolation` passa com a lista de exceções **ainda** exatamente `voice.py`/`deliver.py`;
+**Critérios de aceite:** reação, texto, botões, silêncio, baixa confiança e split cobertos; progresso
+com `chart_path` produz texto não vazio com a leitura correspondente e **nunca** `mode="media"` nesta
+fase; `test_channel_isolation` passa com a lista de exceções **ainda** exatamente
+`voice.py`/`deliver.py`;
 `rg -n 'enqueue_response|OutboundService|\.send\(' src/fittrack/graph/nodes/voice.py` não encontra
 nada; o teste de equivalência prova que Telegram e WhatsApp recebem o mesmo conteúdo, variando só
 formato.
@@ -1469,6 +1539,30 @@ exatamente para elas não inventarem um segundo mecanismo que o ADR é escrito a
 **O anti-padrão a proibir explicitamente no ADR:** usar o DSN de owner, ou dar `BYPASSRLS` ao runtime.
 Um teste de claim que "funciona" contra conexão de superuser é o erro mais caro possível aqui — as
 policies existem e nunca são avaliadas.
+[ADR-0010](#os-adrs-a-escrever), "fronteira de manutenção cross-tenant"**, que fixa o padrão comum
+sem confundir os dois principais. O **runtime** e o principal dedicado do saver permanecem
+`NOSUPERUSER NOBYPASSRLS`. Para varrer uma tabela de domínio sob `FORCE ROW LEVEL SECURITY`, a porta é
+uma função `SECURITY DEFINER` estreita, com `search_path` fixo, sem SQL arbitrário e retornando o
+mínimo; seu dono é uma role separada `NOLOGIN NOSUPERUSER BYPASSRLS`, sem membros e com os menores
+grants de tabela/coluna/sequence possíveis, no padrão efetivo da `fittrack_identity` da `_0002`. O
+runtime recebe apenas `EXECUTE` na função e **não** herda a role dona. Sem o `BYPASSRLS` do dono, a
+função global continua sujeita à policy, não tem `app.tenant_id` e vê zero linhas. Já as tabelas do
+LangGraph usam o segundo padrão do mesmo ADR: `thread_id` construído pelo código mais um principal
+`NOBYPASSRLS` com DML limitado às seis tabelas, sem poder sobre tabelas de domínio; ali não existe
+razão para atravessar uma policy de tenant. As quatro tarefas instanciam a seção correspondente. A
+fronteira do checkpointer (#5) e o fechamento automático de sessão (#22) são seções dele, não ADRs
+próprios.
+
+**Nesta sprint o ADR-0010 é instanciado diretamente por duas tarefas** — T04 usa o padrão do saver
+`NOBYPASSRLS`; T15 usa a função com dono `BYPASSRLS` e runtime apenas com `EXECUTE`. A T18 estende a
+fronteira pré-tenant já aceita na §19.1 e implementada pela `_0002`, portanto não espera o ADR-0010.
+Na Sprint 04, T14 e o fechamento automático da T25 **reusam a porta `SECURITY DEFINER`**; é exatamente
+para elas não inventarem um segundo mecanismo que o ADR é escrito agora.
+
+**O anti-padrão a proibir explicitamente no ADR:** usar o DSN de owner, dar `BYPASSRLS` ao runtime ou
+torná-lo membro da role dona das funções. O `BYPASSRLS` existe somente no dono `NOLOGIN`, sem membros,
+e só é alcançável pelas funções com superfície mínima. Um teste de claim que "funciona" contra
+conexão de superuser é o erro mais caro possível aqui — as policies existem e nunca são avaliadas.
 
 ## Ambiguidades — registro e leitura recomendada
 
