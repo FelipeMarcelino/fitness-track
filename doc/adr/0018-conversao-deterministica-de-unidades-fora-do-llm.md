@@ -31,16 +31,25 @@ número sem conversão no modelo.
 
 O conversor usa somente `Decimal`: lb → kg multiplica por `Decimal("0.45359237")`; km → m multiplica
 por `Decimal("1000")`. Toda normalização para as colunas `NUMERIC(...,2)` aplica
-`quantize(Decimal("0.01"), ROUND_HALF_UP)` exatamente uma vez, no limite de persistência. A mesma
-fronteira calcula RIR derivado a partir de RPE; RIR explícito continua intocado. O gateway/prompt não
-tem permissão para emitir campo convertido, arredondado ou derivado.
+`quantize(Decimal("0.01"), ROUND_HALF_UP)` exatamente uma vez, no limite de persistência. O
+gateway/prompt não tem permissão para emitir campo convertido, arredondado ou derivado.
+
+**Fora de escopo, de propósito: RIR.** Este ADR cobre só a conversão de unidade de uma
+`QuantityLiteral` (kg/lb, km/m e as demais da §9.5) — grandeza física para grandeza física, com
+constante de conversão fixa. `RIR ≈ 10 − RPE` não é conversão de unidade: é uma inferência derivada
+de outro campo do próprio domínio de treino, e mora em `domain/rpe.py`, não em `domain/units.py`
+(T09, §9.6). As duas fronteiras são determinísticas e as duas rodam no limite de persistência, mas
+são módulos diferentes porque resolvem problemas diferentes — juntar os dois em `units.py` faria o
+módulo de unidades também precisar conhecer a tabela de RPE/RIR da §9.6, que não tem nada a ver com
+quilogramas. RIR explícito nunca é sobrescrito pelo derivado (§9.6, T09).
 
 ## Consequências
 
 O schema de extração fica mais explícito e testes podem fixar entradas como `100 lb → 45.36 kg` sem
 simular raciocínio do modelo. Há conversor e testes a mais, mas a mesma regra cobre retry, fallback e
 qualquer provider. A errata da §9.5 precisa substituir a instrução de conversão no prompt pelo
-contrato literal e pela fronteira determinística.
+contrato literal e pela fronteira determinística. Fixar RIR em `domain/rpe.py` (e não aqui) evita que
+uma leitura futura deste ADR reintroduza a derivação em `units.py` e duplique o cálculo.
 
 ## Condição de revisão
 

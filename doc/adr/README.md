@@ -25,6 +25,8 @@ o ADR explica *como se chegou nele*.
 | [0007](0007-stt-fora-do-llm-gateway.md) | STT fora do `LLMGateway`, configurado em `models.yaml` | aceito | — |
 | [0008](0008-coluna-propria-para-resposta-fixa.md) | Coluna própria para a resposta fixa já enviada | aceito | — |
 | [0009](0009-respostas-fixas-antes-do-grafo.md) | Respostas fixas da §11.3 antes de o `voice_agent` existir | aceito, expira na Sprint 03 | — |
+| [0012](0012-proveniencia-plural-da-serie.md) | Proveniência plural e imutável da série | aceito | — |
+| [0018](0018-conversao-deterministica-de-unidades-fora-do-llm.md) | Conversão determinística de unidades fora do LLM | aceito | — |
 
 > ⚠️ **ADR-0001 está referenciado mas ausente da árvore.** O `CLAUDE.md` e a §2 da spec apontam para
 > `doc/adr/0001-groq-como-provider-primario.md`, e o arquivo não existe. O conteúdo da decisão está
