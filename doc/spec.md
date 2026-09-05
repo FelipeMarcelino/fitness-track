@@ -892,6 +892,19 @@ CREATE TABLE exercise_set_source (
 CREATE INDEX ix_source_tenant ON exercise_set_source(tenant_id);
 CREATE INDEX ix_source_raw_message ON exercise_set_source(raw_message_id)
     WHERE raw_message_id IS NOT NULL;
+-- raw_message_id só fica NULL pela ação ON DELETE SET NULL da FK. O runtime
+-- não pode criar proveniência sem literal de origem.
+CREATE FUNCTION require_source_raw_message() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+IF NEW.raw_message_id IS NULL THEN
+RAISE EXCEPTION 'exercise_set_source requires raw_message_id on INSERT';
+END IF;
+RETURN NEW;
+END;
+$$;
+CREATE TRIGGER require_source_raw_message_on_insert
+    BEFORE INSERT ON exercise_set_source
+    FOR EACH ROW EXECUTE FUNCTION require_source_raw_message();
 -- A proveniência é append-only para o runtime: correções criam novas séries ou
 -- usam o fluxo explícito de correção, nunca alteram ou apagam sua evidência.
 REVOKE UPDATE, DELETE ON exercise_set_source FROM fittrack_app;
@@ -1842,19 +1855,23 @@ await graph.ainvoke(Command(resume=user_text), config=config)
 Um pedido composto costuma conter passos independentes. Rodá-los em sequência soma latência sem
 motivo: duas chamadas de LLM de 3s viram 6s de espera quando poderiam ser 3s.
 
-O router não devolve uma lista plana de rotas — devolve **estágios**. Passos dentro de um estágio
-rodam em paralelo; estágios rodam em ordem.
+O router devolve uma lista plana de passos; `stage_plan()` transforma-a em **estágios**. Passos dentro
+de um estágio rodam em paralelo; estágios rodam em ordem.
 
 #### A regra de agrupamento
 
 **Escrita antes de leitura, sempre.** `ingestion` grava no banco; todos os outros leem dele. Se
-rodassem juntos, o leitor poderia consultar antes do `COMMIT`.
+rodassem juntos, o leitor poderia consultar antes do `COMMIT`. Dois passos de `ingestion` também não
+correm juntos: um finalizador de sessão pode ler antes do `log_workout` que deveria fechar.
 
 ```
-1. Se o plano contém `ingestion`, ele fica sozinho no estágio 1.
-2. Todo o resto (`analysis`, `recommendation`, `admin`, `smalltalk`) vai para o
-   estágio 2, em paralelo.
-3. Sem `ingestion`, há um único estágio e tudo é paralelo.
+1. `stage_plan()` separa todos os passos de `ingestion`: writes (`log_workout`, `log_metric`,
+   `correct_entry`) vêm primeiro; finalizadores (`close_session`, `discard_session`) vêm depois.
+   A ordem original é estável dentro de cada grupo e cada passo ocupa seu próprio estágio.
+2. Só depois de todos os estágios de `ingestion`, todo o resto (`analysis`, `recommendation`,
+   `admin`, `smalltalk`) vai para um estágio paralelo.
+3. Sem `ingestion`, há um único estágio e tudo é paralelo. `close_session` e `discard_session` no
+   mesmo plano são inválidos e o plano é rejeitado antes do dispatch.
 ```
 
 #### O exemplo composto
@@ -1863,7 +1880,7 @@ rodassem juntos, o leitor poderia consultar antes do `COMMIT`.
 "Fiz supino 80x8 e compara com semana passada"
 
 plan = [
-  [ {ingestion, log_workout} ],                                   ← estágio 1, sozinho
+  [ {ingestion, log_workout} ],                                   ← estágio 1
   [ {analysis, analyze_progress, {exercise: supino_reto_barra}} ], ← estágio 2
 ]
 
@@ -2026,9 +2043,11 @@ golden set: os buckets de ruído passam a medir o normalizer, não a extração.
 **Schema de saída:**
 
 ```python
+from pydantic import Field
+
 class TurnSegment(BaseModel):
     text: str                    # trecho normalizado, uma unidade de sentido
-    source_fragments: list[int]  # índices dos fragmentos da rajada que o geraram
+    source_fragments: list[int] = Field(min_length=1)  # fragmentos da rajada que o geraram
     was_audio: bool
 
 class NormalizedTurn(BaseModel):
@@ -2054,9 +2073,11 @@ class NormalizedTurn(BaseModel):
 3. **Anáfora só com âncora explícita.** `resolved_references` exige que a referência apareça em
    `messages` ou na sessão ativa. Sem âncora, o texto passa como está e a clarificação (§9.10)
    resolve depois.
-4. **Preservar o literal.** `source_fragments` amarra cada segmento aos fragmentos originais, e o
-   `extraction_agent` continua obrigado a preencher `source_text` a partir do texto do usuário —
-   não da reescrita. É o que permite auditar uma extração errada até a mensagem que a causou.
+4. **Preservar o literal.** `source_fragments` é não vazio e amarra cada segmento aos fragmentos
+   originais. O `extraction_agent` continua obrigado a preencher `source_text` a partir do texto do
+   usuário — não da reescrita. A validação pós-normalizer também rejeita segmento cuja resolução
+   determinística não produza ao menos um `SourceSpan`; é o que permite auditar uma extração errada
+   até a mensagem que a causou.
 5. **Idempotente sobre entrada limpa.** Um turno de uma mensagem única e bem-formada sai igual ao
    que entrou. Um teste do golden set verifica exatamente isso, porque um normalizer que "melhora"
    texto já bom é um gerador de regressão silenciosa.
@@ -2107,7 +2128,8 @@ interpretáveis, e o que permite ao `dispatch` falhar cedo num alvo inexistente 
    erro.
 3. **`pending_clarification` tem precedência.** Se `answers_clarification=True`, o worker nem chama o
    router: retoma o grafo por `Command(resume=...)` (§8.7).
-4. **Teto de 4 passos por estágio.** É o número de alvos paralelizáveis. Um plano maior é sintoma de
+4. **Teto de 4 passos por estágio paralelo.** É o número de alvos paralelizáveis. Cada passo de
+   `ingestion` ocupa seu próprio estágio e não conta para esse fan-out. Um plano maior é sintoma de
    prompt quebrado e é truncado com registro em `errors`.
 
 ### 9.5 Contrato do `extraction_agent`

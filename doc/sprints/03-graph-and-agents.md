@@ -141,16 +141,22 @@ o teste de arquitetura que sustenta a §8.8.
 2. Declarar no mesmo módulo `CONCURRENT_KEYS` e `SINGLE_WRITER_KEYS` (com o ramo dono anotado). Uma
    chave nova que não apareça em nenhum dos dois **reprova o teste** — é o que impede o campo
    acrescentado sem decisão.
-3. `stage_plan(steps) -> list[PlanStage]` com os três casos da §8.8 (`ingestion` sozinho no estágio
-   1; o resto no estágio 2; sem `ingestion`, estágio único) e o teto da §9.4 regra 4: 4 passos por
-   estágio, truncando com registro em `errors`.
+3. `stage_plan(steps) -> list[PlanStage]` serializa **cada** passo de `ingestion` antes de qualquer
+   leitor: writes (`log_workout`, `log_metric`, `correct_entry`) vêm antes de finalizadores
+   (`close_session`, `discard_session`), preservando a ordem original dentro de cada grupo; cada passo
+   ocupa um estágio próprio. Só depois vem um estágio paralelo com o resto. Sem `ingestion`, há um
+   estágio único. `close_session` e `discard_session` juntos são inválidos. O teto da §9.4 regra 4 é
+   4 passos no estágio paralelo, truncando com registro em `errors`.
 4. **Resolver o conflito com `test_channel_isolation`** — ver
    [ambiguidade #3](#3-channel_caps-no-graphstate-reprova-o-teste-de-isolamento-hoje). Separar
    `IMPORT_EXCEPTIONS` de `CAPS_EXCEPTIONS`, e acrescentar a asserção substituta: `state.py` menciona
    `channel_caps` exatamente uma vez, e apenas como anotação de campo.
 5. O teste do reducer cobre três transições distintas: fan-out do mesmo batch concatena; entrada vazia
    não apaga; `BatchReset()` vindo do runner apaga exatamente uma vez antes do batch seguinte.
-   `bounded_add_messages` é exercitado com 13+ mensagens e nunca devolve mais de 12.
+   `bounded_add_messages` é exercitado com 13+ mensagens e nunca devolve mais de 12. O teste de
+   staging prova que `log_workout` seguido de `close_session` e `analyze_progress` vira três estágios
+   ordenados, para que o fechamento leia a série já commitada; a dupla `close_session` e
+   `discard_session` é rejeitada antes do dispatch.
 
 **Primeiro teste que deve falhar.**
 `tests/test_graph_reducers.py::test_a_parallel_stage_merges_every_concurrent_key` →
@@ -269,10 +275,12 @@ e podar checkpoints.
 `scripts/bootstrap.py`, `.env.example`, `docker-compose.yml`, `docker-compose.dev.yml`,
 `docker/postgres/initdb/00-roles.sh`, `scripts/init_dev_env.py`; criar `graph/persistence.py`,
 `graph/store.py`,
-`doc/adr/0010-fronteira-de-tenant-nas-tabelas-do-langgraph.md`,
 `tests/unit/test_tenant_store.py`, `tests/integration/test_graph_checkpoint.py`. **Não existe migração
 de grant nas tabelas do LangGraph:** Alembic roda antes de `setup()` num banco limpo e não pode dar
 `GRANT` em relações que ainda não existem.
+
+O [ADR-0010 existente](../adr/0010-fronteira-de-manutencao-cross-tenant.md) é o contrato desta
+tarefa; a T04 não cria outro arquivo ADR nem reutiliza o mesmo número para uma decisão diferente.
 
 **Plano de implementação:**
 
@@ -501,8 +509,8 @@ Redis.
 
 **Plano de implementação:** schemas Pydantic estritos para `TurnSegment` e `NormalizedTurn`; delimitar
 fragmentos, transcrições, histórico e `pending_clarification` como dados não confiáveis — `clean_text`
-**continua não confiável** e é redelimitado a jusante; validar que `source_fragments` aponta só para
-índices existentes e que não há anáfora resolvida sem âncora; carregar `normalizer.md` no boot —
+**continua não confiável** e é redelimitado a jusante; validar que `source_fragments` é não vazio,
+aponta só para índices existentes e que não há anáfora resolvida sem âncora; carregar `normalizer.md` no boot —
 texto instrucional não fica em Python; golden set para fragmentação, STT, anáfora, interrupt pendente
 e injection.
 
@@ -530,6 +538,8 @@ existe, não é vazio, e não há instrução equivalente inline no módulo; `al
 `0 <= start < end <= len(texto-fonte)` em todo caso, inclusive quando a similaridade cai abaixo do
 limiar e o resultado é o fragmento inteiro; um segmento gerado a partir de um fragmento
 `was_audio=True` resolve contra `transcript`, nunca contra `payload` (o envelope inteiro).
+`source_fragments=[]` ou qualquer alinhamento que não produza `SourceSpan` é rejeitado antes de o
+turno entrar no estado.
 `test_schema_contract.py` inclui `raw_message.text_extract` no inventário de colunas cifradas;
 `test_encrypted_columns.py` prova que só o round-trip com AAD de linha recupera o texto.
 
@@ -690,32 +700,36 @@ invariantes 3, 5 e 6.
 omitia).** Cria `exercise_set_source` com as duas FKs tenant-qualificadas (`exercise_set_id` e
 `raw_message_id`, a segunda com `ON DELETE SET NULL (raw_message_id)`), as chaves candidatas
 `uq_exercise_set_id_tenant` em `exercise_set` e `uq_raw_message_id_tenant` em `raw_message`, e as
-colunas novas em `exercise_set`: `provenance_hash BYTEA NOT NULL` e
-`expansion_ordinal SMALLINT NOT NULL DEFAULT 0`. Substitui `ux_set_idempotency` — ver SQL completo na
-ADR-0012. A mesma migração habilita e força RLS, cria `tenant_isolation` para a tabela nova e revoga
-`UPDATE` e `DELETE` de `fittrack_app`; a enumeração de cobertura do schema **atual** no teste de
-isolamento passa a incluir a tabela, sem modificar a lista histórica `TENANT_SCOPED` da `_0002`.
+colunas novas em `exercise_set`: `provenance_hash BYTEA NOT NULL`,
+`extraction_ordinal SMALLINT NOT NULL DEFAULT 0` e `expansion_ordinal SMALLINT NOT NULL DEFAULT 0`.
+Substitui `ux_set_idempotency` pelo índice parcial de cinco colunas — ver SQL completo na ADR-0012. A
+mesma migração habilita e força RLS, cria `tenant_isolation` para a tabela nova, recusa `INSERT` sem
+`raw_message_id` por trigger e revoga `UPDATE` e `DELETE` de `fittrack_app`; a enumeração de cobertura
+do schema **atual** no teste de isolamento passa a incluir a tabela, sem modificar a lista histórica
+`TENANT_SCOPED` da `_0002`.
 
 **Plano de implementação:** criar/reabrir sessão conforme §6 — **somente `closed_auto` reabre até
 15 min; `closed_explicit` não reabre**; derivar `is_bodyweight`, escopo e equipamento do registro no
 banco; expandir `repeat` em `expansion_ordinal = 0..repeat-1`, marcar `inferred=True` nas repetições
 implícitas. **A chave de idempotência não é a antiga.** `set_index` (exibição/ordenação) e
-`provenance_hash`+`expansion_ordinal` (idempotência) são calculados separadamente e inseridos no
-mesmo `INSERT`, mas só os dois últimos entram no alvo do `ON CONFLICT (session_id, exercise_id,
-provenance_hash, expansion_ordinal) DO NOTHING` — **nunca** `ON CONFLICT` sobre `set_index`, porque
+`provenance_hash`+`extraction_ordinal`+`expansion_ordinal` (idempotência) são calculados
+separadamente e inseridos no mesmo `INSERT`, mas só os três últimos entram no alvo exato do
+`ON CONFLICT (session_id, exercise_id, provenance_hash, extraction_ordinal, expansion_ordinal)
+WHERE deleted_at IS NULL DO NOTHING` — **nunca** `ON CONFLICT` sobre `set_index`, porque
 `set_index` é derivado da contagem atual de linhas da sessão, que o próprio INSERT anterior já
 alterou: se o commit da tentativa 1 for bem-sucedido mas o checkpoint do grafo falhar antes de
 persistir, a tentativa 2 (retry do mesmo batch) recalcula um `set_index` **diferente** — mas
-`provenance_hash` e `expansion_ordinal` são funções só do conteúdo já validado da extração, então
-continuam iguais, o `ON CONFLICT` colide e a tentativa 2 não insere nada (ver ADR-0012, seção
-"Idempotência"). O `INSERT` de `exercise_set` usa `RETURNING id`; quando o conflito zera o
-`RETURNING` (linha já existe de uma tentativa anterior), `repositories/workouts.py` faz um `SELECT`
-pela mesma chave `(session_id, exercise_id, provenance_hash, expansion_ordinal)` para obter o `id`
-existente — nunca insere `exercise_set_source` para um `exercise_set_id` inventado. Depois de cada
-série resolvida (nova ou reencontrada), com `status='complete'` só quando o `CHECK ck_set_payload`
-puder ser satisfeito, `repositories/set_source.py` insere uma linha em `exercise_set_source` por span
-resolvido — mesma transação, mesmo `INSERT ... ON CONFLICT (exercise_set_id, position) DO NOTHING`,
-para que o mesmo retry que reencontrou o `exercise_set` também não duplique a proveniência.
+`provenance_hash`, `extraction_ordinal` e `expansion_ordinal` são funções só do conteúdo já validado
+da extração, então continuam iguais, o `ON CONFLICT` com o predicado do índice colide e a tentativa 2
+não insere nada (ver ADR-0012, seção "Idempotência"). O `INSERT` de `exercise_set` usa `RETURNING id`;
+quando o conflito zera o `RETURNING` (linha já existe de uma tentativa anterior),
+`repositories/workouts.py` faz um `SELECT` pela mesma chave de cinco colunas **e**
+`deleted_at IS NULL` para obter o `id` existente — nunca insere `exercise_set_source` para um
+`exercise_set_id` inventado. Depois de cada série resolvida (nova ou reencontrada), com
+`status='complete'` só quando o `CHECK ck_set_payload` puder ser satisfeito,
+`repositories/set_source.py` insere uma linha em `exercise_set_source` por span resolvido — mesma
+transação, mesmo `INSERT ... ON CONFLICT (exercise_set_id, position) DO NOTHING`, para que o mesmo
+retry que reencontrou o `exercise_set` também não duplique a proveniência.
 
 **Primeiro teste que deve falhar.** `test_persistence_expands_3x10_to_three_complete_rows` com
 `assert rows == [(1, 10), (2, 10), (3, 10)]`.
@@ -729,7 +743,10 @@ para `exercise_set_id` e para `raw_message_id` reprovam nos dois sentidos; um te
 apaga o `raw_message` referenciado (simulando a purga de 90 dias) e prova que `exercise_set_source`
 sobrevive com `raw_message_id IS NULL`, `tenant_id` intacto e o snapshot (`channel`, `occurred_at`)
 preservado; o runtime não consegue `UPDATE` nem `DELETE` numa linha de proveniência append-only e o
-teste de cobertura do schema atual falha se a tabela nova perder RLS ou policy.
+teste de cobertura do schema atual falha se a tabela nova perder RLS ou policy; `INSERT` direto com
+`raw_message_id = NULL` falha, enquanto a purga por FK ainda consegue anulá-lo; e a pirâmide
+`12, 10, 8` com a mesma proveniência persiste as três séries, provando o índice parcial de cinco
+colunas e o alvo exato do `ON CONFLICT`.
 
 **Tamanho:** M/G — cresceu com a migração da ADR-0012. **Bloqueado pela
 [ambiguidade crítica #7](#7-crítico-uma-série-pode-vir-de-vários-fragmentos-mas-source_message_id-é-escalar).**
@@ -1174,9 +1191,10 @@ S03-T07 (quota).
 `graph/root.py`, `llm/roles.py`, golden set de roteamento.
 
 **Plano.** Uma chamada ao gateway com `agent="router"`, `role=LLMRole.ROUTER`; nunca texto cru, nunca
-`channel_caps`. **`stage_plan()` ignora qualquer ordenação sugerida pelo LLM:** se há `ingestion`, ela
-é o estágio 1 sozinha e todo o resto forma o estágio 2 paralelo. `state["plan"]` só é escrito depois
-de `stage_plan()`. Truncamento em quatro passos registra em `errors` e na métrica `agent_plan_steps`,
+`channel_caps`. **`stage_plan()` ignora qualquer ordenação sugerida pelo LLM:** cada passo de
+`ingestion` ocupa um estágio serial, com writes antes de `close_session`/`discard_session`; só depois
+todo o resto forma o estágio paralelo. `state["plan"]` só é escrito depois de `stage_plan()`.
+Truncamento em quatro passos do estágio paralelo registra em `errors` e na métrica `agent_plan_steps`,
 sem inventar destino alternativo. `pending_clarification` tem precedência: o worker retoma por
 `Command(resume=…)` e o router se recusa a executar.
 
@@ -1225,7 +1243,8 @@ somar uma varredura periódica como reforço, mas o lease + autocura no próprio
 o caso descrito pela revisão sem exigir a fronteira cross-tenant desta sprint.
 
 **Primeiros testes que devem falhar.** `test_stage_plan_puts_ingestion_before_readers` — plano com
-`analysis` antes de `ingestion` sai estagiado com ingestão sozinha no estágio 1; e
+`analysis`, `log_workout` e `close_session` sai em três estágios, com os dois passos de ingestão
+seriais antes do leitor; e
 `test_dispatch_reserves_only_priced_steps_before_any_send`, com duas estimativas cobradas que,
 juntas, excedem o saldo e `assert priced_sends == []`.
 

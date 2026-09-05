@@ -180,13 +180,28 @@ CREATE TABLE exercise_set_source (
     -- participa da FK, fica intocado, porque ele identifica o DONO desta linha de proveniência,
     -- não a mensagem apagada. Diferente do MATCH SIMPLE que o ADR-0003 teve de fechar: ali um
     -- NULL era gravável pela aplicação e virava brecha; aqui NULL só é alcançado por este próprio
-    -- ON DELETE, nunca por um INSERT da aplicação, então não reabre o oráculo de existência.
+    -- ON DELETE: o trigger abaixo recusa INSERT da aplicação sem raw_message_id, então não reabre
+    -- o oráculo de existência.
     FOREIGN KEY (raw_message_id, tenant_id)
         REFERENCES raw_message (id, tenant_id) ON DELETE SET NULL (raw_message_id)
 );
 CREATE INDEX ix_source_tenant      ON exercise_set_source(tenant_id);
 CREATE INDEX ix_source_raw_message ON exercise_set_source(raw_message_id)
     WHERE raw_message_id IS NOT NULL;
+
+-- A coluna só pode ficar NULL pela ação ON DELETE SET NULL da FK: o runtime
+-- não cria uma evidência sem mensagem de origem, mas a retenção pode apagá-la.
+CREATE FUNCTION require_source_raw_message() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+IF NEW.raw_message_id IS NULL THEN
+RAISE EXCEPTION 'exercise_set_source requires raw_message_id on INSERT';
+END IF;
+RETURN NEW;
+END;
+$$;
+CREATE TRIGGER require_source_raw_message_on_insert
+    BEFORE INSERT ON exercise_set_source
+    FOR EACH ROW EXECUTE FUNCTION require_source_raw_message();
 
 -- A aplicação pode consultar e acrescentar evidência, mas não reescrevê-la ou
 -- apagá-la. Correções passam pelo fluxo de domínio e preservam a trilha anterior.
@@ -303,7 +318,8 @@ troca:
   (`provenance_hash`, `extraction_ordinal`, `expansion_ordinal`), duas chaves candidatas novas (em
   `exercise_set` e em `raw_message`), um índice de idempotência substituído e uma FK que usa a
   sintaxe de coluna do `ON DELETE SET NULL` (PG15+; o `docker-compose.yml` já fixa Postgres 16).
-- Os testes cobrem: os três fragmentos; offsets inválidos/fora de ordem; FK cruzada entre tenants nas
+- Os testes cobrem: os três fragmentos; `source_fragments`/`source_segments` vazios e alinhamento sem
+  span recusados antes da persistência; offsets inválidos/fora de ordem; FK cruzada entre tenants nas
   duas direções (`exercise_set_id` e `raw_message_id`); RLS de `exercise_set_source` reprovando leitura
   sem `app.tenant_id`; reprocessamento que commita mas não checkpointa (prova que `extraction_ordinal`
   + `expansion_ordinal` + `provenance_hash` bloqueiam a duplicata que `set_index` sozinho deixava
@@ -313,7 +329,8 @@ troca:
   `raw_message_id IS NULL` e o snapshot intacto; span de fragmento de texto resolvido contra
   `text_extract` e de voz contra `transcript`, nunca contra o `payload` do envelope inteiro; ausência
   de texto sintético; e tentativa do runtime de `UPDATE` ou `DELETE` em `exercise_set_source`
-  recusada por privilégio.
+  recusada por privilégio; `INSERT` sem `raw_message_id` recusado pelo trigger, mas a purga por FK
+  ainda capaz de anulá-lo.
 
 ## Condição de revisão
 
