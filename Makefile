@@ -35,10 +35,11 @@ test: ## Unit and architecture tests; no containers required
 	$(PYTEST) -m "not integration"
 
 # Section 21.4 runs these before everything: cheapest to run, costliest to
-# regress. `test_graph_reducers` and `test_graph_topology` join them in the PR
-# that introduces the graph — a topology test over no topology proves nothing.
+# regress. `test_graph_reducers` joined them in the PR that introduced the
+# graph state; `test_graph_topology` joins in the PR that introduces the root
+# graph — a topology test over no topology proves nothing.
 test-architecture: ## The architecture guardrails alone (spec 21.4)
-	$(PYTEST) tests/test_channel_isolation.py
+	$(PYTEST) tests/test_channel_isolation.py tests/test_graph_reducers.py
 
 test-integration: ## Tests that need Postgres, Redis or Qdrant (spec 21.4)
 	$(PYTEST) -m integration
