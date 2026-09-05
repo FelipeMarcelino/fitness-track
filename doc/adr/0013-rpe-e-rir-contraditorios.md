@@ -23,7 +23,10 @@ pelo LLM só pode ser `explicit`. Valor e origem sempre aparecem juntos, portant
 camada posterior sabe se os dois valores vieram de declarações explícitas sem tentar
 reconstruir essa informação do texto. A regra de derivar RIR a partir de RPE só vale
 quando RIR não foi informado explicitamente, roda em `domain/rpe.py`, fora do LLM, e o
-DTO de persistência marca o resultado como `rir_origin="derived"`.
+DTO de persistência marca o resultado como `rir_origin="derived"`. Como RPE aceita uma
+casa decimal e RIR é `SMALLINT`, o cálculo transforma RPE em `Decimal`, faz
+`Decimal("10") - rpe` e aplica `quantize(Decimal("1"), ROUND_HALF_UP)` antes da
+persistência: RPE 7.5 deriva RIR 3. Não há truncamento implícito nem RIR decimal.
 
 O fluxo pede esclarecimento somente quando a contradição tornar o registro inviável;
 caso contrário, persiste o melhor registro com a sinalização de baixa confiança. A
@@ -35,6 +38,7 @@ outro número explícito.
 O histórico preserva o que foi dito e deixa a incerteza visível para a confirmação em
 texto, em vez de apresentar uma falsa coerência. Há casos de baixa confiança a mais,
 mas eles são auditáveis e não contaminam a regra determinística com exceções implícitas.
+O RIR derivado cabe sempre na coluna inteira e tem arredondamento único, versionado e testável.
 
 ## Condição de revisão
 

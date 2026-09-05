@@ -1864,9 +1864,10 @@ rodassem juntos, o leitor poderia consultar antes do `COMMIT`. Dois passos de `i
 correm juntos: um finalizador de sessão pode ler antes do `log_workout` que deveria fechar.
 
 ```
-1. `stage_plan()` separa todos os passos de `ingestion`: writes (`log_workout`, `log_metric`,
-   `correct_entry`) vêm primeiro; finalizadores (`close_session`, `discard_session`) vêm depois.
-   A ordem original é estável dentro de cada grupo e cada passo ocupa seu próprio estágio.
+1. `stage_plan()` separa todos os passos de `ingestion`, preserva a ordem plana proposta pelo router e
+   dá a cada passo seu próprio estágio. Assim, `log_workout → close_session` fecha a sessão que acabou
+   de receber a série, enquanto `close_session → log_workout` fecha a sessão anterior antes de abrir a
+   próxima; nenhum dos dois é reordenado.
 2. Só depois de todos os estágios de `ingestion`, os passos restantes (`analysis`, `recommendation`,
    `admin`, `smalltalk`) são agrupados em rodadas paralelas estáveis: a primeira ocorrência de cada
    alvo vai para a primeira rodada, a segunda ocorrência daquele alvo vai para a segunda, e assim por
@@ -2099,13 +2100,15 @@ medição vem antes da otimização.
 autoridade que agrupa os passos conforme a §8.8.
 
 ```python
+from pydantic import Field
+
 class RouteStep(BaseModel):
     target: Literal["ingestion", "analysis", "recommendation", "admin", "smalltalk"]
     intent: str
     payload: dict = {}
 
 class RoutingPlan(BaseModel):
-    steps: list[RouteStep]
+    steps: list[RouteStep] = Field(max_length=4)
     rationale: str      # uma frase; vai para o trace, não para o usuário
 ```
 
@@ -2131,9 +2134,10 @@ interpretáveis, e o que permite ao `dispatch` falhar cedo num alvo inexistente 
    erro.
 3. **`pending_clarification` tem precedência.** Se `answers_clarification=True`, o worker nem chama o
    router: retoma o grafo por `Command(resume=...)` (§8.7).
-4. **Teto de 4 passos por estágio paralelo.** É o número de alvos paralelizáveis. Cada passo de
-   `ingestion` ocupa seu próprio estágio e não conta para esse fan-out. Um plano maior é sintoma de
-   prompt quebrado e é truncado com registro em `errors`.
+4. **Teto de 4 passos no plano linear.** `RoutingPlan.steps` aplica `max_length=4` **antes** de
+   `stage_plan()`: o limite não é por estágio, porque ingestões e destinos repetidos ocupam estágios
+   sucessivos. Uma quinta proposta é inválida na fronteira Pydantic e dispara o retry/fallback normal
+   do gateway; nunca é truncada silenciosamente depois de criar estágios.
 
 ### 9.5 Contrato do `extraction_agent`
 
@@ -2184,7 +2188,12 @@ class ExtractionResult(BaseModel):
 ```
 
 Um `model_validator` do schema rejeita qualquer par `rpe`/`rpe_origin` ou `rir`/`rir_origin` em que
-somente valor ou origem esteja presente.
+somente valor ou origem esteja presente. O mesmo validador aplica a matriz de unidades por destino
+**antes** de `domain/units.py`: `load` aceita somente `kg`/`lb`; `distance`, `m`/`km`/`cm`;
+`duration`/`hold`/`rest`, `h`/`min`/`s`. Métricas usam uma tabela fechada por `kind` — `peso`:
+`kg`/`lb`, `cintura`/`braco`: `cm`, `sono_h`: `h`, `disposicao`/`dor`: `scale_0_10` — e kind ou
+unidade fora da tabela reprova. `QuantityLiteral` continua o envelope comum, mas não torna uma unidade
+válida em todos os campos.
 
 **Regras de extração codificadas no prompt:**
 
@@ -2222,10 +2231,11 @@ inferência textual. O schema registra essa diferença: `rpe_origin="explicit"` 
 usuário e `rpe_origin="inferred"` para o mapa acima; `rir_origin` da saída crua só pode ser
 `"explicit"`. Valor e origem são obrigatoriamente preenchidos juntos. Se RPE e RIR forem ambos
 explícitos e contraditórios, os dois são preservados e a extração fica `low_confidence`; o sistema não
-corrige um número pelo outro. `domain/rpe.py` deriva `RIR ≈ 10 − RPE` somente quando não houve RIR
-explícito, depois da validação Pydantic; o DTO de persistência marca esse resultado como
-`rir_origin="derived"`, valor que o LLM nunca emite. Esclarecimento só é pedido quando a contradição
-inviabilizar o registro (ADR-0013).
+corrige um número pelo outro. `domain/rpe.py` deriva RIR somente quando não houve RIR explícito,
+depois da validação Pydantic: converte o RPE de uma casa para `Decimal`, calcula `Decimal("10") − rpe`
+e aplica `quantize(Decimal("1"), ROUND_HALF_UP)` antes de persistir o `SMALLINT`. Assim RPE 7.5 deriva
+RIR 3 de modo determinístico; o DTO marca esse resultado como `rir_origin="derived"`, valor que o LLM
+nunca emite. Esclarecimento só é pedido quando a contradição inviabilizar o registro (ADR-0013).
 
 ### 9.7 Contrato do `analysis_agent`
 

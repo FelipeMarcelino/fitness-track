@@ -142,13 +142,13 @@ o teste de arquitetura que sustenta a §8.8.
    chave nova que não apareça em nenhum dos dois **reprova o teste** — é o que impede o campo
    acrescentado sem decisão.
 3. `stage_plan(steps) -> list[PlanStage]` serializa **cada** passo de `ingestion` antes de qualquer
-   leitor: writes (`log_workout`, `log_metric`, `correct_entry`) vêm antes de finalizadores
-   (`close_session`, `discard_session`), preservando a ordem original dentro de cada grupo; cada passo
-   ocupa um estágio próprio. Depois, passos não-ingestion formam rodadas paralelas estáveis com **no
-   máximo um passo por target**: a segunda ocorrência de `analysis`, por exemplo, só entra na rodada
+   leitor, preservando a ordem plana do router: cada passo ocupa um estágio próprio, sem mover um
+   `close_session` que venha antes de um novo `log_workout`. Depois, passos não-ingestion formam
+   rodadas paralelas estáveis com no máximo um passo por target: a segunda ocorrência de `analysis`,
+   por exemplo, só entra na rodada
    seguinte. Sem `ingestion`, aplicam-se essas mesmas rodadas. `close_session` e `discard_session`
-   juntos são inválidos. O teto da §9.4 regra 4 é 4 passos no estágio paralelo, truncando com registro
-   em `errors`.
+   juntos são inválidos. `RoutingPlan.steps` limita o plano **linear** a quatro passos antes de
+   `stage_plan()`; uma quinta proposta reprova a validação, em vez de ser truncada.
 4. **Resolver o conflito com `test_channel_isolation`** — ver
    [ambiguidade #3](#3-channel_caps-no-graphstate-reprova-o-teste-de-isolamento-hoje). Separar
    `IMPORT_EXCEPTIONS` de `CAPS_EXCEPTIONS`, e acrescentar a asserção substituta: `state.py` menciona
@@ -157,8 +157,9 @@ o teste de arquitetura que sustenta a §8.8.
    não apaga; `BatchReset()` vindo do runner apaga exatamente uma vez antes do batch seguinte.
    `bounded_add_messages` é exercitado com 13+ mensagens e nunca devolve mais de 12. O teste de
    staging prova que `log_workout` seguido de `close_session` e `analyze_progress` vira três estágios
-   ordenados, para que o fechamento leia a série já commitada; a dupla `close_session` e
-   `discard_session` é rejeitada antes do dispatch.
+   ordenados, para que o fechamento leia a série já commitada, e que `close_session` seguido de
+   `log_workout` preserva a fronteira entre sessões; a dupla `close_session` e `discard_session` é
+   rejeitada antes do dispatch.
 
 **Primeiro teste que deve falhar.**
 `tests/test_graph_reducers.py::test_a_parallel_stage_merges_every_concurrent_key` →
@@ -587,6 +588,12 @@ adiante para a T12. `source_text` não é prova de uma série: para um único sp
 receber aquele recorte literal; para múltiplos spans fica `NULL`, nunca uma concatenação de
 `clean_text` ou a escolha enganosa de um fragmento.
 
+Antes dessa fronteira, o validador Pydantic confere a unidade permitida por campo: carga só aceita
+kg/lb, distância m/km/cm, duração/hold/rest h/min/s, e cada métrica consulta a tabela fechada do
+próprio `kind` (`peso` kg/lb, `cintura`/`braco` cm, `sono_h` h e `disposicao`/`dor` scale_0_10).
+`load=10 min`, `duration=30 kg`, kind desconhecido e unidade incompatível falham na fronteira LLM,
+antes de `domain/units.py`.
+
 `domain/units.py` é a única fronteira que converte `QuantityLiteral` em DTO de persistência
 (`load_kg`, `distance_m`, `duration_s`/`hold_s`/`rest_s` ou métrica): usa `Decimal("0.45359237")`
 para lb → kg, `Decimal("1000")` para km → m, `Decimal("0.01")` para cm → m, `Decimal("60")` para min → s e
@@ -594,8 +601,10 @@ para lb → kg, `Decimal("1000")` para km → m, `Decimal("0.01")` para cm → m
 `quantize(Decimal("0.01"), ROUND_HALF_UP)` **uma vez**, no limite de armazenamento — para os campos
 `INTEGER` de tempo, `to_integral_value(ROUND_HALF_UP)` no lugar de `quantize` (ADR-0018). O prompt só
 classifica e devolve o número literal mais a unidade; ele não calcula, não arredonda e não emite
-`load_kg` para entrada em lb nem `duration_s` para entrada em minutos. `domain/rpe.py`, **e só ele** (ADR-0018), também aplica
-`RIR ≈ 10 − RPE` apenas depois da resposta, para inferência derivada, preservando o RIR explícito.
+`load_kg` para entrada em lb nem `duration_s` para entrada em minutos. `domain/rpe.py`, **e só ele** (ADR-0018), também deriva
+RIR apenas depois da resposta, preservando o RIR explícito: transforma RPE de uma casa em `Decimal`,
+calcula `Decimal("10") - rpe` e aplica `quantize(Decimal("1"), ROUND_HALF_UP)` antes do `SMALLINT`.
+Logo, RPE 7.5 deriva RIR 3, nunca um decimal ou uma conversão implícita.
 O schema registra `rpe_origin` (`explicit` ou `inferred`) e `rir_origin` (`explicit` na saída crua),
 exigindo valor e origem juntos; só o DTO de persistência pode usar `rir_origin="derived"`. Assim a
 contradição é detectável sem pedir que o domínio infira a origem novamente do texto.
@@ -610,6 +619,8 @@ produz os três `SourceSpan` esperados, rejeitando `source_text` sintético.
 `test_normalize_100_lb_with_decimal_half_up` afirma `Decimal("45.36")` no DTO de persistência e que o
 fake do LLM devolveu somente `100` + `"lb"`; `test_normalize_50_cm_to_m_with_decimal` afirma
 `Decimal("0.50")` e que o fake devolveu somente `50` + `"cm"`.
+`test_rejects_incompatible_quantity_unit` envia `load=10 min`, `duration=30 kg` e `sono_h=8 cm`;
+`test_derives_integer_rir_from_fractional_rpe` afirma que RPE 7.5 gera RIR derivado 3.
 
 **Critérios de aceite:** "muito fácil" → RPE 3; "falhei" → 10; RPE/RIR numérico explícito prevalece
 sobre adjetivo; `3x10` continua uma unidade de extração (as três linhas físicas são provadas na T12);
@@ -619,7 +630,8 @@ recusados **antes de tocar o banco**; testes de unidades cobrem kg/lb/km/cm e mi
 arredondamento fixos (`quantize` para carga/distância, `to_integral_value` para os `INTEGER` de
 tempo), incluindo h → s, e provam que nenhuma saída do LLM em lb, minutos ou horas chega a
 `load_kg`/`duration_s` sem passar por `domain/units.py`; RPE/RIR explícitos contraditórios preservam
-ambos com origem explícita e baixa confiança.
+ambos com origem explícita e baixa confiança; unidade incompatível é rejeitada antes de
+`domain/units.py` e RPE fracionário deriva RIR inteiro com `ROUND_HALF_UP`.
 
 **Tamanho:** M. Ver [ambiguidade #2](#2-rpe-e-rir-explícitos-e-contraditórios).
 
@@ -1167,7 +1179,8 @@ T28 — é o contrato que todo mundo espera.
 `agents/__init__.py`.
 
 **Plano.** `Target`, intents fechados e `RouteStep`/`RoutingPlan` validados contra a tabela da §9.4,
-com `extra="forbid"`. `VoiceOutput` com validação **por modo** (`reaction` exige emoji **e**
+com `extra="forbid"`; `RoutingPlan.steps` tem `max_length=4` no plano linear, antes de
+`stage_plan()`. `VoiceOutput` com validação **por modo** (`reaction` exige emoji **e**
 `fallback_text` — decisão #24/ADR-0015: quem redige o texto de degradação de uma reação recusada ou
 com alvo ausente/não endereçável (`press:`) é o `voice`; exigir que o adaptador invente palavra visível ao usuário viola a
 invariante 2 — e proíbe split; `text` proíbe emoji/botões/mídia; `buttons` exige pergunta e opções;
@@ -1202,11 +1215,12 @@ S03-T07 (quota).
 `graph/root.py`, `llm/roles.py`, golden set de roteamento.
 
 **Plano.** Uma chamada ao gateway com `agent="router"`, `role=LLMRole.ROUTER`; nunca texto cru, nunca
-`channel_caps`. **`stage_plan()` ignora qualquer ordenação sugerida pelo LLM:** cada passo de
-`ingestion` ocupa um estágio serial, com writes antes de `close_session`/`discard_session`; só depois
-o resto forma rodadas paralelas estáveis, cada uma com no máximo um passo por target. `state["plan"]`
-só é escrito depois de `stage_plan()`. Truncamento em quatro passos do estágio paralelo registra em
-`errors` e na métrica `agent_plan_steps`, sem inventar destino alternativo. `pending_clarification` tem precedência: o worker retoma por
+`channel_caps`. `RoutingPlan.steps` é validado com máximo de quatro passos **antes** do estagiamento:
+o router recebe retry/fallback se exceder, sem truncar input válido. **`stage_plan()` ignora qualquer
+agrupamento sugerido pelo LLM, mas preserva a ordem plana dos passos de `ingestion`**; cada um ocupa
+um estágio serial. Só depois o resto forma rodadas paralelas estáveis, cada uma com no máximo um passo
+por target. `state["plan"]` só é escrito depois de `stage_plan()`. `pending_clarification` tem
+precedência: o worker retoma por
 `Command(resume=…)` e o router se recusa a executar.
 
 Antes do primeiro `Send` de **cada** estágio, `dispatch` chama
@@ -1257,6 +1271,9 @@ o caso descrito pela revisão sem exigir a fronteira cross-tenant desta sprint.
 `analysis`, `log_workout` e `close_session` sai em três estágios, com os dois passos de ingestão
 seriais antes do leitor; `test_stage_plan_serializes_duplicate_targets` — duas análises e uma
 recomendação saem em duas rodadas, com a recomendação paralela à primeira análise; e
+`test_routing_plan_rejects_a_fifth_step` — o schema rejeita antes de `stage_plan()`; e
+`test_stage_plan_preserves_close_before_new_workout` — `close_session`, `log_workout` mantém essa
+ordem em estágios consecutivos; e
 `test_dispatch_reserves_only_priced_steps_before_any_send`, com duas estimativas cobradas que,
 juntas, excedem o saldo e `assert priced_sends == []`.
 

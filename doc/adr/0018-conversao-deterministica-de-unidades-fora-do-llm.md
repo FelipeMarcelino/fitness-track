@@ -47,6 +47,12 @@ mesmo limite aplica `to_integral_value(ROUND_HALF_UP)` em vez de `quantize` para
 de "uma vez, no limite" continua a mesma, só a função de arredondamento muda com o tipo de destino. O
 gateway/prompt não tem permissão para emitir campo convertido, arredondado ou derivado.
 
+Antes de chegar ao conversor, o schema também valida a compatibilidade entre campo e unidade: carga
+aceita kg/lb, distância m/km/cm e tempos h/min/s; métricas consultam a tabela fechada do seu `kind`.
+`QuantityLiteral` é o envelope comum, não uma autorização para usar qualquer unidade em qualquer
+destino. Um par incompatível reprova na fronteira Pydantic, em vez de delegar uma decisão semântica a
+`domain/units.py`.
+
 **Fora de escopo, de propósito: RIR.** Este ADR cobre só a conversão de unidade de uma
 `QuantityLiteral` (kg/lb, km/m e as demais da §9.5) — grandeza física para grandeza física, com
 constante de conversão fixa. `RIR ≈ 10 − RPE` não é conversão de unidade: é uma inferência derivada
@@ -63,7 +69,8 @@ O schema de extração fica mais explícito e testes podem fixar entradas como `
 mas a mesma regra
 cobre retry, fallback e qualquer provider. A errata da §9.5 precisa substituir a instrução de
 conversão no prompt pelo contrato literal e pela fronteira determinística, para distância **e** para
-tempo. Fixar RIR em `domain/rpe.py` (e não aqui) evita que uma leitura futura deste ADR reintroduza a
+tempo. Os testes também rejeitam `load=10 min`, `duration=30 kg` e métrica com unidade incompatível
+antes do conversor. Fixar RIR em `domain/rpe.py` (e não aqui) evita que uma leitura futura deste ADR reintroduza a
 derivação em `units.py` e duplique o cálculo.
 
 ## Condição de revisão
