@@ -16,11 +16,13 @@ from __future__ import annotations
 
 from typing import Any, ClassVar
 
+from langchain_core.messages import BaseMessage
+
 from fittrack.config import Provider
 from fittrack.llm.providers.base import (
-    ProviderError,
     ProviderRequest,
     ProviderResponse,
+    provider_failure,
     sanitize_params,
 )
 
@@ -38,6 +40,26 @@ DEFAULT_MAX_TOKENS = 4096
 _THINKING = {"type": "adaptive"}
 
 _ROLES = {"human": "user", "ai": "assistant", "tool": "user"}
+
+
+def _without_prefill(messages: tuple[BaseMessage, ...]) -> tuple[BaseMessage, ...]:
+    """Drop trailing assistant turns, which Anthropic reads as a prefill.
+
+    Spec 7.4 is blunt about it: prefill is a 400 on the current models, "nunca
+    usar". But a history whose last turn is the bot's is ordinary — Groq
+    accepts exactly that, and the graph's `messages` (spec 8.2) can well end
+    with an `AIMessage`. The provider cannot tell an accidental trailing turn
+    from a deliberate prefill, so this path removes it.
+
+    Dropping rather than raising: this adapter is every role's *fallback*
+    (7.2), and refusing the call would defeat the one mechanism 7.3 has to
+    rescue a failed primary — over a turn the model was about to regenerate
+    anyway.
+    """
+    kept = list(messages)
+    while kept and kept[-1].type == "ai":
+        kept.pop()
+    return tuple(kept)
 
 
 class AnthropicProvider:
@@ -65,7 +87,7 @@ class AnthropicProvider:
             "max_tokens": params.pop("max_tokens", DEFAULT_MAX_TOKENS),
             "messages": [
                 {"role": _ROLES.get(message.type, "user"), "content": message.content}
-                for message in request.messages
+                for message in _without_prefill(request.messages)
                 if message.type != "system"
             ],
             **params,
@@ -74,7 +96,22 @@ class AnthropicProvider:
             payload["system"] = system
         if effort:
             payload["thinking"] = dict(_THINKING)
-            payload["output_config"] = {"effort": effort}
+        # One object carries both halves (`OutputConfigParam`), so the schema
+        # and the effort cannot be written independently without the second
+        # erasing the first.
+        output_config: dict[str, Any] = {}
+        if effort:
+            output_config["effort"] = effort
+        if request.schema is not None:
+            # Anthropic's own structured-output format (spec 7.4). Without it,
+            # a structured role that falls back here gets prose, and the
+            # gateway rejects the very answer the fallback existed to produce.
+            output_config["format"] = {
+                "type": "json_schema",
+                "schema": request.schema.model_json_schema(),
+            }
+        if output_config:
+            payload["output_config"] = output_config
         return payload
 
     async def complete(self, request: ProviderRequest) -> ProviderResponse:
@@ -83,7 +120,7 @@ class AnthropicProvider:
                 **self.build_payload(request), timeout=request.timeout_s
             )
         except Exception as error:
-            raise ProviderError(f"anthropic call failed: {type(error).__name__}") from None
+            raise provider_failure("anthropic", error) from None
 
         # The first *text* block, not the first block: with `thinking` on, the
         # reasoning block comes first and is not the answer.

@@ -31,10 +31,15 @@ from pydantic import BaseModel, ValidationError
 
 from fittrack.config import ModelsConfig, ModelSpec
 from fittrack.llm.providers.base import LLMProvider, ProviderRequest
-from fittrack.llm.roles import LLMRole
+from fittrack.llm.roles import AGENT_ROLES, LLMRole
 from fittrack.llm.types import LLMResult, TokenUsage
 
-__all__ = ["LLMGateway", "RoleHasNoPrimaryError", "SchemaViolationError"]
+__all__ = [
+    "LLMGateway",
+    "RoleHasNoPrimaryError",
+    "SchemaViolationError",
+    "UnknownAgentError",
+]
 
 
 class RoleHasNoPrimaryError(LookupError):
@@ -44,6 +49,14 @@ class RoleHasNoPrimaryError(LookupError):
     model that produced the answer is not a judge (spec 7.2). It runs offline
     from `evals/`, never through this path — so naming the role here is more
     useful than an `AttributeError` on `None.model` one frame down.
+    """
+
+
+class UnknownAgentError(ValueError):
+    """The `(agent, role)` pair is not one `AGENT_ROLES` registers.
+
+    A `ValueError` rather than a `LookupError`: this is a bad argument at the
+    call site, not a missing entry the caller could not have known about.
     """
 
 
@@ -121,11 +134,41 @@ class LLMGateway:
     def _primary_for(self, *, agent: str, role: LLMRole) -> ModelSpec:
         resolved = self._models.resolve(agent=agent, role=role)
         if resolved.primary is None:
+            # Checked before the pair, and the order matters: "is this role
+            # invocable at all" is a property of the role alone, while the
+            # check below is about the pairing. The JUDGE reaches this and
+            # nothing else can — `ModelsConfig` refuses at boot any other role
+            # without a primary.
             raise RoleHasNoPrimaryError(
                 f"role {role.value} has no primary model and is not invocable "
                 "through the gateway (spec 7.2)"
             )
+        _require_registered_pair(agent=agent, role=role)
         return resolved.primary
+
+
+def _require_registered_pair(*, agent: str, role: LLMRole) -> None:
+    """The agent must be registered, and under the role it is invoking.
+
+    `ModelsConfig.resolve()` compares the two only when an `agents:` override
+    exists — and the shipped configuration has none (7.2.1 recommends none for
+    phase 1.0). So without this, `agent="extraction", role=COACH` resolves
+    happily: it buys the reasoning tier for an extraction and labels the cost
+    `extraction` while doing it. That is a call-site mistake that surfaces as a
+    line on the bill rather than as an error, which is the shape of failure
+    `AGENT_ROLES` was built to prevent — its own docstring says so about the
+    configuration side of the same mapping.
+    """
+    registered = AGENT_ROLES.get(agent)
+    if registered is None:
+        raise UnknownAgentError(
+            f"{agent!r} is not a registered agent; every LLM caller is in "
+            "AGENT_ROLES (spec 9.2), and the name labels every metric of 20.3"
+        )
+    if registered is not role:
+        raise UnknownAgentError(
+            f"agent {agent!r} invokes role {registered.value}, not {role.value} (spec 7.2.1)"
+        )
 
 
 def _params_of(spec: ModelSpec) -> dict[str, object]:

@@ -32,12 +32,79 @@ __all__ = [
     "ProviderError",
     "ProviderRequest",
     "ProviderResponse",
+    "provider_failure",
     "sanitize_params",
 ]
 
 
 class ProviderError(RuntimeError):
-    """A provider could not answer. S03-T07 classifies these for retry."""
+    """A provider could not answer, with the category the retry policy reads.
+
+    Spec 7.3 routes four outcomes differently: 429/5xx/timeout/connection retry
+    and then fall back; a context-limit 400 falls back *without* retrying,
+    because it is the one 400 another provider's window can resolve; any other
+    400 is a programming error and must not reach the fallback at all.
+
+    Telling those apart needs more than an exception class name — both 400s
+    arrive as the SDK's bad-request type. So the status travels, and whether it
+    was a context-limit travels with it.
+
+    The provider's *message* deliberately does not. It quotes the request back,
+    and the request is the user's text (invariant 10, spec 20.6).
+    """
+
+    def __init__(
+        self,
+        vendor: str,
+        *,
+        status_code: int | None = None,
+        context_limit: bool = False,
+        kind: str = "error",
+    ) -> None:
+        detail = f"HTTP {status_code}" if status_code is not None else kind
+        if context_limit:
+            detail += ", context limit"
+        super().__init__(f"{vendor} call failed ({detail})")
+        self.vendor = vendor
+        self.status_code = status_code
+        self.context_limit = context_limit
+
+
+# What each vendor says when the prompt does not fit. Substrings rather than
+# exact messages: the wording is theirs and changes without notice.
+#
+# This is a net, not the mechanism. Spec 7.3 puts a token-count preflight ahead
+# of the call precisely because discovering the limit from an error costs a
+# wasted call — but the estimate uses a different tokenizer than the provider,
+# so an estimate that runs low still lands here.
+_CONTEXT_LIMIT_MARKERS = (
+    "context_length_exceeded",
+    "context length",
+    "context window",
+    "prompt is too long",
+    "too many tokens",
+    "maximum context",
+    "request too large",
+)
+
+
+def provider_failure(vendor: str, error: Exception) -> ProviderError:
+    """Classify an SDK exception into the categories 7.3 routes on.
+
+    Reads the message to set the flag and then drops it: the classification is
+    the only part safe to carry forward.
+    """
+    status_code = getattr(error, "status_code", None)
+    if not isinstance(status_code, int):
+        status_code = None
+    message = str(error).lower()
+    context_limit = any(marker in message for marker in _CONTEXT_LIMIT_MARKERS)
+    return ProviderError(
+        vendor,
+        status_code=status_code,
+        context_limit=context_limit,
+        kind=type(error).__name__,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +158,14 @@ GPT_OSS_FAMILY = "gpt-oss"
 # (spec 7.4, sampling row), so the gateway removes rather than forwards.
 _ANTHROPIC_REJECTS = frozenset({"temperature", "top_p"})
 
+# `effort` is Anthropic's spelling of the reasoning knob; Groq's is
+# `reasoning_effort`, and its API has no `effort` at all. `ModelSpec` accepts
+# both fields for either provider — `models.yaml` uses one on the primaries and
+# the other on the fallbacks — so an agent override that merged the wrong one
+# onto a Groq spec would forward a keyword that provider does not have.
+# Provider-wide, unlike the rule below, because no Groq model takes it.
+_GROQ_REJECTS = frozenset({"effort"})
+
 # Valid on other Groq models; an error on this family (spec 7.4).
 _GPT_OSS_REJECTS = frozenset({"reasoning_format"})
 
@@ -98,8 +173,10 @@ _GPT_OSS_REJECTS = frozenset({"reasoning_format"})
 def _rejected_by(provider: Provider, model: str) -> frozenset[str]:
     if provider == "anthropic":
         return _ANTHROPIC_REJECTS
-    if provider == "groq" and GPT_OSS_FAMILY in model:
-        return _GPT_OSS_REJECTS
+    if provider == "groq":
+        if GPT_OSS_FAMILY in model:
+            return _GROQ_REJECTS | _GPT_OSS_REJECTS
+        return _GROQ_REJECTS
     return frozenset()
 
 

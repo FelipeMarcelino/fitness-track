@@ -35,7 +35,7 @@ from pydantic import BaseModel
 from fittrack.config import ModelsConfig, Provider, load_config
 from fittrack.llm.gateway import LLMGateway, RoleHasNoPrimaryError
 from fittrack.llm.providers.base import ProviderRequest, ProviderResponse
-from fittrack.llm.roles import LLMRole
+from fittrack.llm.roles import AGENT_ROLES, LLMRole
 from fittrack.llm.types import LLMResult
 
 CONFIG_DIR = Path(__file__).resolve().parents[2] / "config"
@@ -199,6 +199,50 @@ async def test_a_role_without_a_primary_is_refused_by_name() -> None:
             tenant_id=7,
             messages=turn(),
         )
+
+
+async def test_an_agent_invoked_under_the_wrong_role_is_refused() -> None:
+    """`AGENT_ROLES` says which role each agent invokes; the pair is checked.
+
+    With no `agents:` override — the shipped configuration — `resolve()` has
+    nothing to compare against and returns whatever role was asked for. So
+    `agent="extraction", role=COACH` would quietly buy the reasoning tier for
+    an extraction and label the metric `extraction` while doing it: a call-site
+    mistake that shows up as a cost line, not as an error.
+    """
+    with pytest.raises(ValueError, match="extraction"):
+        await gateway(FakeProvider()).ainvoke(
+            agent="extraction",
+            role=LLMRole.COACH,
+            tenant_id=7,
+            messages=turn(),
+            schema=Extracted,
+        )
+
+
+async def test_an_unregistered_agent_is_refused() -> None:
+    """A misspelled agent resolves fine and labels every metric with a name
+    nothing else in the system uses (spec 20.3).
+    """
+    with pytest.raises(ValueError, match="extractoin"):
+        await gateway(FakeProvider()).ainvoke(
+            agent="extractoin",
+            role=LLMRole.EXTRACTOR,
+            tenant_id=7,
+            messages=turn(),
+            schema=Extracted,
+        )
+
+
+async def test_every_registered_agent_may_invoke_its_own_role() -> None:
+    """The guard must not reject the sixteen pairs that are correct."""
+    fake = FakeProvider()
+    invocable = {agent: role for agent, role in AGENT_ROLES.items() if role is not LLMRole.JUDGE}
+
+    for agent, role in invocable.items():
+        await gateway(fake).ainvoke(agent=agent, role=role, tenant_id=7, messages=turn())
+
+    assert len(fake.calls) == len(invocable)
 
 
 async def test_an_unconfigured_provider_is_refused_before_the_call() -> None:

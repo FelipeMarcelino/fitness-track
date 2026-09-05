@@ -19,9 +19,9 @@ from typing import Any, ClassVar
 
 from fittrack.config import Provider
 from fittrack.llm.providers.base import (
-    ProviderError,
     ProviderRequest,
     ProviderResponse,
+    provider_failure,
     sanitize_params,
 )
 
@@ -74,9 +74,11 @@ class GroqProvider:
                 **self.build_payload(request), timeout=request.timeout_s
             )
         except Exception as error:
-            # The type, never the message: a provider error can quote the
+            # The category, never the message: a provider error can quote the
             # request body back, and the body is the user's text (spec 20.6).
-            raise ProviderError(f"groq call failed: {type(error).__name__}") from None
+            # `provider_failure` keeps the status and the context-limit flag,
+            # which is what the policy of 7.3 routes on.
+            raise provider_failure("groq", error) from None
 
         text = answer.choices[0].message.content or ""
         usage = getattr(answer, "usage", None)

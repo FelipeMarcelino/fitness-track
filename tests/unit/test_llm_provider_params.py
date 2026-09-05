@@ -17,6 +17,12 @@ Nothing here is a model *choice* — that stays in `config/models.yaml` and is
 resolved by role (invariant 4). A family token is a capability fact about a
 provider's API, which 7.4 requires the gateway to absorb in code.
 
+The last section covers the other half of what an adapter translates: a
+**failure**. Spec 7.3 routes a 429 differently from an ordinary 400, and a
+context-limit 400 differently from both — so a `ProviderError` carrying only an
+exception class name would leave S03-T07 unable to implement that policy at
+all.
+
 No SDK client is constructed: payload building is a pure function on each
 adapter, which is what lets the shape be asserted without a network or a key.
 """
@@ -25,14 +31,33 @@ from __future__ import annotations
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from pydantic import BaseModel
 
 from fittrack.llm.providers.anthropic import AnthropicProvider
-from fittrack.llm.providers.base import ProviderRequest, sanitize_params
+from fittrack.llm.providers.base import ProviderRequest, provider_failure, sanitize_params
 from fittrack.llm.providers.groq import GroqProvider
 
 GPT_OSS = "openai/gpt-oss-120b"
 OTHER_GROQ = "llama-3.3-70b-versatile"
 CLAUDE = "claude-haiku-4-5"
+
+
+class Answer(BaseModel):
+    """A schema to require, so the structured-output path has something to send."""
+
+    reps: int
+
+
+class FakeStatusError(Exception):
+    """An SDK status error, in the only two attributes the policy reads.
+
+    Both vendors' SDKs raise `APIStatusError` subclasses carrying
+    `status_code`; the message is theirs and may quote the request back.
+    """
+
+    def __init__(self, status_code: int, message: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 def request(model: str, **params: object) -> ProviderRequest:
@@ -191,3 +216,175 @@ def test_max_tokens_is_present_because_anthropic_requires_it() -> None:
     payload = AnthropicProvider.build_payload(request(CLAUDE))
 
     assert payload["max_tokens"] > 0
+
+
+def test_effort_never_reaches_the_groq_path() -> None:
+    """`effort` is Anthropic's spelling; Groq's is `reasoning_effort`.
+
+    `ModelSpec` accepts both fields for either provider, so an agent override
+    that merged `effort` onto a Groq primary would forward a keyword that
+    provider's API does not have. The role config is not provider-discriminated,
+    so the map is where this stops.
+    """
+    clean = sanitize_params(provider="groq", model=GPT_OSS, params={"effort": "high"})
+
+    assert "effort" not in clean
+
+
+def test_reasoning_effort_still_reaches_the_groq_path() -> None:
+    """The spelling Groq does accept survives: dropping both would silence the
+    reasoning tier of 7.2 on its own primary.
+    """
+    clean = sanitize_params(provider="groq", model=GPT_OSS, params={"reasoning_effort": "high"})
+
+    assert clean["reasoning_effort"] == "high"
+
+
+# --------------------------------------------------------------------------- #
+# Anthropic structured output, and the prefill that is a guaranteed 400
+# --------------------------------------------------------------------------- #
+
+
+def structured(model: str, **params: object) -> ProviderRequest:
+    return ProviderRequest(
+        model=model,
+        messages=(HumanMessage(content="oi"),),
+        params=dict(params),
+        schema=Answer,
+        timeout_s=30,
+    )
+
+
+def test_the_anthropic_payload_carries_the_requested_schema() -> None:
+    """Without this, every structured role that falls back returns prose.
+
+    Anthropic is the fallback of every role in `models.yaml` (spec 7.2), so a
+    payload that ignored `schema` would turn each fallback of a structured
+    agent into a validation failure — defeating the one path that exists to
+    rescue the call (spec 7.3).
+    """
+    payload = AnthropicProvider.build_payload(structured(CLAUDE))
+
+    assert payload["output_config"]["format"] == {
+        "type": "json_schema",
+        "schema": Answer.model_json_schema(),
+    }
+
+
+def test_effort_and_schema_share_one_output_config() -> None:
+    """`output_config` carries both keys; writing one must not erase the other."""
+    output_config = AnthropicProvider.build_payload(structured(CLAUDE, effort="high"))[
+        "output_config"
+    ]
+
+    assert output_config["effort"] == "high"
+    assert output_config["format"]["type"] == "json_schema"
+
+
+def test_a_trailing_assistant_turn_is_dropped_on_the_anthropic_path() -> None:
+    """Spec 7.4: prefill is a 400 on the current models — "nunca usar".
+
+    A history whose last turn is the bot's is ordinary, and Groq accepts it as
+    a prefill. Forwarding it to Anthropic guarantees the failure, and doing it
+    on the *fallback* path would defeat the fallback.
+    """
+    call = ProviderRequest(
+        model=CLAUDE,
+        messages=(HumanMessage(content="oi"), AIMessage(content="olá")),
+        params={},
+        schema=None,
+        timeout_s=30,
+    )
+
+    assert AnthropicProvider.build_payload(call)["messages"] == [{"role": "user", "content": "oi"}]
+
+
+def test_an_assistant_turn_in_the_middle_survives_on_the_anthropic_path() -> None:
+    """Only a trailing one is prefill; the rest is conversation."""
+    call = ProviderRequest(
+        model=CLAUDE,
+        messages=(
+            HumanMessage(content="oi"),
+            AIMessage(content="olá"),
+            HumanMessage(content="supino"),
+        ),
+        params={},
+        schema=None,
+        timeout_s=30,
+    )
+
+    assert [turn["role"] for turn in AnthropicProvider.build_payload(call)["messages"]] == [
+        "user",
+        "assistant",
+        "user",
+    ]
+
+
+def test_a_trailing_assistant_turn_survives_on_the_groq_path() -> None:
+    """The asymmetry is the point: Groq supports prefill (spec 7.4)."""
+    call = ProviderRequest(
+        model=GPT_OSS,
+        messages=(HumanMessage(content="oi"), AIMessage(content="olá")),
+        params={},
+        schema=None,
+        timeout_s=30,
+    )
+
+    assert GroqProvider.build_payload(call)["messages"][-1]["role"] == "assistant"
+
+
+# --------------------------------------------------------------------------- #
+# A failure carries a category, never the provider's message (spec 7.3)
+# --------------------------------------------------------------------------- #
+
+
+def test_a_rate_limit_is_reported_with_its_status() -> None:
+    """7.3 retries a 429 and refuses to fall back on an ordinary 400. The
+    policy needs to tell them apart, and a class name cannot.
+    """
+    failure = provider_failure("groq", FakeStatusError(429, "slow down"))
+
+    assert failure.status_code == 429
+    assert failure.context_limit is False
+
+
+def test_a_context_limit_400_is_flagged_apart_from_an_ordinary_400() -> None:
+    """The one 400 another provider can resolve (spec 7.3, and the reason the
+    section spells out why it is the exception).
+
+    Both arrive as the SDK's bad-request error, so without the flag the
+    fallback either never happens or happens for programming errors too.
+    """
+    over = provider_failure("groq", FakeStatusError(400, "context_length_exceeded: 140k > 131k"))
+    ordinary = provider_failure("groq", FakeStatusError(400, "invalid schema for tool"))
+
+    assert (over.status_code, over.context_limit) == (400, True)
+    assert (ordinary.status_code, ordinary.context_limit) == (400, False)
+
+
+def test_the_anthropic_wording_for_a_long_prompt_is_recognised_too() -> None:
+    """The vendors word it differently; the policy is the same."""
+    failure = provider_failure("anthropic", FakeStatusError(400, "prompt is too long: 1M tokens"))
+
+    assert failure.context_limit is True
+
+
+def test_a_connection_failure_has_no_status() -> None:
+    """Timeouts and connection errors retry by 7.3 without ever having one."""
+    failure = provider_failure("anthropic", ConnectionResetError("boom"))
+
+    assert failure.status_code is None
+    assert failure.context_limit is False
+
+
+def test_a_failure_never_carries_the_provider_message() -> None:
+    """A provider error quotes the request back, and the request is the user's
+    text (invariant 10, spec 20.6). The category is the diagnosis; the body is
+    not ours to propagate.
+    """
+    secret = "supino reto com 80kg, 8 reps"
+
+    failure = provider_failure("groq", FakeStatusError(400, f"invalid request: {secret}"))
+
+    assert secret not in str(failure)
+    assert secret not in repr(failure)
