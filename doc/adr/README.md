@@ -25,8 +25,12 @@ o ADR explica *como se chegou nele*.
 | [0007](0007-stt-fora-do-llm-gateway.md) | STT fora do `LLMGateway`, configurado em `models.yaml` | aceito | — |
 | [0008](0008-coluna-propria-para-resposta-fixa.md) | Coluna própria para a resposta fixa já enviada | aceito | — |
 | [0009](0009-respostas-fixas-antes-do-grafo.md) | Respostas fixas da §11.3 antes de o `voice_agent` existir | aceito, expira na Sprint 03 | — |
+| [0010](0010-fronteira-de-manutencao-cross-tenant.md) | Fronteira de manutenção cross-tenant | aceito | — |
 | [0011](0011-sdks-nativos-na-camada-de-provider.md) | SDKs nativos na camada de provider | aceito | §7.4 (linha "SDK LangChain") |
 | [0012](0012-proveniencia-plural-da-serie.md) | Proveniência plural e imutável da série | aceito | — |
+| [0013](0013-rpe-e-rir-contraditorios.md) | RPE e RIR contraditórios | aceito | — |
+| [0014](0014-health-report-segue-para-router.md) | Achado de saúde e bloqueio são independentes | aceito | §§8.3 e 8.4 |
+| [0015](0015-fallback-text-obrigatorio-em-reacao.md) | `fallback_text` obrigatório em reação | aceito | §13.1 |
 | [0018](0018-conversao-deterministica-de-unidades-fora-do-llm.md) | Conversão determinística de unidades fora do LLM | aceito | — |
 
 > ⚠️ **ADR-0001 está referenciado mas ausente da árvore.** O `CLAUDE.md` e a §2 da spec apontam para

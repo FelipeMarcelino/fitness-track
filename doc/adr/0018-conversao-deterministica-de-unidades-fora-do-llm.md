@@ -39,12 +39,19 @@ existem depois de `domain/units.py` multiplicar. Segundo explícito (`"descansei
 `unit="s"` e passa direto, sem conversão.
 
 O conversor usa somente `Decimal`: lb → kg multiplica por `Decimal("0.45359237")`; km → m multiplica
-por `Decimal("1000")`; min → s multiplica por `Decimal("60")`. Toda normalização para as colunas
+por `Decimal("1000")`; cm → m multiplica por `Decimal("0.01")`; min → s multiplica por `Decimal("60")`; h → s multiplica por
+`Decimal("3600")`. Toda normalização para as colunas
 `NUMERIC(...,2)` (cargas e distâncias) aplica `quantize(Decimal("0.01"), ROUND_HALF_UP)` exatamente
 uma vez, no limite de persistência; `duration_s`/`hold_s`/`rest_s` são `INTEGER` (§5.2), então o
 mesmo limite aplica `to_integral_value(ROUND_HALF_UP)` em vez de `quantize` para duas casas — a regra
 de "uma vez, no limite" continua a mesma, só a função de arredondamento muda com o tipo de destino. O
 gateway/prompt não tem permissão para emitir campo convertido, arredondado ou derivado.
+
+Antes de chegar ao conversor, o schema também valida a compatibilidade entre campo e unidade: carga
+aceita kg/lb, distância m/km/cm e tempos h/min/s; métricas consultam a tabela fechada do seu `kind`.
+`QuantityLiteral` é o envelope comum, não uma autorização para usar qualquer unidade em qualquer
+destino. Um par incompatível reprova na fronteira Pydantic, em vez de delegar uma decisão semântica a
+`domain/units.py`.
 
 **Fora de escopo, de propósito: RIR.** Este ADR cobre só a conversão de unidade de uma
 `QuantityLiteral` (kg/lb, km/m e as demais da §9.5) — grandeza física para grandeza física, com
@@ -57,11 +64,13 @@ quilogramas. RIR explícito nunca é sobrescrito pelo derivado (§9.6, T09).
 
 ## Consequências
 
-O schema de extração fica mais explícito e testes podem fixar entradas como `100 lb → 45.36 kg` e
-`40 min → 2400 s` sem simular raciocínio do modelo. Há conversor e testes a mais, mas a mesma regra
+O schema de extração fica mais explícito e testes podem fixar entradas como `100 lb → 45.36 kg`,
+`50 cm → 0.50 m`, `40 min → 2400 s` e `1 h → 3600 s` sem simular raciocínio do modelo. Há conversor e testes a mais,
+mas a mesma regra
 cobre retry, fallback e qualquer provider. A errata da §9.5 precisa substituir a instrução de
 conversão no prompt pelo contrato literal e pela fronteira determinística, para distância **e** para
-tempo. Fixar RIR em `domain/rpe.py` (e não aqui) evita que uma leitura futura deste ADR reintroduza a
+tempo. Os testes também rejeitam `load=10 min`, `duration=30 kg` e métrica com unidade incompatível
+antes do conversor. Fixar RIR em `domain/rpe.py` (e não aqui) evita que uma leitura futura deste ADR reintroduza a
 derivação em `units.py` e duplique o cálculo.
 
 ## Condição de revisão

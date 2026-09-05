@@ -124,7 +124,7 @@ operar e o marginalmente mais exposto; a mitigação é a mesma dos demais dados
 | AD-12 | Fila | Redis + ARQ, lock FIFO por `tenant_id` | Redis já necessário para debounce e cache. Chaveado por tenant, **não** por identidade de canal: duas mensagens do mesmo usuário em canais diferentes serializam. |
 | AD-13 | Confirmação | Reação de emoji quando confiante, texto na dúvida | Mínimo ruído no chat durante o treino. Disponível nos dois canais, com conjuntos de emoji diferentes (§18.1). |
 | AD-14 | Orquestração | **LangGraph, com os primitivos explícitos: `StateGraph`, subgrafos compilados, `Send`, `Command`, `interrupt`, nós `defer`, `ToolNode`, `RetryPolicy` e checkpointer Postgres** | O fluxo entre agentes é um artefato declarado e versionado, não controle de fluxo espalhado. Dá checkpoint, retomada, tracing por nó e paralelismo real de graça. Ver §8. |
-| AD-15 | Roteamento | `router_agent` em toda mensagem, retornando um **plano em estágios** para três agentes de domínio | Suporta pedidos compostos nativamente; passos independentes rodam em paralelo, com escrita antes de leitura (§8.8). |
+| AD-15 | Roteamento | `router_agent` em toda mensagem, retornando um **plano de passos** para três agentes de domínio; `stage_plan()` agrupa os estágios | Suporta pedidos compostos nativamente; passos independentes rodam em paralelo, com escrita antes de leitura (§8.8). |
 | AD-16 | Agentes de domínio | **Exatamente três: `extraction`, `analysis`, `recommendation`** | São as três coisas que o produto faz. Tudo o mais é auxiliar a um deles ou infraestrutura de conversa (§9). Manter o número pequeno é o que mantém o roteamento avaliável (§21.2). |
 | AD-17 | Normalização de entrada | `conversation_normalizer` antes do guardrail e do router | Rajada fragmentada, ruído de STT e anáfora ("mais 8") são problemas de *conversa*, não de extração. Resolvê-los uma vez, num agente barato, tira ambiguidade de todos os agentes a jusante. Ver §9.3. |
 | AD-18 | Estado | 1 thread LangGraph por **tenant** + `interrupt()` com TTL | Continuidade conversacional + esclarecimento nativo. Thread por tenant, não por canal: trocar de canal continua a mesma conversa. |
@@ -322,7 +322,8 @@ t=19.0s  worker: POST /setMessageReaction {chat_id, message_id: <última da
          worker: registra custo por tenant, libera lock:{tenant_id}
 
 t=+90min scheduler: sessão #182 sem série nova há 90min
-         → fecha, gera resumo, indexa no Qdrant, envia texto de resumo
+         → fecha, gera resumo, persiste narrativa, envia texto de resumo
+           (a indexação no Qdrant começa na fase 1.1)
 ```
 
 ### 4.1 Garantias de ordenação
@@ -609,8 +610,12 @@ CREATE TABLE exercise_set (
     inferred        BOOLEAN NOT NULL DEFAULT false,  -- expandido de "3x10", não dito série a série
     confidence      NUMERIC(3,2) NOT NULL DEFAULT 1.00,
     low_confidence  BOOLEAN GENERATED ALWAYS AS (confidence < 0.75) STORED,
-    source_text     TEXT,                       -- trecho original que gerou esta linha
-    source_message_id TEXT,
+    -- Derivado de um único span literal; com múltiplas fontes fica NULL.
+    -- Nunca recebe clean_text ou uma concatenação sintética.
+    source_text     TEXT,
+    provenance_hash BYTEA NOT NULL,              -- SHA-256 dos spans canônicos
+    extraction_ordinal SMALLINT NOT NULL DEFAULT 0,
+    expansion_ordinal  SMALLINT NOT NULL DEFAULT 0,
     corrected_from  BIGINT REFERENCES exercise_set(id),
     deleted_at      TIMESTAMPTZ,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -628,7 +633,8 @@ CREATE TABLE exercise_set (
     ),
     CONSTRAINT ck_rpe_range CHECK (rpe IS NULL OR (rpe >= 0 AND rpe <= 10)),
     FOREIGN KEY (session_id, tenant_id)
-        REFERENCES workout_session(id, tenant_id) ON DELETE CASCADE
+        REFERENCES workout_session(id, tenant_id) ON DELETE CASCADE,
+    UNIQUE (id, tenant_id)
 );
 CREATE INDEX ix_set_tenant_created ON exercise_set(tenant_id, created_at DESC)
     WHERE deleted_at IS NULL;
@@ -636,16 +642,17 @@ CREATE INDEX ix_set_session ON exercise_set(session_id) WHERE deleted_at IS NULL
 CREATE INDEX ix_set_tenant_exercise ON exercise_set(tenant_id, exercise_id, created_at DESC)
     WHERE deleted_at IS NULL;
 
--- Idempotência de reprocessamento (§17.4). NULLS NOT DISTINCT (PG15+) é
--- obrigatório: sem ele, séries com source_message_id nulo escapariam da
--- unicidade e o retry de um batch duplicaria o volume do treino.
+-- Idempotência de reprocessamento (§17.4). A chave usa somente evidência
+-- canônica e ordinais atribuídos por código; set_index muda depois de um
+-- commit parcial e não pode participar dela.
 -- Fila de revisão: séries que ficaram incompletas por timeout de esclarecimento
 CREATE INDEX ix_set_incomplete ON exercise_set(tenant_id, created_at DESC)
     WHERE status = 'incomplete' AND deleted_at IS NULL;
 
 CREATE UNIQUE INDEX ux_set_idempotency
-    ON exercise_set (session_id, exercise_id, set_index, source_message_id)
-    NULLS NOT DISTINCT
+    ON exercise_set (
+        session_id, exercise_id, provenance_hash, extraction_ordinal, expansion_ordinal
+    )
     WHERE deleted_at IS NULL;
 
 -- Volume por série, materializado para as queries analíticas
@@ -663,7 +670,7 @@ WHERE s.deleted_at IS NULL
 CREATE TABLE session_summary (
     session_id      BIGINT PRIMARY KEY REFERENCES workout_session(id) ON DELETE CASCADE,
     tenant_id       BIGINT NOT NULL REFERENCES tenant(id) ON DELETE CASCADE,
-    narrative       BYTEA NOT NULL,     -- CIFRADA (§22.2); resumo indexado no RAG
+    narrative       BYTEA NOT NULL,     -- CIFRADA (§22.2); indexação começa na fase 1.1
     key_version     SMALLINT NOT NULL DEFAULT 1,
     total_volume_kg NUMERIC(10,2),
     total_sets      SMALLINT,
@@ -845,6 +852,7 @@ CREATE TABLE raw_message (
     direction          TEXT NOT NULL,  -- inbound | outbound
     msg_type           TEXT NOT NULL,  -- text | voice | image | button_reply | reaction | template
     payload            BYTEA NOT NULL, -- CIFRADA (§22.2); JSON serializado antes de cifrar
+    text_extract       BYTEA,          -- CIFRADA (§22.2); texto plano, se a mensagem tiver um
     transcript         BYTEA,          -- CIFRADA (§22.2); preenchida se áudio
     key_version        SMALLINT NOT NULL DEFAULT 1,
     received_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -852,9 +860,57 @@ CREATE TABLE raw_message (
 
     UNIQUE (identity_id, channel_message_id),
     FOREIGN KEY (identity_id, tenant_id, channel)
-        REFERENCES channel_identity(id, tenant_id, channel) ON DELETE CASCADE
+        REFERENCES channel_identity(id, tenant_id, channel) ON DELETE CASCADE,
+    UNIQUE (id, tenant_id)
 );
 CREATE INDEX ix_raw_tenant_time ON raw_message(tenant_id, received_at DESC);
+
+-- Proveniência plural e imutável de uma série. O literal continua cifrado em
+-- raw_message; depois da retenção, a relação estrutural sobrevive e a FK zera
+-- somente raw_message_id.
+CREATE TABLE exercise_set_source (
+    id              BIGSERIAL PRIMARY KEY,
+    tenant_id       BIGINT NOT NULL REFERENCES tenant(id) ON DELETE CASCADE,
+    exercise_set_id BIGINT NOT NULL,
+    raw_message_id  BIGINT,
+    position        SMALLINT NOT NULL,
+    source_field    TEXT NOT NULL,
+    fragment_index  SMALLINT NOT NULL,
+    start_offset    INTEGER NOT NULL,
+    end_offset      INTEGER NOT NULL,
+    channel         channel_kind NOT NULL,
+    occurred_at     TIMESTAMPTZ NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT ck_source_field CHECK (source_field IN ('text_extract', 'transcript')),
+    CONSTRAINT ck_span_bounds CHECK (start_offset >= 0 AND start_offset < end_offset),
+    UNIQUE (exercise_set_id, position),
+    FOREIGN KEY (exercise_set_id, tenant_id)
+        REFERENCES exercise_set(id, tenant_id) ON DELETE CASCADE,
+    FOREIGN KEY (raw_message_id, tenant_id)
+        REFERENCES raw_message(id, tenant_id) ON DELETE SET NULL (raw_message_id)
+);
+CREATE INDEX ix_source_tenant ON exercise_set_source(tenant_id);
+CREATE INDEX ix_source_raw_message ON exercise_set_source(raw_message_id)
+    WHERE raw_message_id IS NOT NULL;
+-- raw_message_id só fica NULL pela ação ON DELETE SET NULL da FK. O runtime
+-- não pode criar proveniência sem literal de origem.
+CREATE FUNCTION require_source_raw_message() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+IF NEW.raw_message_id IS NULL THEN
+RAISE EXCEPTION 'exercise_set_source requires raw_message_id on INSERT';
+END IF;
+RETURN NEW;
+END;
+$$;
+CREATE TRIGGER require_source_raw_message_on_insert
+    BEFORE INSERT ON exercise_set_source
+    FOR EACH ROW EXECUTE FUNCTION require_source_raw_message();
+-- A proveniência é append-only para o runtime: correções criam novas séries ou
+-- usam o fluxo explícito de correção, nunca alteram ou apagam sua evidência.
+REVOKE UPDATE, DELETE ON exercise_set_source FROM fittrack_app;
+-- Esta tabela nasce depois da migração que instalou RLS. A própria migração
+-- que a cria deve executar ENABLE/FORCE ROW LEVEL SECURITY e a policy
+-- tenant_isolation da §19.1; RLS não é herdada nem aplicada automaticamente.
 
 CREATE TABLE processing_batch (
     id            BIGSERIAL PRIMARY KEY,
@@ -958,10 +1014,19 @@ Duas peças de persistência do LangGraph vivem no mesmo Postgres, e servem a co
 | `AsyncPostgresSaver` | `langgraph-checkpoint-postgres` | `checkpoints`, `checkpoint_blobs`, `checkpoint_writes` | por thread (`tenant:{id}`) | Estado do grafo a cada super-step — é o que permite `interrupt` e retomada (§8.7) |
 | `AsyncPostgresStore` | mesmo pacote | `store` | por namespace (`tenant`, id, `profile`) | Memória de longo prazo entre threads: digest de preferências, nada de dado de treino (§8.4) |
 
-Executar `await saver.setup()` e `await store.setup()` uma vez na migração inicial. As duas criam e
-gerenciam as próprias tabelas; Alembic não as versiona, e é por isso que a chamada de `setup()` fica
-num passo explícito do bootstrap em vez de escondida no `startup` da aplicação — duas réplicas de
-`ingress` subindo ao mesmo tempo correriam para criar as mesmas tabelas.
+Alembic não cria nem concede acesso a essas tabelas. O bootstrap, como owner, executa
+`await saver.setup()` e `await store.setup()` **depois** das migrações, revoga o DML que os
+privilégios default poderiam ter herdado para `fittrack_app` e só então concede o DML mínimo ao
+principal dedicado `fittrack_graph`. As duas chamadas continuam explícitas no bootstrap — nunca no
+`startup` — e são idempotentes.
+
+**Fronteira de tenant.** `thread_id = "tenant:{tenant_id}"` nasce em uma única função de código;
+o principal `fittrack_graph` é `NOSUPERUSER NOBYPASSRLS`, não é membro de `fittrack_app` e não recebe
+acesso ao domínio. `TenantEncryptedSaver` cifra todo valor de canal, inclusive primitivos, com AAD
+ligado a tenant/thread e ao slot estável: namespace/id do checkpoint, canal/versão do blob ou
+task/índice do write. `TenantScopedStore` prefixa toda operação por
+`("tenant", str(tenant_id), "profile")` e cifra cada valor com AAD de tenant, namespace e key. O
+saver e o Store brutos nunca são entregues a nós do grafo. Ver ADR-0010.
 
 **Retenção — e por que não é opcional.** `checkpoint_blobs` guarda o **estado inteiro** por
 super-step, não um delta. Uma conversa ativa com 8 super-steps por rajada e 5 rajadas por treino
@@ -994,8 +1059,9 @@ passa a dominar o banco antes de qualquer tabela de domínio (R7). Job diário a
                                     │
                     ┌───────────────┼────────────────┐
                     ▼               ▼                ▼
-            envia resumo    indexa no Qdrant   dispara gamification_agent
-            (se janela 24h)                    (PRs, streaks)
+            envia resumo   persiste narrativa  dispara gamification_agent
+            (se janela 24h)  para indexação     (PRs, streaks)
+                              na fase 1.1
 
   sessão sem nenhuma série após 30min → discarded (não gera resumo)
 ```
@@ -1025,8 +1091,9 @@ Gerado no fechamento por `summary_agent` (tier rápido), com:
   PRs detectados (via SQL).
 - **Narrativa:** texto de 2 a 4 frases descrevendo o treino, gerada pelo LLM **a partir dos números
   já calculados**, nunca recalculando.
-- **Indexação:** a narrativa vai para a coleção `user_sessions` do Qdrant com payload
-  `{tenant_id, session_id, local_date, muscle_groups, volume_kg}`.
+- **Indexação:** a narrativa é persistida agora; sua indexação na coleção `user_sessions`
+  do Qdrant, com payload `{tenant_id, session_id, local_date, muscle_groups, volume_kg}` ,
+  começa na fase 1.1. Fechar uma sessão na fase 1.0 não chama o Qdrant.
 
 ---
 
@@ -1230,7 +1297,7 @@ perdido — fica em `raw_message`.
 
 | Aspecto | Groq (`gpt-oss-120b`) | Anthropic |
 | --- | --- | --- |
-| SDK LangChain | `langchain_groq.ChatGroq` | `langchain_anthropic.ChatAnthropic` |
+| SDK | SDK nativo `groq` | SDK nativo `anthropic` |
 | Structured output | `response_format` JSON Schema (estilo OpenAI), com `strict: true` ou best-effort | `output_config.format` com `json_schema`, ou tool com `strict: true` |
 | Amostragem | `temperature`, `top_p` aceitos | **Rejeitados** em `claude-opus-5` / `claude-haiku-4-5` de nova geração → o gateway **remove** esses parâmetros no caminho Anthropic |
 | Raciocínio | `reasoning_effort`: `low` / `medium` / `high` | `thinking={"type":"adaptive"}` + `output_config={"effort": ...}` |
@@ -1243,6 +1310,9 @@ perdido — fica em `raw_message`.
 
 Consequências práticas para a implementação:
 
+0. **Os adapters são nativos.** `BaseMessage` de `langchain-core` pode ser o contrato de
+   entrada do gateway, mas é convertido na fronteira do adapter; nenhum agente instancia
+   cliente de provider diretamente (ADR-0011).
 1. **Nunca passar `temperature` no caminho Anthropic**, e **nunca passar `reasoning_format` no
    caminho gpt-oss**. Note a assimetria: o segundo é válido em *outros* modelos do Groq, então o
    mapa de parâmetros permitidos é por **`(provider, modelo)`**, não por provider.
@@ -1255,7 +1325,7 @@ Consequências práticas para a implementação:
    estrutura o resultado. Não afeta nenhum papel da fase 1.0.
 4. **Prompts compatíveis.** Todo prompt de sistema é escrito de forma neutra, sem sintaxe específica
    de provider. Blocos XML (`<exemplo>`, `<regras>`) funcionam bem nos dois.
-5. **`with_structured_output` do LangChain** normaliza a maior parte, mas o gateway valida o
+5. **Structured output do adapter nativo** normaliza a maior parte, mas o gateway valida o
    resultado com Pydantic de qualquer forma — a validação é a fonte da verdade, não o provider.
 6. **O golden set roda contra os dois providers** no CI, de modo que a troca é sempre verificada.
    É também o que transforma "o gpt-oss-120b é bom o suficiente em pt-BR?" de suposição em medida.
@@ -1304,16 +1374,26 @@ class RouteStep(TypedDict):
     payload: dict        # argumentos extraídos pelo router
 
 # Um ESTÁGIO é um conjunto de passos que rodam em PARALELO. Os estágios rodam
-# em ordem. O router decide o agrupamento; a regra está na §8.8.
+# em ordem; stage_plan() é a autoridade pela regra da §8.8.
 PlanStage = list[RouteStep]
+
+class BatchReset:
+    """Sentinela fechado, emitido apenas pelo runner antes de um batch novo."""
+
+def resettable_add(old: list, update: list | BatchReset) -> list:
+    return [] if isinstance(update, BatchReset) else operator.add(old, update)
+
+def bounded_add_messages(old: list, update: list) -> list:
+    return add_messages(old, update)[-12:]
 
 class GraphState(TypedDict):
     # --- entrada (imutável durante a execução) ---
     tenant_id: int
     batch_id: int
-    raw_fragments: list[dict]        # [{text, channel, channel_message_id, was_audio}]
+    raw_fragments: list[dict]        # [{raw_message_id, text, channel, was_audio}]
     origin_channel: Literal["telegram", "whatsapp"]
     reply_to: tuple[str, str]        # (channel, channel_message_id) da última msg
+    destination_identity_id: int     # identidade da última mensagem da rajada
 
     # --- contexto carregado antes do grafo ---
     profile: dict                    # athlete_profile + subscription tier
@@ -1325,7 +1405,7 @@ class GraphState(TypedDict):
     turn: dict | None                # NormalizedTurn: texto limpo + metadados
 
     # --- conversação ---
-    messages: Annotated[list, add_messages]   # janela curta + resumo rolante
+    messages: Annotated[list, bounded_add_messages]  # janela curta + resumo rolante
     conversation_digest: str                  # resumo das interações antigas
 
     # --- roteamento ---
@@ -1336,18 +1416,19 @@ class GraphState(TypedDict):
     # Campos escritos por ramos que podem rodar em paralelo PRECISAM de reducer.
     # Sem ele o LangGraph levanta InvalidUpdateError quando dois ramos escrevem
     # a mesma chave no mesmo super-step. Ver §8.8.
-    extracted_sets: Annotated[list[dict], operator.add]
-    persisted_set_ids: Annotated[list[int], operator.add]
+    extracted_sets: Annotated[list[dict], resettable_add]
+    persisted_set_ids: Annotated[list[int], resettable_add]
     analysis_result: dict | None     # escrito só por `analysis` — sem concorrência
     recommendation: dict | None      # escrito só por `recommendation`
     query_result: dict | None        # escrito só por `admin`
     health_flag: dict | None         # escrito só pelo guardrail, antes do fan-out
 
     # --- controle de saída ---
-    outbound: Annotated[list[dict], operator.add]   # TODO ramo acrescenta blocos aqui
-    errors: Annotated[list[str], operator.add]
+    outbound: Annotated[list[dict], resettable_add] # TODO ramo acrescenta blocos aqui
+    errors: Annotated[list[str], resettable_add]
     confidence: float
     pending_clarification: dict | None
+    voice_output: dict | None        # escritor único: voice_agent
 ```
 
 > `errors` aparece **uma vez só**, com reducer. Uma versão anterior desta seção declarava o campo
@@ -1355,14 +1436,22 @@ class GraphState(TypedDict):
 > Dois ramos falhando no mesmo super-step levantariam `InvalidUpdateError`, transformando duas
 > falhas numa terceira não relacionada. É exatamente a armadilha que a §8.8 descreve.
 
+**Classificação de escrita.** `CONCURRENT_KEYS` contém exatamente
+`extracted_sets`, `persisted_set_ids`, `outbound` e `errors`; todas usam
+`resettable_add`. `SINGLE_WRITER_KEYS` declara o ramo dono de cada outra chave escrita.
+Um teste falha se uma chave nova não pertencer a uma das duas classificações. Uma lista
+vazia comum continua sendo um update normal: só `BatchReset()`, construído pelo runner
+antes de um batch novo, apaga os quatro acumuladores.
+
 **`channel_caps` é a exceção que confirma a regra.** Ele está no estado porque o `voice_agent` é um
 nó do grafo e precisa lê-lo. Um teste de arquitetura (`tests/test_channel_isolation.py`) falha se
 qualquer módulo sob `graph/subgraphs/` referenciar a chave `channel_caps` ou importar de
 `channels/` (AD-39). A disciplina precisa de um assert, não de um comentário.
 
-**Poda do estado.** Após cada execução, um reducer mantém no máximo as 12 últimas mensagens em
-`messages`; o excedente é comprimido em `conversation_digest` pelo tier `SUMMARY` a cada 20
-interações. Contexto de treino **não** vive no estado — vem sempre do Postgres via tools.
+**Poda do estado.** `bounded_add_messages` preserva a semântica de `add_messages` e mantém no
+máximo as 12 últimas em `messages`; o excedente é comprimido em `conversation_digest` pelo tier
+`SUMMARY` a cada 20 interações. Contexto de treino **não** vive no estado — vem sempre do Postgres
+via tools.
 
 ### 8.3 Topologia do grafo raiz
 
@@ -1420,6 +1509,11 @@ Cinco alvos, três deles agentes de domínio (AD-16). `admin` e `smalltalk` exis
 tráfego precisa ir a algum lugar, e mandá-lo para um dos três agentes de domínio contaminaria tanto
 os prompts quanto a avaliação de roteamento.
 
+O rótulo `BLOCK / FLAG` do desenho não é uma rota única. O achado `HEALTH_REPORT`, quando não vem
+acompanhado de bloqueio, segue para `router`, acrescenta o aviso e mantém a ingestão possível. Uma
+categoria bloqueante segue diretamente para `voice`; se coexistir com o achado, o relato ainda é
+persistido e o aviso é acumulado antes da recusa (ADR-0014).
+
 ### 8.4 Os primitivos, um a um
 
 #### `StateGraph` e a compilação
@@ -1450,6 +1544,9 @@ builder.add_node("deliver", deliver_node,
 
 graph = builder.compile(checkpointer=saver, store=store, name="fittrack_root")
 ```
+
+`saver` e `store` acima são as portas tenant-aware da §5.3, construídas para a invocação; os
+backends brutos não podem ser passados a um nó ou a um runtime.
 
 **`RetryPolicy` é por nó, e não substitui o fallback do gateway.** O `LLMGateway` (§7.3) já trata
 429/5xx com backoff e troca de provider; o `RetryPolicy` do nó cobre a camada acima — uma exceção
@@ -1495,8 +1592,10 @@ produz fan-out, mas entrega a *todos* os ramos o mesmo estado — e o plano do r
 `payload` por passo (`{exercise: "supino_reto_barra", weeks: 8}`). Sem `Send`, cada subgrafo teria de
 reencontrar o próprio passo dentro de `state["plan"]` filtrando por `target`, o que já é feio com um
 passo por alvo e fica errado no dia em que o plano tiver dois passos para o mesmo alvo ("compara meu
-supino **e** meu agachamento"). `Send` entrega a cada ramo exatamente o argumento dele, e o mesmo
-alvo pode aparecer duas vezes no mesmo estágio como duas tarefas independentes.
+supino **e** meu agachamento"). `Send` entrega a cada ramo exatamente o argumento dele. O mesmo alvo
+pode aparecer duas vezes no plano, mas `stage_plan()` coloca ocorrências sucessivas em estágios
+distintos: um estágio nunca contém dois `Send` para o mesmo alvo, pois ambos escreveriam a mesma
+chave de escritor único.
 
 O terceiro argumento de `add_conditional_edges` é a lista de destinos possíveis. Ele é opcional em
 runtime e obrigatório aqui: é o que faz `graph.get_graph().draw_mermaid()` produzir o diagrama certo
@@ -1510,16 +1609,17 @@ Onde um nó precisa **atualizar o estado e escolher o próximo nó** ao mesmo te
 ```python
 from langgraph.types import Command
 
-def guardrail_node(state: GraphState) -> Command[Literal["router", "voice"]]:
-    verdict = await gateway.ainvoke(role=LLMRole.GUARDRAIL, ...)
-    if verdict.category == "PASS":
-        return Command(goto="router")
-    return Command(
-        goto="voice",                                   # pula direto para a saída
-        update={"health_flag": verdict.model_dump(),
-                "outbound": [{"kind": "health_notice", **verdict.blocks()}]},
-    )
+def guardrail_node(state: GraphState) -> Command[Literal["router", "voice"]]: return route_guardrail_verdict(await gateway.ainvoke(role=LLMRole.GUARDRAIL, ...))
 ```
+
+O veredito não é uma enumeração exclusiva: `health_report` e `blocking_category` são eixos
+independentes. Um achado de saúde sem bloqueio continua para o router, para que uma série no mesmo
+turno seja registrada. Uma categoria bloqueante vai a `voice` e não pode chegar a ingestão; se ela
+coexistir com o achado, o relato é persistido e seu aviso acompanha a recusa (ADR-0014).
+
+`route_guardrail_verdict()` primeiro persiste o achado, produz `health_flag` e acumula
+`health_notice` em `outbound`; depois, se `blocking_category` existir, acrescenta o bloco de recusa e
+retorna `Command(goto="voice", update=...)`. Sem bloqueio, retorna `Command(goto="router", update=...)`.
 
 A alternativa — devolver um dict e declarar uma `add_conditional_edges` que relê o estado para
 decidir — funciona, mas espalha a decisão por dois lugares: o nó que sabe o veredito e a função que
@@ -1754,19 +1854,28 @@ await graph.ainvoke(Command(resume=user_text), config=config)
 Um pedido composto costuma conter passos independentes. Rodá-los em sequência soma latência sem
 motivo: duas chamadas de LLM de 3s viram 6s de espera quando poderiam ser 3s.
 
-O router não devolve uma lista plana de rotas — devolve **estágios**. Passos dentro de um estágio
-rodam em paralelo; estágios rodam em ordem.
+O router devolve uma lista plana de passos; `stage_plan()` transforma-a em **estágios**. Passos dentro
+de um estágio rodam em paralelo; estágios rodam em ordem.
 
 #### A regra de agrupamento
 
 **Escrita antes de leitura, sempre.** `ingestion` grava no banco; todos os outros leem dele. Se
-rodassem juntos, o leitor poderia consultar antes do `COMMIT`.
+rodassem juntos, o leitor poderia consultar antes do `COMMIT`. Dois passos de `ingestion` também não
+correm juntos: um finalizador de sessão pode ler antes do `log_workout` que deveria fechar.
 
 ```
-1. Se o plano contém `ingestion`, ele fica sozinho no estágio 1.
-2. Todo o resto (`analysis`, `recommendation`, `admin`, `smalltalk`) vai para o
-   estágio 2, em paralelo.
-3. Sem `ingestion`, há um único estágio e tudo é paralelo.
+1. `stage_plan()` separa todos os passos de `ingestion`, preserva a ordem plana proposta pelo router e
+   dá a cada passo seu próprio estágio. Assim, `log_workout → close_session` fecha a sessão que acabou
+   de receber a série, enquanto `close_session → log_workout` fecha a sessão anterior antes de abrir a
+   próxima; nenhum dos dois é reordenado.
+2. Só depois de todos os estágios de `ingestion`, os passos restantes (`analysis`, `recommendation`,
+   `admin`, `smalltalk`) são agrupados em rodadas paralelas estáveis: a primeira ocorrência de cada
+   alvo vai para a primeira rodada, a segunda ocorrência daquele alvo vai para a segunda, e assim por
+   diante. Cada rodada contém no máximo um passo por alvo.
+3. Sem `ingestion`, aplica-se a mesma regra de rodadas; portanto pode haver mais de um estágio para
+   serializar destinos repetidos. Destinos distintos na mesma rodada continuam paralelos.
+4. `close_session` e `discard_session` no mesmo plano são inválidos e o plano é rejeitado antes do
+   dispatch.
 ```
 
 #### O exemplo composto
@@ -1775,7 +1884,7 @@ rodassem juntos, o leitor poderia consultar antes do `COMMIT`.
 "Fiz supino 80x8 e compara com semana passada"
 
 plan = [
-  [ {ingestion, log_workout} ],                                   ← estágio 1, sozinho
+  [ {ingestion, log_workout} ],                                   ← estágio 1
   [ {analysis, analyze_progress, {exercise: supino_reto_barra}} ], ← estágio 2
 ]
 
@@ -1890,7 +1999,7 @@ histórico (§8.4):
 | Agente | Tier | Fase | Papel |
 | --- | --- | --- | --- |
 | `conversation_normalizer` | NORMALIZER | 1.0 | **Única entrada.** Junta a rajada, limpa ruído de STT, resolve anáfora, classifica o turno. §9.3 |
-| `router_agent` | ROUTER | 1.0 | Gera o plano em estágios sobre os três alvos de domínio + `admin`/`smalltalk`. §9.4 |
+| `router_agent` | ROUTER | 1.0 | Gera os passos do plano sobre os três alvos de domínio + `admin`/`smalltalk`; `stage_plan()` forma os estágios. §9.4 |
 | `guardrail_agent` | GUARDRAIL | 1.0 | Triagem de saúde/segurança e conteúdo fora de escopo. §12 |
 | `clarification_agent` | ROUTER | 1.0 | Uma pergunta agregada quando falta campo obrigatório; emite `interrupt()`. §9.10 |
 | `correction_agent` | EXTRACTOR | 1.0 | "Na verdade era 12 reps", "apaga a última". **Crítico** dado o ack por emoji. |
@@ -1909,7 +2018,7 @@ histórico (§8.4):
 | `load_context` | Carrega perfil, plano, quota, sessão ativa e capacidades do canal. |
 | `session_manager` | Abre, reabre ou reutiliza sessão. Máquina de estados da §6. |
 | `exercise_resolver` | Algoritmo de 3 camadas; só chama LLM (tier RESOLVER) no desempate. §10 |
-| `persistence` | Transação única, idempotente por `source_message_id`. |
+| `persistence` | Transação única, idempotente pela proveniência canônica e seus ordinais. |
 | `numeric_critic` | Verifica que todo número narrado veio de uma tool. §9.9 |
 | `plan_validator` | Valida ficha contra catálogo, lesões, equipamento, volume. §9.9 |
 | `program_validator` | Valida programa contra soma de fases, deload, faixas de RPE. §9.9 |
@@ -1938,9 +2047,11 @@ golden set: os buckets de ruído passam a medir o normalizer, não a extração.
 **Schema de saída:**
 
 ```python
+from pydantic import Field
+
 class TurnSegment(BaseModel):
     text: str                    # trecho normalizado, uma unidade de sentido
-    source_fragments: list[int]  # índices dos fragmentos da rajada que o geraram
+    source_fragments: list[int] = Field(min_length=1)  # fragmentos da rajada que o geraram
     was_audio: bool
 
 class NormalizedTurn(BaseModel):
@@ -1966,9 +2077,11 @@ class NormalizedTurn(BaseModel):
 3. **Anáfora só com âncora explícita.** `resolved_references` exige que a referência apareça em
    `messages` ou na sessão ativa. Sem âncora, o texto passa como está e a clarificação (§9.10)
    resolve depois.
-4. **Preservar o literal.** `source_fragments` amarra cada segmento aos fragmentos originais, e o
-   `extraction_agent` continua obrigado a preencher `source_text` a partir do texto do usuário —
-   não da reescrita. É o que permite auditar uma extração errada até a mensagem que a causou.
+4. **Preservar o literal.** `source_fragments` é não vazio e amarra cada segmento aos fragmentos
+   originais. O `extraction_agent` continua obrigado a preencher `source_text` a partir do texto do
+   usuário — não da reescrita. A validação pós-normalizer também rejeita segmento cuja resolução
+   determinística não produza ao menos um `SourceSpan`; é o que permite auditar uma extração errada
+   até a mensagem que a causou.
 5. **Idempotente sobre entrada limpa.** Um turno de uma mensagem única e bem-formada sai igual ao
    que entrou. Um teste do golden set verifica exatamente isso, porque um normalizer que "melhora"
    texto já bom é um gerador de regressão silenciosa.
@@ -1983,16 +2096,19 @@ medição vem antes da otimização.
 ### 9.4 O `router_agent`
 
 **Entrada:** `NormalizedTurn` + contexto (sessão ativa, plano do usuário, `pending_clarification`).
-**Saída:** `list[PlanStage]`, com o agrupamento da §8.8.
+**Saída:** uma lista de `RouteStep`. O LLM nunca devolve estágios; `stage_plan()` é a única
+autoridade que agrupa os passos conforme a §8.8.
 
 ```python
+from pydantic import Field
+
 class RouteStep(BaseModel):
     target: Literal["ingestion", "analysis", "recommendation", "admin", "smalltalk"]
     intent: str
     payload: dict = {}
 
 class RoutingPlan(BaseModel):
-    stages: list[list[RouteStep]]
+    steps: list[RouteStep] = Field(max_length=4)
     rationale: str      # uma frase; vai para o trace, não para o usuário
 ```
 
@@ -2018,39 +2134,49 @@ interpretáveis, e o que permite ao `dispatch` falhar cedo num alvo inexistente 
    erro.
 3. **`pending_clarification` tem precedência.** Se `answers_clarification=True`, o worker nem chama o
    router: retoma o grafo por `Command(resume=...)` (§8.7).
-4. **Teto de 4 passos por estágio.** É o número de alvos paralelizáveis. Um plano maior é sintoma de
-   prompt quebrado e é truncado com registro em `errors`.
+4. **Teto de 4 passos no plano linear.** `RoutingPlan.steps` aplica `max_length=4` **antes** de
+   `stage_plan()`: o limite não é por estágio, porque ingestões e destinos repetidos ocupam estágios
+   sucessivos. Uma quinta proposta é inválida na fronteira Pydantic e dispara o retry/fallback normal
+   do gateway; nunca é truncada silenciosamente depois de criar estágios.
 
 ### 9.5 Contrato do `extraction_agent`
 
 **Schema de saída (Pydantic):**
 
 ```python
+from decimal import Decimal
+from pydantic import Field
+
+class QuantityLiteral(BaseModel):
+    value: Decimal
+    unit: Literal["kg", "lb", "m", "km", "cm", "h", "s", "min", "scale_0_10"]
+    unit_origin: Literal["explicit", "defaulted"]
+
 class ExtractedSet(BaseModel):
     exercise_raw: str            # como o usuário disse
     set_type: Literal["strength","cardio","isometric","interval"]
-    set_index: int | None = None # None = expandir
     repeat: int = 1              # "3x10" → repeat=3
-    load_kg: float | None = None
+    load: QuantityLiteral | None = None
     reps: int | None = None
     rpe: float | None = None
+    rpe_origin: Literal["explicit", "inferred"] | None = None
     rir: int | None = None
-    distance_m: float | None = None
-    duration_s: int | None = None
-    hold_s: int | None = None
-    rest_s: int | None = None
+    rir_origin: Literal["explicit"] | None = None
+    distance: QuantityLiteral | None = None
+    duration: QuantityLiteral | None = None
+    hold: QuantityLiteral | None = None
+    rest: QuantityLiteral | None = None
     is_warmup: bool = False
     is_failure: bool = False
     technique: str | None = None
     side: Literal["left","right","both"] | None = None
-    source_text: str             # trecho literal que gerou esta série
+    source_segments: list[int] = Field(min_length=1)  # índices em NormalizedTurn.segments
     confidence: float            # 0..1
 
 class ExtractedMetric(BaseModel):
     kind: str                    # peso | sono_h | disposicao | ...
-    value: float
-    unit: str
-    source_text: str
+    value: QuantityLiteral
+    source_segments: list[int] = Field(min_length=1)
 
 class ExtractionResult(BaseModel):
     is_workout_log: bool
@@ -2061,18 +2187,33 @@ class ExtractionResult(BaseModel):
     overall_confidence: float
 ```
 
+Um `model_validator` do schema rejeita qualquer par `rpe`/`rpe_origin` ou `rir`/`rir_origin` em que
+somente valor ou origem esteja presente. O mesmo validador aplica a matriz de unidades por destino
+**antes** de `domain/units.py`: `load` aceita somente `kg`/`lb`; `distance`, `m`/`km`/`cm`;
+`duration`/`hold`/`rest`, `h`/`min`/`s`. Métricas usam uma tabela fechada por `kind` — `peso`:
+`kg`/`lb`, `cintura`/`braco`: `cm`, `sono_h`: `h`, `disposicao`/`dor`: `scale_0_10` — e kind ou
+unidade fora da tabela reprova. `QuantityLiteral` continua o envelope comum, mas não torna uma unidade
+válida em todos os campos.
+
 **Regras de extração codificadas no prompt:**
 
-1. **Unidades.** Padrão kg. "libras"/"lbs" → converte (`×0.45359237`). Números sem unidade em
-   contexto de musculação assumem kg. Distâncias: "km" → metros.
+1. **Unidades.** O LLM devolve o literal e a unidade, nunca um valor convertido. Números sem unidade
+   em contexto de musculação usam `unit="kg"` e `unit_origin="defaulted"`; entradas explícitas
+   preservam o número e normalizam apenas o rótulo (`libras`/`lbs` → `lb`). `domain/units.py` converte
+   com `Decimal` no limite de persistência: lb → kg por `0.45359237`, km → m por `1000`, cm → m por
+   `0.01`, min → s por `60` e h → s por `3600`, aplicando `ROUND_HALF_UP` uma única vez.
 2. **Notação de séries.** `3x10`, `3 séries de 10`, `3×10` → `repeat=3, reps=10`.
    `12, 10, 8` → três séries com reps distintas, `repeat=1` cada.
-3. **Peso corporal.** "barra fixa 10 reps" → `load_kg=null`. "barra fixa com 10kg de lastro" →
-   `load_kg=10` e `technique="lastro"`.
+3. **Peso corporal.** "barra fixa 10 reps" → `load=null`. "barra fixa com 10kg de lastro" →
+   `load=QuantityLiteral(value=Decimal("10"), unit="kg", unit_origin="explicit")` e
+   `technique="lastro"`.
 4. **Mapa de RPE em linguagem natural** (§9.6).
 5. **Nunca inventar.** Campo não mencionado → `null`. É preferível `missing_fields` a um chute.
-6. **`source_text` obrigatório** em toda série, e extraído do **texto do usuário**, não da reescrita
-   do normalizer — é o que permite auditoria e correção (§9.3, regra 4).
+6. **Proveniência plural e derivada.** O LLM só cita `source_segments`, índices do turno que ele leu.
+   O nó do normalizador já alinhou cada segmento a `SourceSpan` literal em `text_extract` ou
+   `transcript`; código determinístico resolve, ordena e valida esses spans depois do schema e antes
+   da persistência. `source_text` é derivado somente quando há um span; com vários, fica `NULL`.
+   O LLM nunca emite offset contra o texto bruto que não viu (ADR-0012).
 
 ### 9.6 Mapa de RPE a partir de linguagem natural
 
@@ -2085,8 +2226,16 @@ class ExtractionResult(BaseModel):
 | "muito difícil", "quase falhei", "no limite" | 9 | 1 |
 | "falhei", "não consegui terminar", "travei" | 10 | 0 |
 
-Quando o usuário der o número diretamente ("RPE 8", "deixei 2 na reserva"), o número prevalece sobre
-a inferência textual.
+Quando o usuário der um número diretamente ("RPE 8", "deixei 2 na reserva"), ele prevalece sobre a
+inferência textual. O schema registra essa diferença: `rpe_origin="explicit"` para número dito pelo
+usuário e `rpe_origin="inferred"` para o mapa acima; `rir_origin` da saída crua só pode ser
+`"explicit"`. Valor e origem são obrigatoriamente preenchidos juntos. Se RPE e RIR forem ambos
+explícitos e contraditórios, os dois são preservados e a extração fica `low_confidence`; o sistema não
+corrige um número pelo outro. `domain/rpe.py` deriva RIR somente quando não houve RIR explícito,
+depois da validação Pydantic: converte o RPE de uma casa para `Decimal`, calcula `Decimal("10") − rpe`
+e aplica `quantize(Decimal("1"), ROUND_HALF_UP)` antes de persistir o `SMALLINT`. Assim RPE 7.5 deriva
+RIR 3 de modo determinístico; o DTO marca esse resultado como `rir_origin="derived"`, valor que o LLM
+nunca emite. Esclarecimento só é pedido quando a contradição inviabilizar o registro (ADR-0013).
 
 ### 9.7 Contrato do `analysis_agent`
 
@@ -2351,12 +2500,13 @@ entrada: exercise_raw = "supino reto"
 └────────────────────────────────────────────────────────────────────┘
                             │ não achou
 ┌─ Camada 2 — busca lexical (trigram) ──────────────────────────────┐
-│  SELECT e.id, similarity(a.normalized, :norm) AS s                 │
+│  SELECT e.id, max(similarity(a.normalized, :norm)) AS s            │
 │  FROM exercise_alias a JOIN exercise e ON e.id = a.exercise_id     │
 │  WHERE a.normalized % :norm                                        │
 │    AND (a.tenant_id IS NULL OR a.tenant_id = :t)                   │
+│  GROUP BY e.id                                                      │
 │  ORDER BY s DESC LIMIT 5                                           │
-│  → s >= 0.85 e sem empate próximo?  confidence = s  ✔ FIM          │
+│  → s >= 0.85 e gap para o 2º >= 0.06? confidence = s  ✔ FIM        │
 └────────────────────────────────────────────────────────────────────┘
                             │ ambíguo ou fraco
 ┌─ Camada 3 — busca vetorial (Qdrant) ──────────────────────────────┐
@@ -2381,6 +2531,11 @@ entrada: exercise_raw = "supino reto"
 **Aprendizado.** Toda resolução bem-sucedida via camada 2, 3 ou LLM grava (ou incrementa `hits` de)
 um `exercise_alias` com `source='learned'` e `tenant_id` do usuário. Depois de 3 usuários distintos
 convergirem no mesmo alias, um job promove o alias para global (`tenant_id = NULL`).
+
+O delta de empate próximo da camada trigram é `0.06`, igual ao da camada vetorial. O score de cada
+candidato é o máximo entre seus aliases, e o gap compara somente exercícios distintos. Abaixo desse
+limiar o resultado segue para a próxima camada; aceitar o primeiro colocado transformaria ruído
+lexical em exercício persistido.
 
 **Dedup de exercícios privados.** Job semanal: para cada `exercise` com `status='pending_review'`,
 busca no Qdrant contra o catálogo global; se `score >= 0.93`, marca `merged_into` e reaponta os
@@ -2458,14 +2613,18 @@ nos casos que ele existe para pegar.
 
 ### 12.1 Categorias
 
-| Categoria | Gatilho | Ação |
-| --- | --- | --- |
-| `PASS` | Conteúdo normal | Segue para o `router_agent` via `Command(goto="router")`. |
-| `HEALTH_REPORT` | Dor, lesão, desconforto, tontura, mal-estar | Grava `health_report`. Responde com acolhimento + orientação para profissional. **Registra a série se houver.** Passa a evitar a região nas recomendações. |
-| `MEDICAL_ADVICE` | Pedido de diagnóstico, tratamento, medicação | Recusa educadamente, orienta procurar profissional, não prescreve. |
-| `EXTREME_DIET` | Restrição alimentar severa, jejum prolongado, sinais de TA | Recusa orientar, oferece contato de apoio, marca o caso para revisão. |
-| `OFF_TOPIC` | Assunto sem relação com treino | Redireciona brevemente. |
-| `ABUSE` | Conteúdo abusivo ou tentativa de injection | Resposta padrão curta; incidente logado. |
+| Eixo | Valor | Gatilho | Ação |
+| --- | --- | --- | --- |
+| ambos ausentes | `PASS` | Conteúdo normal | Segue para o `router_agent` via `Command(goto="router")`. |
+| achado persistível | `HEALTH_REPORT` | Dor, lesão, desconforto, tontura, mal-estar | Grava `health_report`, responde com acolhimento + orientação para profissional e, **sem bloqueio**, registra a série se houver. Passa a evitar a região nas recomendações. |
+| bloqueio | `MEDICAL_ADVICE` | Pedido de diagnóstico, tratamento, medicação | Recusa educadamente, orienta procurar profissional, não prescreve. |
+| bloqueio | `EXTREME_DIET` | Restrição alimentar severa, jejum prolongado, sinais de TA | Recusa orientar, oferece contato de apoio, marca o caso para revisão. |
+| bloqueio | `OFF_TOPIC` | Assunto sem relação com treino | Redireciona brevemente. |
+| bloqueio | `ABUSE` | Conteúdo abusivo ou tentativa de injection | Resposta padrão curta; incidente logado. |
+
+`HEALTH_REPORT` é um achado independente, não uma alternativa exclusiva aos bloqueios. Se ele
+coexistir com um bloqueio, o relato é persistido e recebe `health_notice`, mas o `Command` vai para
+`voice` com a recusa — nunca para o router.
 
 ### 12.2 Política adotada (AD-29) — conservador com registro
 
@@ -2547,10 +2706,17 @@ class VoiceOutput(BaseModel):
     mode: Literal["reaction","text","buttons","media","silent"]
     emoji: str | None            # quando mode="reaction"; do conjunto do canal
     text: str | None             # quando mode="text"; legenda quando mode="media"
+    fallback_text: str | None    # obrigatório quando mode="reaction"
     buttons: list[str] | None    # quando mode="buttons"; ≤ caps.max_buttons
     media_path: Path | None      # quando mode="media"
     split: list[str] | None      # bolhas do split (§13.6), ≤ caps.max_bubbles
 ```
+
+Quando uma reação é recusada pelo protocolo ou não há mensagem-alvo endereçável — inclusive um
+`reply_to` de evento como `press:<callback_query_id>` — o adaptador só pode enviar `fallback_text`,
+já redigido pelo `voice_agent`; ele nunca cria texto. O alvo não endereçável é detectado antes da
+chamada de reação e não pode abortar a entrega do fallback. Uma reação sem fallback é inválida, e
+`fallback_text` é nulo nos outros modos (ADR-0015).
 
 ### 13.2 Regra de decisão do `mode` (AD-13)
 
@@ -3063,10 +3229,12 @@ queda entre o `RENAME` e o `DEL` não perde o lote.
   `UNIQUE (identity_id, channel_message_id)` em `raw_message` é a segunda barreira. Os dois canais
   reentregam o que não recebeu 200 rápido.
 - **Persistência:** `ux_set_idempotency` (§5.2) é um índice único parcial em
-  `(session_id, exercise_id, set_index, source_message_id)` com **`NULLS NOT DISTINCT`**, de modo
-  que reprocessar o mesmo batch não duplica séries. O `NULLS NOT DISTINCT` é a parte que importa:
-  sem ele, séries com `source_message_id` nulo não colidiriam entre si e o retry inflaria o volume
-  do treino silenciosamente. A gravação usa `ON CONFLICT DO NOTHING` contra esse índice.
+  `(session_id, exercise_id, provenance_hash, extraction_ordinal, expansion_ordinal)`.
+  Os três últimos termos são funções do resultado validado e não da contagem atual da sessão:
+  uma pirâmide que cita o mesmo trecho usa `extraction_ordinal`, e `3x10` usa
+  `expansion_ordinal`. A gravação usa `ON CONFLICT` com o predicado
+  `WHERE deleted_at IS NULL`, idêntico ao índice parcial; `set_index` não participa porque pode
+  mudar entre um commit bem-sucedido e o retry que sucede um checkpoint interrompido.
 - **Envio:** `outbound_queue` só marca `sent_at` após confirmação do canal; retry usa o mesmo
   registro. Nenhum dos dois canais oferece chave de idempotência no envio, então a ordem
   "envia → confirma → marca" é a garantia inteira: marcar antes de enviar perderia mensagem, e
@@ -3585,6 +3753,11 @@ BEGIN
     $f$, t);
   END LOOP;
 END $$;
+
+-- Esta lista é histórica: descreve somente as tabelas existentes quando a
+-- migração inicial de RLS rodou. Uma tabela tenant-scoped criada depois dela
+-- habilita FORCE RLS e sua policy na própria migração; o teste de cobertura do
+-- schema atual a inventaria separadamente, sem reescrever esta migração.
 
 -- Linhas GLOBAIS (tenant_id IS NULL) precisam ser LEGÍVEIS por qualquer tenant:
 -- o resolver (§10) consulta `tenant_id IS NULL OR tenant_id = :t`, e sem esta
@@ -4106,15 +4279,17 @@ Cifrados **antes** de chegar ao Postgres. O banco vê apenas bytes.
 | `health_report.verbatim` | Relato de dor e lesão; dado sensível do art. 11 |
 | `body_metric.value` | Peso, medidas, sono, disposição |
 | `athlete_profile.injuries` | Histórico de lesão; JSON serializado e então cifrado |
-| `raw_message.payload` | Texto bruto do usuário |
+| `raw_message.payload` | Envelope bruto do canal, que pode conter texto do usuário |
+| `raw_message.text_extract` | Recorte literal da mensagem de texto, usado exclusivamente por spans auditáveis |
 | `raw_message.transcript` | Transcrição de áudio |
 | `processing_batch.combined_text` | Concatenação persistida das mensagens para retry |
 | `outbound_queue.payload` | Resposta pendente, que pode repetir dado de treino ou saúde |
 | `session_summary.narrative` | Narrativa da sessão, pode conter relato pessoal |
 
-Essas colunas já nascem `BYTEA` no schema da §5.2, cada uma com sua `key_version` ao lado — **não
-existe migração de conversão**, porque a criptografia entra na fase 1.0 justamente para evitá-la
-(§24). Converter depois exigiria ler, cifrar e reescrever todas as linhas com o serviço parado.
+Essas colunas nascem `BYTEA` na migração que as cria, cada uma com sua `key_version` ao lado — **não
+existe migração de conversão de texto em claro**, porque a criptografia entra na fase 1.0 justamente
+para evitá-la (§24). Converter depois exigiria ler, cifrar e reescrever todas as linhas com o serviço
+parado.
 
 **O `external_id` paga um preço que os outros não pagam: ele precisa ser pesquisável.** Todo webhook
 começa com "quem é esta conta?", e AES-GCM com nonce aleatório não permite `WHERE external_id = ?`.
@@ -4246,6 +4421,7 @@ fitness-track/
 │       ├── router.md
 │       ├── guardrail.md
 │       ├── extraction.md
+│       ├── resolver.md
 │       ├── analysis.md
 │       ├── recommendation.md
 │       ├── program.md
@@ -4412,6 +4588,7 @@ Sem isso, nada mais tem dado para operar.
   `interrupt` e `RetryPolicy`
 - Agentes: normalizer, guardrail, router, extraction, resolver, clarification, correction, voice,
   summary; nós: session_manager, persistence
+- Resumo de sessão persistido no fechamento; a narrativa ainda não é indexada no Qdrant
 - STT via Groq
 - `onboarding_agent` + consentimentos LGPD
 - Catálogo global semeado (~300 exercícios) + coleção `exercise_catalog` no Qdrant
@@ -4433,7 +4610,7 @@ de extração ≥ 0.90 no golden set, acurácia de roteamento ≥ 0.95 e nenhum 
 - Subgrafo `analysis`: `analysis_agent` + `ToolNode` + `narrator` + **`numeric_critic`**
 - `gamification` (PRs, streaks) no fechamento de sessão
 - Progressão visível: relatório em texto, gráfico PNG e resumo semanal (§16.3)
-- Indexação de `user_sessions` no Qdrant
+- Indexação inicial de `user_sessions` no Qdrant, incluindo narrativas de resumo já persistidas
 - Comando "o que você anotou?" / revisão de séries (`admin/list_recent`)
 - LLM-as-judge para as respostas de análise
 - **`proactive_coach` + detectores SQL + scheduler com 3 janelas** — antecipado da 1.3, porque no
