@@ -144,9 +144,11 @@ o teste de arquitetura que sustenta a §8.8.
 3. `stage_plan(steps) -> list[PlanStage]` serializa **cada** passo de `ingestion` antes de qualquer
    leitor: writes (`log_workout`, `log_metric`, `correct_entry`) vêm antes de finalizadores
    (`close_session`, `discard_session`), preservando a ordem original dentro de cada grupo; cada passo
-   ocupa um estágio próprio. Só depois vem um estágio paralelo com o resto. Sem `ingestion`, há um
-   estágio único. `close_session` e `discard_session` juntos são inválidos. O teto da §9.4 regra 4 é
-   4 passos no estágio paralelo, truncando com registro em `errors`.
+   ocupa um estágio próprio. Depois, passos não-ingestion formam rodadas paralelas estáveis com **no
+   máximo um passo por target**: a segunda ocorrência de `analysis`, por exemplo, só entra na rodada
+   seguinte. Sem `ingestion`, aplicam-se essas mesmas rodadas. `close_session` e `discard_session`
+   juntos são inválidos. O teto da §9.4 regra 4 é 4 passos no estágio paralelo, truncando com registro
+   em `errors`.
 4. **Resolver o conflito com `test_channel_isolation`** — ver
    [ambiguidade #3](#3-channel_caps-no-graphstate-reprova-o-teste-de-isolamento-hoje). Separar
    `IMPORT_EXCEPTIONS` de `CAPS_EXCEPTIONS`, e acrescentar a asserção substituta: `state.py` menciona
@@ -305,7 +307,9 @@ tarefa; a T04 não cria outro arquivo ADR nem reutiliza o mesmo número para uma
    serializer — num envelope não primitivo antes de delegar. O delegate usa `EncryptedSerializer` do
    próprio `langgraph-checkpoint` e `TenantCheckpointCipher` ligado a `thread_id_for(tenant_id)`; na
    leitura o adaptador decifra e remove o envelope antes de o grafo ver o valor. O AAD inclui o
-   tenant/thread derivados pelo código; ler o blob com a fronteira de outro tenant falha autenticação.
+   tenant/thread derivados pelo código **e o slot estável**: namespace/id do checkpoint,
+   canal/versão do blob ou task/índice do write; trocar valores entre slots do mesmo tenant também
+   falha autenticação. Ler o blob com a fronteira de outro tenant falha autenticação.
    `checkpoint`/`metadata` ficam restritos a versões, ids e uma allowlist de metadados sem conteúdo. A
    fábrica compila a instância do grafo para aquela invocação, sem cache mutável de processo, e nunca
    chama `setup()` no runtime.
@@ -319,7 +323,9 @@ tarefa; a T04 não cria outro arquivo ADR nem reutiliza o mesmo número para uma
    aparece em `checkpoint_blobs.blob`, `checkpoint_writes.blob` nem `store.value`; trocar os blobs
    entre tenants falha autenticação. O teste procura o literal também no JSONB de
    `checkpoints.checkpoint`/`metadata` e usa um `conversation_digest` escalar para provar que o
-   adaptador não deixa o atalho de primitivos furar o serializer. O teste inspeciona o banco bruto —
+   adaptador não deixa o atalho de primitivos furar o serializer. Além da troca cross-tenant, move
+   ciphertext deliberadamente entre dois checkpoints, entre canais/versões de blob e entre writes do
+   **mesmo** tenant/thread; cada leitura deve falhar autenticação. O teste inspeciona o banco bruto —
    round-trip pela API sozinho não prova criptografia.
 7. Retenção (§5.3, "não é opcional"): cron ARQ diário no padrão do `sweep_voice_audio` já existente,
    apagando checkpoints antigos **exceto o último de cada thread** — é ele que carrega um `interrupt`
@@ -368,7 +374,10 @@ encerramento: handoff cumprido).
    juntos `identity_id`, `channel` e `channel_message_id`. Esses valores originam
    `destination_identity_id`, `origin_channel` e `reply_to`; se a linha não existir ou não pertencer ao
    tenant, o batch falha antes do grafo. Nunca recuperar a identidade a partir de `reply_to`: dois
-   chats podem ter o mesmo `channel_message_id` e um tenant pode ter várias identidades.
+   chats podem ter o mesmo `channel_message_id` e um tenant pode ter várias identidades. Em
+   `button_reply` do Telegram, `channel_message_id="press:<callback_query_id>"` continua sendo um
+   identificador de evento, não uma mensagem endereçável; ele pode cruzar o estado como `reply_to`, mas
+   uma reação a esse alvo obrigatoriamente degrada para `fallback_text` no adaptador (ADR-0015/T19).
 3. **Quem monta `channel_caps` é o worker, não o grafo.** A §4 põe o carregamento de capacidades
    antes do `ainvoke`; a §9.2 também lista um nó `load_context`. A leitura que concilia as duas com o
    AD-39: o **worker** (fora de `graph/`, logo autorizado a importar `channels/`) resolve
@@ -580,7 +589,7 @@ receber aquele recorte literal; para múltiplos spans fica `NULL`, nunca uma con
 
 `domain/units.py` é a única fronteira que converte `QuantityLiteral` em DTO de persistência
 (`load_kg`, `distance_m`, `duration_s`/`hold_s`/`rest_s` ou métrica): usa `Decimal("0.45359237")`
-para lb → kg, `Decimal("1000")` para km → m, `Decimal("60")` para min → s e
+para lb → kg, `Decimal("1000")` para km → m, `Decimal("0.01")` para cm → m, `Decimal("60")` para min → s e
 `Decimal("3600")` para h → s, e
 `quantize(Decimal("0.01"), ROUND_HALF_UP)` **uma vez**, no limite de armazenamento — para os campos
 `INTEGER` de tempo, `to_integral_value(ROUND_HALF_UP)` no lugar de `quantize` (ADR-0018). O prompt só
@@ -599,13 +608,14 @@ Peso corporal, notação de séries e o mapa da §9.6 continuam no prompt; campo
 `"8 reps"`, onde o fake do LLM devolve só `source_segments` e o teste prova que `resolve_spans`
 produz os três `SourceSpan` esperados, rejeitando `source_text` sintético.
 `test_normalize_100_lb_with_decimal_half_up` afirma `Decimal("45.36")` no DTO de persistência e que o
-fake do LLM devolveu somente `100` + `"lb"`.
+fake do LLM devolveu somente `100` + `"lb"`; `test_normalize_50_cm_to_m_with_decimal` afirma
+`Decimal("0.50")` e que o fake devolveu somente `50` + `"cm"`.
 
 **Critérios de aceite:** "muito fácil" → RPE 3; "falhei" → 10; RPE/RIR numérico explícito prevalece
 sobre adjetivo; `3x10` continua uma unidade de extração (as três linhas físicas são provadas na T12);
 `source_segments` vazio ou inexistente, spans resolvidos fora do fragmento, sobrepostos ou fora de ordem,
 campo inventado e valor inválido são
-recusados **antes de tocar o banco**; testes de unidades cobrem kg/lb/km e min/s, constante e
+recusados **antes de tocar o banco**; testes de unidades cobrem kg/lb/km/cm e min/s, constante e
 arredondamento fixos (`quantize` para carga/distância, `to_integral_value` para os `INTEGER` de
 tempo), incluindo h → s, e provam que nenhuma saída do LLM em lb, minutos ou horas chega a
 `load_kg`/`duration_s` sem passar por `domain/units.py`; RPE/RIR explícitos contraditórios preservam
@@ -1035,9 +1045,10 @@ re-disparado pelo retry é inócuo.
 
 **A degradação de reação fecha no adaptador.** `deliver` copia `VoiceOutput.fallback_text` para
 `OutboundBlock.text` e persiste o campo cifrado com o restante do payload. Quando o Telegram rejeita
-o emoji ou a mensagem-alvo já desapareceu, `TelegramAdapter._send_degraded()` envia `block.text`, não
-o próprio emoji; o emoji só permanece como fallback de compatibilidade para uma linha antiga sem
-`text`. O adaptador continua decidindo **quando** degradar, porque isso é protocolo; o `voice` continua
+o emoji, a mensagem-alvo já desapareceu **ou `reply_to` é um evento não endereçável como `press:`**,
+`TelegramAdapter._send_degraded()` envia `block.text`, não o próprio emoji; o teste exige que o caso
+`press:` não chame `_send_reaction()` nem deixe `_addressable()` abortar a resposta. O emoji só
+permanece como fallback de compatibilidade para uma linha antiga sem `text`. O adaptador continua decidindo **quando** degradar, porque isso é protocolo; o `voice` continua
 sendo o único autor de **o que dizer**, porque isso é conteúdo (invariantes 2 e 11). Os dois caminhos
 de falha têm teste no adaptador. Um `VoiceOutput(mode="media")` que atravesse essa fronteira por bug
 falha explicitamente antes do enqueue; não vira silêncio. A T26 garante que progresso com gráfico
@@ -1060,8 +1071,8 @@ no-op, não em bolha nova. Mesmo padrão do `_reply_group` do STT (`stt.py:1122`
 o nó presente; e2e (com A+B+D): rajada → batch → grafo → `voice_agent` → `deliver` → drain → bolhas no
 fake de canal, na ordem e espaçadas; o nó que falha **depois** do enqueue (kick ou checkpoint) e é
 repetido não cria segundo grupo — a segunda execução cai no `ON CONFLICT (group_id, seq) DO NOTHING`;
-`RetryPolicy(max_attempts=3)` no registro do nó; reação rejeitada pelo conjunto do Telegram e reação
-cujo alvo desapareceu enviam o `fallback_text` redigido pelo `voice`; `mode="media"` inesperado falha
+`RetryPolicy(max_attempts=3)` no registro do nó; reação rejeitada pelo conjunto do Telegram, cujo alvo
+desapareceu ou cujo `reply_to` é `press:` enviam o `fallback_text` redigido pelo `voice`; `mode="media"` inesperado falha
 alto e não enfileira nem descarta silenciosamente; duas identidades com o mesmo
 `channel_message_id` provam que o enqueue recebe exatamente a identidade da última mensagem da rajada.
 
@@ -1158,7 +1169,7 @@ T28 — é o contrato que todo mundo espera.
 **Plano.** `Target`, intents fechados e `RouteStep`/`RoutingPlan` validados contra a tabela da §9.4,
 com `extra="forbid"`. `VoiceOutput` com validação **por modo** (`reaction` exige emoji **e**
 `fallback_text` — decisão #24/ADR-0015: quem redige o texto de degradação de uma reação recusada ou
-sem mensagem-alvo é o `voice`; exigir que o adaptador invente palavra visível ao usuário viola a
+com alvo ausente/não endereçável (`press:`) é o `voice`; exigir que o adaptador invente palavra visível ao usuário viola a
 invariante 2 — e proíbe split; `text` proíbe emoji/botões/mídia; `buttons` exige pergunta e opções;
 `media` exige `media_path` e trata `text` como legenda opcional, mas **não é emitido nesta sprint**:
 pelo caminho durável o enqueue recusa mídia local (ADR-0005), o progresso degrada para texto e
@@ -1193,9 +1204,9 @@ S03-T07 (quota).
 **Plano.** Uma chamada ao gateway com `agent="router"`, `role=LLMRole.ROUTER`; nunca texto cru, nunca
 `channel_caps`. **`stage_plan()` ignora qualquer ordenação sugerida pelo LLM:** cada passo de
 `ingestion` ocupa um estágio serial, com writes antes de `close_session`/`discard_session`; só depois
-todo o resto forma o estágio paralelo. `state["plan"]` só é escrito depois de `stage_plan()`.
-Truncamento em quatro passos do estágio paralelo registra em `errors` e na métrica `agent_plan_steps`,
-sem inventar destino alternativo. `pending_clarification` tem precedência: o worker retoma por
+o resto forma rodadas paralelas estáveis, cada uma com no máximo um passo por target. `state["plan"]`
+só é escrito depois de `stage_plan()`. Truncamento em quatro passos do estágio paralelo registra em
+`errors` e na métrica `agent_plan_steps`, sem inventar destino alternativo. `pending_clarification` tem precedência: o worker retoma por
 `Command(resume=…)` e o router se recusa a executar.
 
 Antes do primeiro `Send` de **cada** estágio, `dispatch` chama
@@ -1244,7 +1255,8 @@ o caso descrito pela revisão sem exigir a fronteira cross-tenant desta sprint.
 
 **Primeiros testes que devem falhar.** `test_stage_plan_puts_ingestion_before_readers` — plano com
 `analysis`, `log_workout` e `close_session` sai em três estágios, com os dois passos de ingestão
-seriais antes do leitor; e
+seriais antes do leitor; `test_stage_plan_serializes_duplicate_targets` — duas análises e uma
+recomendação saem em duas rodadas, com a recomendação paralela à primeira análise; e
 `test_dispatch_reserves_only_priced_steps_before_any_send`, com duas estimativas cobradas que,
 juntas, excedem o saldo e `assert priced_sends == []`.
 
@@ -1266,7 +1278,7 @@ primeiro é omitido por `QuotaExceeded`.
 
 **Objetivo.** Triagem estruturada de saúde/segurança em toda rajada, retornando
 `Command[Literal["router", "voice"]]` e **preservando o registro de treino** quando houver
-`HEALTH_REPORT`.
+`HEALTH_REPORT` sem bloqueio.
 
 **Spec:** §§8.3, 8.4 (`Command`), 9.2, 12.1–12.3, 13.1, 13.2, 19.5, 20.2, 22.3. Invariante 2.
 
@@ -1290,23 +1302,22 @@ tenant B (mesma classe de bug que a T12/ADR-0012 já corrigiu para `exercise_set
 tenant-scoped nesta sprint fica de fora desse padrão). Nullable para não travar uma inserção manual
 futura fora do fluxo de batch, mas todo `INSERT` desta tarefa sempre preenche.
 
-**Plano.** Veredito Pydantic fechado (`PASS`, `HEALTH_REPORT`, `MEDICAL_ADVICE`, `EXTREME_DIET`,
-`OFF_TOPIC`, `ABUSE`), `extra="forbid"`. Em `HEALTH_REPORT`, o schema devolve
-`source_segments: list[int]` não vazia — índices em `NormalizedTurn.segments`, nunca um offset de
-caractere: o mesmo problema e a mesma solução da T09 (ADR-0012) — o guardrail também só vê o turno
-normalizado, nunca o fragmento bruto. Python resolve `source_segments` via
+**Plano.** Veredito Pydantic fechado em dois eixos, `extra="forbid"`: `health_report` é ausente ou
+contém `source_segments: list[int]` não vazia, região e severidade; `blocking_category` é ausente ou
+`MEDICAL_ADVICE`, `EXTREME_DIET`, `OFF_TOPIC` ou `ABUSE`. `PASS` significa os dois ausentes; portanto
+`HEALTH_REPORT` pode coexistir com uma categoria bloqueante. `source_segments` são índices em
+`NormalizedTurn.segments`, nunca um offset de caractere: o mesmo problema e a mesma solução da T09
+(ADR-0012) — o guardrail também só vê o turno normalizado, nunca o fragmento bruto. Python resolve
+`source_segments` via
 `domain/provenance.resolve_spans(...)` para os `SourceSpan` que a T08 já calculou, decifra
 `text_extract` ou `transcript` conforme `source_field` de cada span e reconstrói **somente** o
 relato literal, nunca `clean_text` e nunca uma reprodução escrita pelo próprio LLM.
 
-Três ramos, não dois — a versão anterior deste plano colapsava `HEALTH_REPORT` dentro do mesmo
-`Command` que `PASS`, e por isso nunca escrevia o aviso em `outbound`:
+Quatro combinações, não uma enumeração exclusiva:
 
-- `PASS` → `Command(goto="router")`, sem `update`.
-- Categorias bloqueantes (`MEDICAL_ADVICE`, `EXTREME_DIET`, `OFF_TOPIC`, `ABUSE`) →
-  `Command(goto="voice", update={"health_flag": …, "outbound": [bloco semântico]})`.
-- `HEALTH_REPORT` → `Command(goto="router", update={"health_flag": …, "outbound":
-  [{"kind": "health_notice", "region": …}]})`. Vai para `router`, não para `voice` (ADR-0014, §12.1:
+- Sem achado e sem bloqueio (`PASS`) → `Command(goto="router")`, sem `update`.
+- Só `health_report` → persiste o relato e retorna `Command(goto="router", update={"health_flag":
+  …, "outbound": [{"kind": "health_notice", "region": …}]})`. Vai para `router` (ADR-0014, §12.1:
   a série do mesmo turno precisa continuar sendo registrada), **mas** ainda assim escreve o bloco
   `health_notice` em `outbound` — a mesma chave com reducer que `ingestion` escreve o `ack` no mesmo
   estágio. Sem isso, uma mensagem mista ("dói o ombro, supino 80x8") persistia a série e o relato e
@@ -1314,8 +1325,13 @@ Três ramos, não dois — a versão anterior deste plano colapsava `HEALTH_REPO
   `voice_agent` (T26) só sabe formatar o que está em `outbound`, não sabe que um `health_flag` sozinho
   precisa virar texto — ele nunca lê `health_flag` diretamente, só os blocos (invariante 2: um único
   caminho de saída, e é `outbound`).
+- Só bloqueio → `Command(goto="voice", update={"outbound": [bloco semântico]})`.
+- `health_report` **e** bloqueio → persiste primeiro o relato, atualiza `health_flag`, acrescenta
+  `health_notice` e o bloco semântico a `outbound`, e retorna `Command(goto="voice", ...)`. Assim um
+  pedido médico com relato de dor registra o achado mas não alcança o router.
 
-`HEALTH_REPORT` grava o relato **antes** de seguir para `router`. A reserva de
+`HEALTH_REPORT` grava o relato **antes de decidir a rota final**; só o caso sem bloqueio segue para
+`router`. A reserva de
 `health_report_id_seq` continua existindo — o AAD do `ColumnCipher` precisa do `row_id` para cifrar
 `verbatim` **antes** de qualquer `INSERT`, então não há como evitar reservar um candidato primeiro.
 **O que muda é que reservar um id deixou de ser, sozinho, a garantia de não-duplicação:** o repositório
@@ -1338,14 +1354,15 @@ a cada mensagem; o texto final do `health_notice` continua sendo decisão de T26
 tenant/linha original; e `test_health_report_retry_after_uncommitted_checkpoint_does_not_duplicate`,
 que insere, simula falha de checkpoint e reprocessa o mesmo `batch_id`, provando `COUNT(*) == 1`.
 
-**Critérios de aceite:** as seis categorias passam, incluindo dor fragmentada normalizada e injeção
-delimitada; a integração prova que `health_report.verbatim` é ciphertext `BYTEA` sem o literal, que
+**Critérios de aceite:** todos os bloqueios e o achado de saúde passam, incluindo dor fragmentada
+normalizada e injeção delimitada; a integração prova que `health_report.verbatim` é ciphertext `BYTEA` sem o literal, que
 decifra com o AAD exato e que tanto RLS quanto a cópia do blob para outra linha/tenant recusam o acesso
 ou a autenticação; `test_graph_topology` prova `normalizer → guardrail`, `guardrail → router` e
-`guardrail → voice`; o caso `HEALTH_REPORT` prova `goto == "router"`, `health_flag` preenchido **e**
+`guardrail → voice`; o caso de `HEALTH_REPORT` sem bloqueio prova `goto == "router"`, `health_flag` preenchido **e**
 `"health_notice"` presente em `outbound["kind"]`; um teste de mensagem mista (relato de dor + série
 válida no mesmo turno) prova que a série persiste **e** `outbound` carrega os dois blocos
-(`ack` e `health_notice`) até o `voice`, não só um deles.
+(`ack` e `health_notice`) até o `voice`, não só um deles; `test_health_report_with_medical_advice`
+prova que o mesmo relato é persistido, `health_notice` e recusa são acumulados e `goto == "voice"`.
 
 **Tamanho:** M.
 
@@ -1624,7 +1641,7 @@ preserva o raciocínio que levou a cada uma.
 | 16 | `answered_at` **não** vira segundo marcador da resposta de mídia | — |
 | 17 | ADR-0009 **aposentado**, não estendido | **ADR-0016** |
 | 18 | O LLM devolve `steps`; `stage_plan()` é a **única** autoridade sobre estágios | errata da §9.4 |
-| 19 | `HEALTH_REPORT → router`, com `health_flag` e aviso acumulado | **ADR-0014** |
+| 19 | Achado de saúde independente: router sem bloqueio; persiste + recusa com bloqueio | **ADR-0014** |
 | 20 | Correção ganha ADR próprio **e** crítico determinístico | **ADR-0017** (Sprint 04) |
 | 21 | *kind* `session_summary` entra em `outbound`, não em `VoiceOutput` | emenda §13.1 (Sprint 04) |
 | 22 | Fechamento automático por job durável idempotente | coberto pelo **ADR-0010** |
@@ -1642,7 +1659,7 @@ preserva o raciocínio que levou a cada uma.
 | 0011 | SDKs nativos em vez de LangChain | #1 | T06 | onda 0 |
 | 0012 | Proveniência plural da série por spans | #7 | T08, T09, T12, T23 | onda 0 (esta PR) |
 | 0013 | RPE e RIR contraditórios | #2 | T09 | onda 0 |
-| 0014 | `HEALTH_REPORT` segue para o router | #19 | T23 | onda 0 |
+| 0014 | Achado de saúde independente do bloqueio | #19 | T23 | onda 0 |
 | 0015 | `fallback_text` obrigatório em reação | #24 | T26 | onda 0 |
 | 0016 | Recusa pré-grafo pelo `voice` — substitui o ADR-0009 | #17 | — | com a T28 |
 | 0017 | Contrato de correção | #20 | T24 | **Sprint 04** |
@@ -1685,7 +1702,7 @@ runtime recebe apenas `EXECUTE` na função e **não** herda a role dona. Sem o 
 função global continua sujeita à policy, não tem `app.tenant_id` e vê zero linhas. Já as tabelas do
 LangGraph usam o segundo padrão do mesmo ADR: `thread_id` construído pelo código, principal de login
 `fittrack_graph NOBYPASSRLS` com DML limitado às tabelas operacionais e **sem** poder sobre tabelas de
-domínio, `TenantEncryptedSaver` + `EncryptedSerializer` ligados ao tenant/thread e
+domínio, `TenantEncryptedSaver` + `EncryptedSerializer` ligados ao tenant/thread e ao slot estável,
 `TenantScopedStore` que injeta o namespace antes de toda operação e cifra o valor. Ali não existe RLS
 porque o schema é da biblioteca; isolamento lógico, menor privilégio e confidencialidade contra dump
 são três camadas distintas e testadas. O grant é obrigatoriamente pós-`setup()` no bootstrap — nunca
@@ -1834,12 +1851,14 @@ sobre `list[PlanStage]` — é a única forma de provar escrita antes de leitura
 Errata de spec basta se for lapso do autor; **ADR** se alguém defender a leitura contrária, por tocar o
 AD-15. Bloqueia T22.
 
-#### 19. **crítico** — `HEALTH_REPORT` vai a `voice` ou a `router`?
-O exemplo da §8.4 manda **qualquer** não-`PASS` direto a `voice`; a §12.1 exige registrar a série mesmo
-quando há relato de dor — o que obriga a prosseguir até a ingestão. As duas não podem estar certas.
-**Leitura recomendada:** `HEALTH_REPORT → router` com `health_flag` e aviso acumulado; as demais
-categorias bloqueantes vão a `voice`. **Exige ADR de segurança/topologia antes de codificar** — muda
-como uma decisão de saúde é aplicada, e a invariante 6 ("falhar registrando") está do lado do router.
+#### 19. **crítico** — achado de saúde e bloqueio podem coexistir?
+O exemplo da §8.4 mandava **qualquer** não-`PASS` direto a `voice`; a §12.1 exige registrar a série
+quando há relato de dor. Mas dor e pedido de medicação podem surgir no mesmo turno: escolher uma
+categoria exclusiva perderia a persistência ou deixaria passar o pedido bloqueante. **Leitura
+recomendada:** achado de saúde e bloqueio são eixos independentes; só o primeiro segue para `router`,
+e a combinação persiste o achado + avisa + vai a `voice`. **Exige ADR de segurança/topologia antes de
+codificar** — muda como uma decisão de saúde é aplicada, e a invariante 6 ("falhar registrando") está
+do lado da persistência.
 Bloqueia T23.
 
 #### 20. **crítico** — correção não tem contrato nenhum
@@ -1978,7 +1997,8 @@ km → m, `Decimal("60")` para min → s, `Decimal("3600")` para h → s (a mesm
   outro `batch_id`; retry/resume do batch corrente preserva o estado.
 - `messages` usa reducer limitado a 12; o digest a cada 20 interações é reconstruído das referências
   canônicas cifradas, não de uma janela de checkpoint que cresça até 20.
-- `TenantEncryptedSaver` força inclusive primitivos pelo serializer cifrado ligado ao tenant/thread;
+- `TenantEncryptedSaver` força inclusive primitivos pelo serializer cifrado ligado ao tenant/thread e
+  ao slot estável;
   todo acesso ao Store passa por wrapper que injeta namespace e cifra valores; os objetos brutos não
   são dependência de nó.
 - O lease do claim reusa `next_retry_at`; nenhuma coluna nova.

@@ -1023,7 +1023,8 @@ principal dedicado `fittrack_graph`. As duas chamadas continuam explícitas no b
 **Fronteira de tenant.** `thread_id = "tenant:{tenant_id}"` nasce em uma única função de código;
 o principal `fittrack_graph` é `NOSUPERUSER NOBYPASSRLS`, não é membro de `fittrack_app` e não recebe
 acesso ao domínio. `TenantEncryptedSaver` cifra todo valor de canal, inclusive primitivos, com AAD
-ligado a tenant/thread. `TenantScopedStore` prefixa toda operação por
+ligado a tenant/thread e ao slot estável: namespace/id do checkpoint, canal/versão do blob ou
+task/índice do write. `TenantScopedStore` prefixa toda operação por
 `("tenant", str(tenant_id), "profile")` e cifra cada valor com AAD de tenant, namespace e key. O
 saver e o Store brutos nunca são entregues a nós do grafo. Ver ADR-0010.
 
@@ -1508,9 +1509,10 @@ Cinco alvos, três deles agentes de domínio (AD-16). `admin` e `smalltalk` exis
 tráfego precisa ir a algum lugar, e mandá-lo para um dos três agentes de domínio contaminaria tanto
 os prompts quanto a avaliação de roteamento.
 
-O rótulo `BLOCK / FLAG` do desenho não é uma rota única: `PASS` e `HEALTH_REPORT` seguem para
-`router`; somente as categorias bloqueantes seguem diretamente para `voice`. O primeiro acrescenta
-o aviso de saúde e mantém a ingestão possível; o segundo não aciona agentes de domínio (ADR-0014).
+O rótulo `BLOCK / FLAG` do desenho não é uma rota única. O achado `HEALTH_REPORT`, quando não vem
+acompanhado de bloqueio, segue para `router`, acrescenta o aviso e mantém a ingestão possível. Uma
+categoria bloqueante segue diretamente para `voice`; se coexistir com o achado, o relato ainda é
+persistido e o aviso é acumulado antes da recusa (ADR-0014).
 
 ### 8.4 Os primitivos, um a um
 
@@ -1590,8 +1592,10 @@ produz fan-out, mas entrega a *todos* os ramos o mesmo estado — e o plano do r
 `payload` por passo (`{exercise: "supino_reto_barra", weeks: 8}`). Sem `Send`, cada subgrafo teria de
 reencontrar o próprio passo dentro de `state["plan"]` filtrando por `target`, o que já é feio com um
 passo por alvo e fica errado no dia em que o plano tiver dois passos para o mesmo alvo ("compara meu
-supino **e** meu agachamento"). `Send` entrega a cada ramo exatamente o argumento dele, e o mesmo
-alvo pode aparecer duas vezes no mesmo estágio como duas tarefas independentes.
+supino **e** meu agachamento"). `Send` entrega a cada ramo exatamente o argumento dele. O mesmo alvo
+pode aparecer duas vezes no plano, mas `stage_plan()` coloca ocorrências sucessivas em estágios
+distintos: um estágio nunca contém dois `Send` para o mesmo alvo, pois ambos escreveriam a mesma
+chave de escritor único.
 
 O terceiro argumento de `add_conditional_edges` é a lista de destinos possíveis. Ele é opcional em
 runtime e obrigatório aqui: é o que faz `graph.get_graph().draw_mermaid()` produzir o diagrama certo
@@ -1605,22 +1609,17 @@ Onde um nó precisa **atualizar o estado e escolher o próximo nó** ao mesmo te
 ```python
 from langgraph.types import Command
 
-def guardrail_node(state: GraphState) -> Command[Literal["router", "voice"]]:
-    verdict = await gateway.ainvoke(role=LLMRole.GUARDRAIL, ...)
-    if verdict.category == "PASS":
-        return Command(goto="router")
-    if verdict.category == "HEALTH_REPORT":
-        return Command(
-            goto="router",
-            update={"health_flag": verdict.model_dump(),
-                    "outbound": [{"kind": "health_notice", **verdict.blocks()}]},
-        )
-    return Command(goto="voice", update={"health_flag": verdict.model_dump(), "outbound": [verdict.blocks()]})
+def guardrail_node(state: GraphState) -> Command[Literal["router", "voice"]]: return route_guardrail_verdict(await gateway.ainvoke(role=LLMRole.GUARDRAIL, ...))
 ```
 
-`HEALTH_REPORT` é o único não-`PASS` que continua para o router: uma mensagem pode trazer dor e
-uma série no mesmo turno, e a série ainda precisa ser registrada. As demais categorias bloqueantes
-vão a `voice` e não podem chegar a ingestão (ADR-0014).
+O veredito não é uma enumeração exclusiva: `health_report` e `blocking_category` são eixos
+independentes. Um achado de saúde sem bloqueio continua para o router, para que uma série no mesmo
+turno seja registrada. Uma categoria bloqueante vai a `voice` e não pode chegar a ingestão; se ela
+coexistir com o achado, o relato é persistido e seu aviso acompanha a recusa (ADR-0014).
+
+`route_guardrail_verdict()` primeiro persiste o achado, produz `health_flag` e acumula
+`health_notice` em `outbound`; depois, se `blocking_category` existir, acrescenta o bloco de recusa e
+retorna `Command(goto="voice", update=...)`. Sem bloqueio, retorna `Command(goto="router", update=...)`.
 
 A alternativa — devolver um dict e declarar uma `add_conditional_edges` que relê o estado para
 decidir — funciona, mas espalha a decisão por dois lugares: o nó que sabe o veredito e a função que
@@ -1868,10 +1867,14 @@ correm juntos: um finalizador de sessão pode ler antes do `log_workout` que dev
 1. `stage_plan()` separa todos os passos de `ingestion`: writes (`log_workout`, `log_metric`,
    `correct_entry`) vêm primeiro; finalizadores (`close_session`, `discard_session`) vêm depois.
    A ordem original é estável dentro de cada grupo e cada passo ocupa seu próprio estágio.
-2. Só depois de todos os estágios de `ingestion`, todo o resto (`analysis`, `recommendation`,
-   `admin`, `smalltalk`) vai para um estágio paralelo.
-3. Sem `ingestion`, há um único estágio e tudo é paralelo. `close_session` e `discard_session` no
-   mesmo plano são inválidos e o plano é rejeitado antes do dispatch.
+2. Só depois de todos os estágios de `ingestion`, os passos restantes (`analysis`, `recommendation`,
+   `admin`, `smalltalk`) são agrupados em rodadas paralelas estáveis: a primeira ocorrência de cada
+   alvo vai para a primeira rodada, a segunda ocorrência daquele alvo vai para a segunda, e assim por
+   diante. Cada rodada contém no máximo um passo por alvo.
+3. Sem `ingestion`, aplica-se a mesma regra de rodadas; portanto pode haver mais de um estágio para
+   serializar destinos repetidos. Destinos distintos na mesma rodada continuam paralelos.
+4. `close_session` e `discard_session` no mesmo plano são inválidos e o plano é rejeitado antes do
+   dispatch.
 ```
 
 #### O exemplo composto
@@ -2188,8 +2191,8 @@ somente valor ou origem esteja presente.
 1. **Unidades.** O LLM devolve o literal e a unidade, nunca um valor convertido. Números sem unidade
    em contexto de musculação usam `unit="kg"` e `unit_origin="defaulted"`; entradas explícitas
    preservam o número e normalizam apenas o rótulo (`libras`/`lbs` → `lb`). `domain/units.py` converte
-   com `Decimal` no limite de persistência: lb → kg por `0.45359237`, km → m por `1000`, min → s por
-   `60` e h → s por `3600`, aplicando `ROUND_HALF_UP` uma única vez.
+   com `Decimal` no limite de persistência: lb → kg por `0.45359237`, km → m por `1000`, cm → m por
+   `0.01`, min → s por `60` e h → s por `3600`, aplicando `ROUND_HALF_UP` uma única vez.
 2. **Notação de séries.** `3x10`, `3 séries de 10`, `3×10` → `repeat=3, reps=10`.
    `12, 10, 8` → três séries com reps distintas, `repeat=1` cada.
 3. **Peso corporal.** "barra fixa 10 reps" → `load=null`. "barra fixa com 10kg de lastro" →
@@ -2600,14 +2603,18 @@ nos casos que ele existe para pegar.
 
 ### 12.1 Categorias
 
-| Categoria | Gatilho | Ação |
-| --- | --- | --- |
-| `PASS` | Conteúdo normal | Segue para o `router_agent` via `Command(goto="router")`. |
-| `HEALTH_REPORT` | Dor, lesão, desconforto, tontura, mal-estar | Grava `health_report`. Responde com acolhimento + orientação para profissional. **Registra a série se houver.** Passa a evitar a região nas recomendações. |
-| `MEDICAL_ADVICE` | Pedido de diagnóstico, tratamento, medicação | Recusa educadamente, orienta procurar profissional, não prescreve. |
-| `EXTREME_DIET` | Restrição alimentar severa, jejum prolongado, sinais de TA | Recusa orientar, oferece contato de apoio, marca o caso para revisão. |
-| `OFF_TOPIC` | Assunto sem relação com treino | Redireciona brevemente. |
-| `ABUSE` | Conteúdo abusivo ou tentativa de injection | Resposta padrão curta; incidente logado. |
+| Eixo | Valor | Gatilho | Ação |
+| --- | --- | --- | --- |
+| ambos ausentes | `PASS` | Conteúdo normal | Segue para o `router_agent` via `Command(goto="router")`. |
+| achado persistível | `HEALTH_REPORT` | Dor, lesão, desconforto, tontura, mal-estar | Grava `health_report`, responde com acolhimento + orientação para profissional e, **sem bloqueio**, registra a série se houver. Passa a evitar a região nas recomendações. |
+| bloqueio | `MEDICAL_ADVICE` | Pedido de diagnóstico, tratamento, medicação | Recusa educadamente, orienta procurar profissional, não prescreve. |
+| bloqueio | `EXTREME_DIET` | Restrição alimentar severa, jejum prolongado, sinais de TA | Recusa orientar, oferece contato de apoio, marca o caso para revisão. |
+| bloqueio | `OFF_TOPIC` | Assunto sem relação com treino | Redireciona brevemente. |
+| bloqueio | `ABUSE` | Conteúdo abusivo ou tentativa de injection | Resposta padrão curta; incidente logado. |
+
+`HEALTH_REPORT` é um achado independente, não uma alternativa exclusiva aos bloqueios. Se ele
+coexistir com um bloqueio, o relato é persistido e recebe `health_notice`, mas o `Command` vai para
+`voice` com a recusa — nunca para o router.
 
 ### 12.2 Política adotada (AD-29) — conservador com registro
 
@@ -2695,9 +2702,11 @@ class VoiceOutput(BaseModel):
     split: list[str] | None      # bolhas do split (§13.6), ≤ caps.max_bubbles
 ```
 
-Quando uma reação é recusada pelo protocolo ou não há mensagem-alvo, o adaptador só pode enviar
-`fallback_text`, já redigido pelo `voice_agent`; ele nunca cria texto. Uma reação sem fallback é
-inválida, e `fallback_text` é nulo nos outros modos (ADR-0015).
+Quando uma reação é recusada pelo protocolo ou não há mensagem-alvo endereçável — inclusive um
+`reply_to` de evento como `press:<callback_query_id>` — o adaptador só pode enviar `fallback_text`,
+já redigido pelo `voice_agent`; ele nunca cria texto. O alvo não endereçável é detectado antes da
+chamada de reação e não pode abortar a entrega do fallback. Uma reação sem fallback é inválida, e
+`fallback_text` é nulo nos outros modos (ADR-0015).
 
 ### 13.2 Regra de decisão do `mode` (AD-13)
 

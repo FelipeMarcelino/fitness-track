@@ -39,7 +39,7 @@ existem depois de `domain/units.py` multiplicar. Segundo explícito (`"descansei
 `unit="s"` e passa direto, sem conversão.
 
 O conversor usa somente `Decimal`: lb → kg multiplica por `Decimal("0.45359237")`; km → m multiplica
-por `Decimal("1000")`; min → s multiplica por `Decimal("60")`; h → s multiplica por
+por `Decimal("1000")`; cm → m multiplica por `Decimal("0.01")`; min → s multiplica por `Decimal("60")`; h → s multiplica por
 `Decimal("3600")`. Toda normalização para as colunas
 `NUMERIC(...,2)` (cargas e distâncias) aplica `quantize(Decimal("0.01"), ROUND_HALF_UP)` exatamente
 uma vez, no limite de persistência; `duration_s`/`hold_s`/`rest_s` são `INTEGER` (§5.2), então o
@@ -59,7 +59,7 @@ quilogramas. RIR explícito nunca é sobrescrito pelo derivado (§9.6, T09).
 ## Consequências
 
 O schema de extração fica mais explícito e testes podem fixar entradas como `100 lb → 45.36 kg`,
-`40 min → 2400 s` e `1 h → 3600 s` sem simular raciocínio do modelo. Há conversor e testes a mais,
+`50 cm → 0.50 m`, `40 min → 2400 s` e `1 h → 3600 s` sem simular raciocínio do modelo. Há conversor e testes a mais,
 mas a mesma regra
 cobre retry, fallback e qualquer provider. A errata da §9.5 precisa substituir a instrução de
 conversão no prompt pelo contrato literal e pela fronteira determinística, para distância **e** para

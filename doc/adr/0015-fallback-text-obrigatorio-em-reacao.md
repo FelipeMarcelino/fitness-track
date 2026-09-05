@@ -18,8 +18,11 @@ adaptador só poderia ficar silencioso ou inventar uma frase, ambas violações 
 
 `VoiceOutput` ganha `fallback_text`, obrigatório quando `mode="reaction"`. O
 `voice_agent` o redige junto com a reação. O adaptador pode usá-lo somente depois de
-uma falha de protocolo ou quando não houver mensagem-alvo para reagir; ele não cria,
-edita ou escolhe uma mensagem alternativa.
+uma falha de protocolo ou quando não houver mensagem-alvo endereçável para reagir; ele
+não cria, edita ou escolhe uma mensagem alternativa. Um `reply_to` ausente ou marcado
+como evento não endereçável (por exemplo, `press:<callback_query_id>`) é decidido antes
+da chamada ao endpoint de reação: o adaptador envia o fallback, não deixa a exceção de
+endereçamento abortar a resposta já enfileirada.
 
 Para todos os demais modos, `fallback_text` é nulo. O bloco convertido para a fila
 mantém o texto como fallback de entrega, mas não o envia quando a reação foi aceita.
@@ -28,7 +31,9 @@ mantém o texto como fallback de entrega, mas não o envia quando a reação foi
 
 Uma degradação de reação preserva conteúdo e continua no único caminho
 `voice_agent → deliver → outbound_queue`. O contrato fica um pouco mais amplo e os
-testes de schema devem rejeitar uma reação sem fallback ou fallback em modo incompatível.
+testes de schema devem rejeitar uma reação sem fallback ou fallback em modo incompatível;
+os testes de adaptador também provam que alvo `press:` recebe o texto de fallback e não
+faz chamada de reação.
 
 ## Condição de revisão
 

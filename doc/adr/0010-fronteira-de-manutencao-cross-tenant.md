@@ -37,7 +37,10 @@ Para a persistência do LangGraph:
 - o bootstrap executa Alembic, depois `saver.setup()`/`store.setup()` como owner,
   revoga grants herdados e só então concede os grants mínimos a `fittrack_graph`;
 - `TenantEncryptedSaver` envolve inclusive valores primitivos, cifra-os com AAD ligado
-  ao tenant/thread e não expõe conteúdo em `checkpoint` ou `metadata`;
+  ao tenant/thread **e ao slot estável de armazenamento**. Para checkpoints, o slot inclui
+  namespace/id; para blobs, também canal/versão; para writes, task/índice. Assim, mover
+  ciphertext entre linhas, canais ou writes do mesmo thread também falha autenticação, e o
+  saver não expõe conteúdo em `checkpoint` ou `metadata`;
 - `TenantScopedStore` prefixa toda operação com `("tenant", str(tenant_id),
   "profile")`, cifra o valor com AAD de tenant, namespace e key, e é a única porta
   entregue ao grafo. O Store bruto nunca chega a um nó nem ao runtime.
@@ -55,7 +58,8 @@ O runtime permanece incapaz de ler dados de outro tenant mesmo se uma query esqu
 o filtro, enquanto tarefas operacionais ganham uma superfície pequena, auditável e
 testável. O custo é manter roles, grants pós-`setup()` e testes de privilégio
 explícitos. As tabelas do LangGraph não usam RLS: isolamento lógico, menor privilégio
-e cifra contra dump são camadas separadas e todas obrigatórias.
+e cifra contra dump são camadas separadas e todas obrigatórias. Os testes de cifra cobrem
+tanto cópia cross-tenant quanto troca deliberada entre slots do mesmo tenant/thread.
 
 Um teste que só funciona conectado como superuser é inválido como prova de isolamento.
 Da mesma forma, uma alteração de schema da biblioteca deve falhar alto se a lista de
