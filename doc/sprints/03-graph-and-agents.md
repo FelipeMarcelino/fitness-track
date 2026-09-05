@@ -416,8 +416,19 @@ auditável. Single-shot, papel `NORMALIZER`, **sem** extração de séries.
 **Depende de:** S03-T06; interface de `GraphState` da trilha A; ADR-0012 (onda 0).
 
 **Arquivos previstos:** criar `agents/normalizer.py`, `agents/prompts.py`, `config/prompts/normalizer.md`,
-`domain/provenance.py`, `graph/nodes/normalizer.py`, `tests/unit/test_normalizer.py`,
-`tests/unit/test_provenance_alignment.py`, `evals/golden/normalization.jsonl`.
+`domain/provenance.py`, `graph/nodes/normalizer.py`,
+`src/fittrack/db/migrations/versions/_0006_raw_message_text_extract.py`,
+`tests/unit/test_normalizer.py`, `tests/unit/test_provenance_alignment.py`,
+`evals/golden/normalization.jsonl`; modificar `services/webhook.py`
+(`SqlRawMessageStore.persist`).
+
+**Migração (`_0006`, uma coluna, independente das outras da onda 0 — ver a nota de colisão de
+numeração na T15).** `ALTER TABLE raw_message ADD COLUMN text_extract BYTEA;` — cifrada,
+`NULL` quando a mensagem não carrega texto plano. Nenhuma coluna existente é, byte a byte,
+`raw_fragment.text`: `payload` é o evento inteiro do canal serializado (ADR-0012, contexto #2).
+`SqlRawMessageStore.persist` passa a cifrar `message.text` nesta coluna com o mesmo `column_aad` de
+linha que já usa para `payload`, no mesmo `INSERT` — sem tocar `_envelope()` nem o formato do
+Redis.
 
 **Plano de implementação:** schemas Pydantic estritos para `TurnSegment` e `NormalizedTurn`; delimitar
 fragmentos, transcrições, histórico e `pending_clarification` como dados não confiáveis — `clean_text`
@@ -433,7 +444,7 @@ a assinatura completa. O motivo de nascer na T08: é o nó do normalizador, em
 (nunca exposto ao prompt) e ao `NormalizedTurn` que o LLM acabou de devolver. Logo depois da
 validação Pydantic da saída do `NORMALIZER` — e antes de o nó devolver o estado — o nó chama
 `align_segment_spans(segment, raw_fragments)` para cada `TurnSegment` e grava o resultado em
-`segment.source_spans`, escolhendo `payload` ou `transcript` conforme `raw_fragment.was_audio`. É
+`segment.source_spans`, escolhendo `text_extract` ou `transcript` conforme `raw_fragment.was_audio`. É
 código determinístico (`difflib.SequenceMatcher`, sem chamada de LLM): o passo que faz o
 `extraction_agent` (T09) e o `guardrail_agent` (T23) poderem citar span sem nunca ter visto o texto
 bruto — eles citam **índice de segmento**, este nó já resolveu o span de verdade.
@@ -449,7 +460,7 @@ injection confirma que instrução em fragmento não altera schema, papel, rota 
 existe, não é vazio, e não há instrução equivalente inline no módulo; `align_segment_spans` prova
 `0 <= start < end <= len(texto-fonte)` em todo caso, inclusive quando a similaridade cai abaixo do
 limiar e o resultado é o fragmento inteiro; um segmento gerado a partir de um fragmento
-`was_audio=True` resolve contra `transcript`, nunca `payload`.
+`was_audio=True` resolve contra `transcript`, nunca contra `payload` (o envelope inteiro).
 
 **Tamanho:** M.
 
@@ -475,8 +486,10 @@ caractere que ele "adivinha" contra um literal que não leu não é verificável
 `ExtractedSet` carrega, em vez disso, `source_segments: list[int]` não vazia — índices em
 `NormalizedTurn.segments`, o único texto que o prompt de fato recebeu por inteiro. Cargas, distâncias
 e métricas que exigem normalização usam `QuantityLiteral(value: Decimal, unit:
-Literal["kg", "lb", "m", "km", "cm", "h",
-"scale_0_10"], unit_origin: Literal["explicit", "defaulted"])`. A validação pós-LLM confere que cada
+Literal["kg", "lb", "m", "km", "cm", "h", "s", "min",
+"scale_0_10"], unit_origin: Literal["explicit", "defaulted"])` — `s`/`min` cobrem `duration_s`,
+`hold_s` e `rest_s` (ADR-0018): `"correu 40 minutos"` nunca chega como `duration_s=2400` calculado
+pelo modelo. A validação pós-LLM confere que cada
 índice de `source_segments` existe e então chama `domain/provenance.resolve_spans(...)` — os
 `SourceSpan` já computados pela T08 para aqueles segmentos — para materializar `source_spans`
 canônicos, ordenados e sem sobreposição; só então a proveniência imutável da ADR-0012 é passada
@@ -485,10 +498,12 @@ receber aquele recorte literal; para múltiplos spans fica `NULL`, nunca uma con
 `clean_text` ou a escolha enganosa de um fragmento.
 
 `domain/units.py` é a única fronteira que converte `QuantityLiteral` em DTO de persistência
-(`load_kg`, `distance_m` ou métrica): usa `Decimal("0.45359237")` para lb → kg, `Decimal("1000")`
-para km → m e `quantize(Decimal("0.01"), ROUND_HALF_UP)` **uma vez**, no limite de armazenamento.
-O prompt só classifica e devolve o número literal mais a unidade; ele não calcula, não arredonda e não
-emite `load_kg` para entrada em lb. `domain/rpe.py`, **e só ele** (ADR-0018), também aplica
+(`load_kg`, `distance_m`, `duration_s`/`hold_s`/`rest_s` ou métrica): usa `Decimal("0.45359237")`
+para lb → kg, `Decimal("1000")` para km → m, `Decimal("60")` para min → s, e
+`quantize(Decimal("0.01"), ROUND_HALF_UP)` **uma vez**, no limite de armazenamento — para os campos
+`INTEGER` de tempo, `to_integral_value(ROUND_HALF_UP)` no lugar de `quantize` (ADR-0018). O prompt só
+classifica e devolve o número literal mais a unidade; ele não calcula, não arredonda e não emite
+`load_kg` para entrada em lb nem `duration_s` para entrada em minutos. `domain/rpe.py`, **e só ele** (ADR-0018), também aplica
 `RIR ≈ 10 − RPE` apenas depois da resposta, para inferência derivada, preservando o RIR explícito.
 Peso corporal, notação de séries e o mapa da §9.6 continuam no prompt; campo não dito vira
 `missing_fields`, não chute (invariantes 1 e 6).
@@ -505,8 +520,10 @@ fake do LLM devolveu somente `100` + `"lb"`.
 sobre adjetivo; `3x10` continua uma unidade de extração (as três linhas físicas são provadas na T12);
 `source_segments` inexistente, spans resolvidos fora do fragmento, sobrepostos ou fora de ordem,
 campo inventado e valor inválido são
-recusados **antes de tocar o banco**; testes de unidades cobrem kg/lb/km, constante e arredondamento
-fixos, e provam que nenhuma saída do LLM em lb chega a `load_kg` sem passar por `domain/units.py`.
+recusados **antes de tocar o banco**; testes de unidades cobrem kg/lb/km e min/s, constante e
+arredondamento fixos (`quantize` para carga/distância, `to_integral_value` para os `INTEGER` de
+tempo), e provam que nenhuma saída do LLM em lb ou em minutos chega a `load_kg`/`duration_s` sem
+passar por `domain/units.py`.
 
 **Tamanho:** M. Ver [ambiguidade #2](#2-rpe-e-rir-explícitos-e-contraditórios).
 
@@ -720,14 +737,14 @@ que revoga qualquer membro do papel, para o `BYPASSRLS` não ficar alcançável 
 `tests/integration/test_outbound_claim.py`; modificar `services/outbound.py` (`claim_due` no store e
 no protocolo).
 
-> **Colisão de numeração de migração:** quatro tarefas de trilhas paralelas propõem migração sem
-> coordenar número entre si — T04 (`_0006_langgraph_grants`), T15 (`_0006_outbound_claim`), T12
-> (`_0006_exercise_set_source`, ADR-0012) e T23 (`_0007_health_report_idempotency`), além de T18
-> (`_0007_membership_identity_resolution`), que já nasceu depois das duas primeiras. Nenhuma delas
-> depende do conteúdo de outra, então não há ordem "correta" — só ordem de merge. **Resolver no
-> merge, não na branch:** a primeira PR a mergear fica com o número que já tem; cada PR seguinte cujo
-> número colide renumeia o próprio arquivo (nome e `down_revision`) para o próximo livre antes de
-> abrir o merge. É renumeração mecânica, nunca reordenação de conteúdo.
+> **Colisão de numeração de migração:** cinco tarefas de trilhas paralelas propõem migração sem
+> coordenar número entre si — T04 (`_0006_langgraph_grants`), T15 (`_0006_outbound_claim`), T08
+> (`_0006_raw_message_text_extract`, ADR-0012) e T12 (`_0006_exercise_set_source`, ADR-0012), além
+> de T23 (`_0007_health_report_idempotency`) e T18 (`_0007_membership_identity_resolution`). Nenhuma
+> delas depende do conteúdo de outra, então não há ordem "correta" — só ordem de merge. **Resolver
+> no merge, não na branch:** a primeira PR a mergear fica com o número que já tem; cada PR seguinte
+> cujo número colide renumeia o próprio arquivo (nome e `down_revision`) para o próximo livre antes
+> de abrir o merge. É renumeração mecânica, nunca reordenação de conteúdo.
 
 **Desenho.** A função executa a query da §18.4 (elegível = `sent_at IS NULL AND dead_at IS NULL AND
 scheduled_at <= now AND next_retry_at <= now`, mais o `NOT EXISTS` que só libera `seq n+1` quando
@@ -1077,15 +1094,26 @@ Antes do primeiro `Send` de **cada** estágio, `dispatch` chama
 `QuotaService.reserve_stage(tenant_id, batch_id, stage_cursor, estimates)`. `estimates` enumera cada
 passo e o máximo de invocações que seu contrato permite (incluindo as 3 voltas de `analysis` e
 tentativas/fallback); usa teto de tokens/configuração e o provider mais caro elegível, nunca uma
-média otimista. Cada item explicita custo `0` quando o papel é rápido, preservando a regra da §19.3 de
-não bloquear registro; os itens `ANALYST`/`COACH` entram na reserva de USD e `analysis_calls`. Um script
-Redis atômico sobre `quota:{tenant_id}:{yyyy-mm}` confere e reserva, numa única operação,
-`used + reserved + total_stage` e `analysis_calls`; falta de saldo deixa a reserva vazia, registra
-`QuotaExceeded` e não despacha ramo algum. A chave idempotente
-`(tenant_id, batch_id, stage_cursor)` retorna a mesma reserva em retomada de checkpoint, sem cobrar
-duas vezes. O `reservation_id` e a parcela do ramo seguem no payload privado do `Send`; o gateway
-consome e confere cada chamada contra essa parcela, lança a verificação individual como defesa em
-profundidade e liquida custo real ou libera o saldo não usado quando o ramo termina.
+média otimista. Cada item explicita custo `0` quando o papel é rápido; os itens `ANALYST`/`COACH`
+entram na reserva de USD e `analysis_calls`.
+
+**A reserva é por passo, nunca por estágio inteiro.** A versão anterior deste plano somava todos os
+passos do estágio (`total_stage`) numa única checagem atômica e, sem saldo, suprimia o `Send` de
+**todo** o estágio — inclusive os passos de custo `0`. Isso viola a própria regra da §19.3 que o
+parágrafo cita ("não bloquear registro"): um estágio paralelo mistura livremente ramos caros
+(`analysis`/`recommendation`) com ramos gratuitos (`admin/change_persona`, smalltalk), porque
+`stage_plan()` os agrupa por *estágio de leitura*, não por custo. `reserve_stage` particiona
+`estimates` em dois grupos antes de reservar: passos com custo `0` são incluídos no `Send` list
+incondicionalmente, sem entrar no script atômico — não há o que reservar; passos `ANALYST`/`COACH`
+passam pelo script Redis atômico sobre `quota:{tenant_id}:{yyyy-mm}`, que confere e reserva, numa
+única operação, `used + reserved + total_priced` e `analysis_calls` **só da soma dos passos
+cobrados**. Falta de saldo omite **apenas os passos cobrados** do `Send` list daquele estágio — os
+zero-custo do mesmo estágio saem normalmente — e registra `QuotaExceeded` só para o que foi omitido.
+A chave idempotente `(tenant_id, batch_id, stage_cursor)` retorna a mesma reserva (ou a mesma
+omissão) em retomada de checkpoint, sem cobrar duas vezes nem reavaliar saldo que já mudou. O
+`reservation_id` e a parcela do ramo seguem no payload privado do `Send` de cada passo cobrado; o
+gateway consome e confere cada chamada contra essa parcela, lança a verificação individual como
+defesa em profundidade e liquida custo real ou libera o saldo não usado quando o ramo termina.
 Retry do mesmo batch reutiliza a reserva até o estágio fechar; falha terminal do ramo ou do batch libera
 somente a parcela ainda reservada, para que uma queda de worker não transforme quota em crédito preso.
 
@@ -1108,8 +1136,8 @@ o caso descrito pela revisão sem exigir a fronteira cross-tenant desta sprint.
 
 **Primeiros testes que devem falhar.** `test_stage_plan_puts_ingestion_before_readers` — plano com
 `analysis` antes de `ingestion` sai estagiado com ingestão sozinha no estágio 1; e
-`test_dispatch_reserves_entire_parallel_stage_before_any_send`, com duas estimativas que, juntas,
-excedem o saldo e `assert sends == []`.
+`test_dispatch_reserves_only_priced_steps_before_any_send`, com duas estimativas cobradas que,
+juntas, excedem o saldo e `assert priced_sends == []`.
 
 **Critérios de aceite:** os cinco alvos e todos os intents permitidos passam, intent incompatível
 reprova; teste concorrente prova que duas tentativas de reservar o mesmo último saldo não passam
@@ -1118,7 +1146,10 @@ prova `router → dispatch` e os cinco destinos; `test_channel_isolation` passa.
 gateway para chamada sem parcela ou acima dela: a reserva pré-fan-out complementa, não substitui, a
 guarda por chamada; falha terminal libera saldo não consumido; `test_reservation_past_lease_is_reclaimed_on_next_call`
 prova que uma reserva com deadline vencido é liberada atomicamente na chamada seguinte de
-`reserve_stage` do mesmo tenant, antes de qualquer checagem de saldo nova.
+`reserve_stage` do mesmo tenant, antes de qualquer checagem de saldo nova;
+`test_zero_cost_step_dispatches_when_priced_sibling_is_unaffordable` prova que um estágio com
+`analysis` (sem saldo) e `admin/change_persona` (custo `0`) despacha o segundo mesmo quando o
+primeiro é omitido por `QuotaExceeded`.
 
 **Tamanho:** M.
 
@@ -1139,10 +1170,16 @@ prova que uma reserva com deadline vencido é liberada atomicamente na chamada s
 `graph/root.py`, `graph/state.py`, `tests/test_graph_topology.py`. **Condicional:** ADR de topologia
 do `HEALTH_REPORT` (ambiguidade #19).
 
-**Migração (`_0007`).** `ALTER TABLE health_report ADD COLUMN batch_id BIGINT REFERENCES
-processing_batch(id);` e `CREATE UNIQUE INDEX ux_health_report_idempotency ON
-health_report(tenant_id, batch_id) WHERE batch_id IS NOT NULL;` — nullable para não travar uma
-inserção manual futura fora do fluxo de batch, mas todo `INSERT` desta tarefa sempre preenche.
+**Migração (`_0007`).** `ALTER TABLE processing_batch ADD CONSTRAINT uq_processing_batch_id_tenant
+UNIQUE (id, tenant_id);` seguido de `ALTER TABLE health_report ADD COLUMN batch_id BIGINT, ADD
+CONSTRAINT fk_health_report_batch_tenant FOREIGN KEY (batch_id, tenant_id) REFERENCES
+processing_batch(id, tenant_id);` e `CREATE UNIQUE INDEX ux_health_report_idempotency ON
+health_report(tenant_id, batch_id) WHERE batch_id IS NOT NULL;` — `batch_id` sozinho (sem a
+composta) deixaria a policy de RLS validar só a linha própria de `health_report`, não o `batch_id`
+referenciado, e um tenant A poderia gravar proveniência apontando para um `processing_batch` de
+tenant B (mesma classe de bug que a T12/ADR-0012 já corrigiu para `exercise_set_source` — nenhuma FK
+tenant-scoped nesta sprint fica de fora desse padrão). Nullable para não travar uma inserção manual
+futura fora do fluxo de batch, mas todo `INSERT` desta tarefa sempre preenche.
 
 **Plano.** Veredito Pydantic fechado (`PASS`, `HEALTH_REPORT`, `MEDICAL_ADVICE`, `EXTREME_DIET`,
 `OFF_TOPIC`, `ABUSE`), `extra="forbid"`. Em `HEALTH_REPORT`, o schema devolve
@@ -1150,8 +1187,8 @@ inserção manual futura fora do fluxo de batch, mas todo `INSERT` desta tarefa 
 caractere: o mesmo problema e a mesma solução da T09 (ADR-0012) — o guardrail também só vê o turno
 normalizado, nunca o fragmento bruto. Python resolve `source_segments` via
 `domain/provenance.resolve_spans(...)` para os `SourceSpan` que a T08 já calculou, decifra
-`payload` ou `transcript` conforme `source_field` de cada span e reconstrói **somente** o relato
-literal, nunca `clean_text` e nunca uma reprodução escrita pelo próprio LLM.
+`text_extract` ou `transcript` conforme `source_field` de cada span e reconstrói **somente** o
+relato literal, nunca `clean_text` e nunca uma reprodução escrita pelo próprio LLM.
 
 Três ramos, não dois — a versão anterior deste plano colapsava `HEALTH_REPORT` dentro do mesmo
 `Command` que `PASS`, e por isso nunca escrevia o aviso em `outbound`:
@@ -1174,7 +1211,9 @@ Três ramos, não dois — a versão anterior deste plano colapsava `HEALTH_REPO
 `verbatim` **antes** de qualquer `INSERT`, então não há como evitar reservar um candidato primeiro.
 **O que muda é que reservar um id deixou de ser, sozinho, a garantia de não-duplicação:** o repositório
 insere com `INSERT ... (id, tenant_id, batch_id, region, severity, category, verbatim, key_version)
-VALUES (candidate_id, ...) ON CONFLICT (tenant_id, batch_id) DO NOTHING RETURNING id`. Se o
+VALUES (candidate_id, ...) ON CONFLICT (tenant_id, batch_id) WHERE batch_id IS NOT NULL DO NOTHING
+RETURNING id` — o predicado repete o de `ux_health_report_idempotency` porque é um índice parcial;
+sem repeti-lo o Postgres não o infere como alvo do conflito e o `INSERT` falha. Se o
 `RETURNING` vier vazio, a linha já existe — este `batch_id` já foi processado antes, e o checkpoint do
 grafo é que não sobreviveu — e o `candidate_id` recém-reservado fica só como gap na sequência
 (inofensivo, Postgres não garante sequência sem buracos). O repositório então faz
@@ -1756,8 +1795,8 @@ ponte, e o ADR-0009 precisa de prazo novo por escrito. **Decidido: cortar a T17.
 que será armazenado e analisado depois. Isso contradiz diretamente a invariante 1: o LLM classifica o
 literal, não faz aritmética. O **ADR-0018** fixa `QuantityLiteral(value, unit)` na saída crua e a
 normalização em `domain/units.py`, com `Decimal("0.45359237")` para lb → kg, `Decimal("1000")` para
-km → m e `ROUND_HALF_UP` para duas casas no limite de persistência. Bloqueia T09 e exige errata da
-§9.5.
+km → m, `Decimal("60")` para min → s (a mesma lacuna existia para `duration_s`/`hold_s`/`rest_s`) e
+`ROUND_HALF_UP` no limite de persistência. Bloqueia T09 e exige errata da §9.5.
 
 ## Critério de saída da sprint
 
@@ -1804,7 +1843,7 @@ km → m e `ROUND_HALF_UP` para duas casas no limite de persistência. Bloqueia 
 | `checkpoint_blobs` domina o banco | Médio — guarda o estado inteiro por super-step, e o `GraphState` carrega `raw_fragments` + `messages` + `outbound` | Poda diária na T04 + métrica `graph_checkpoint_bytes` como acompanhamento |
 | Determinismo de LLM em teste | Médio — suíte instável | `temperature=0` reduz variância mas não a elimina: unitários usam providers falsos; golden set mede ao vivo, separado |
 | Custo do judge em toda PR da trilha A | Baixo — o filtro do CI inclui `src/fittrack/graph/` | Não mudar o filtro; **saber**: contar o custo no encerramento e não confundir "judge não calibrado" com regressão |
-| Colisão de numeração de migração `_0006`/`_0007` | Baixo — T04, T15 e T12 propõem `_0006`; T18 e T23 propõem `_0007` | Resolver no merge: primeira a mergear fica com o número, as demais renumeiam o próprio arquivo (nome e `down_revision`) |
+| Colisão de numeração de migração `_0006`/`_0007` | Baixo — T04, T15, T08 e T12 propõem `_0006`; T18 e T23 propõem `_0007` | Resolver no merge: primeira a mergear fica com o número, as demais renumeiam o próprio arquivo (nome e `down_revision`) |
 | Trilha D chegar tarde e bloquear T19 | Alto — `deliver` sem `VoiceOutput` não integra | **Mitigado:** T21 é só contrato e sobe na onda 2. T19 continua escrita contra estado fake; a colagem no grafo é PR separada |
 | T28 subir antes de `voice → deliver` estar coberto | **Crítico** — desliga o único caminho de resposta que existe hoje e o substituto não está provado; o sintoma é **silêncio**, não erro | T28 é a última PR da sprint, com teste de integração dos cinco motivos de recusa antes do merge |
 | Cortar T27 por parecer "produto" | **Crítico** — sem onboarding ninguém consente `workout_data`, e toda nota de voz é recusada para sempre | **Resolvido:** T27 declarada não-cortável no escopo decidido |
