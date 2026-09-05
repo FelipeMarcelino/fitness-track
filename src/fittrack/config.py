@@ -88,6 +88,14 @@ class ModelSpec(BaseModel):
     reasoning_effort: ReasoningEffort | None = None
     effort: ReasoningEffort | None = None
     temperature: Annotated[float, Field(ge=0.0, le=2.0)] | None = None
+    # The output budget, for the providers that require one. Anthropic's API
+    # refuses a request without `max_tokens`, so the adapter has to send
+    # something; without this field the value could only ever be a constant in
+    # Python, which is a limit disguised as a default. It bites hardest on the
+    # high-effort fallbacks, where adaptive thinking spends the same budget the
+    # answer does. Absent means "the adapter's floor" — no role declares one
+    # today, and `extra="forbid"` would have rejected the key outright.
+    max_tokens: Annotated[int, Field(gt=0)] | None = None
 
 
 class RoleConfig(BaseModel):
