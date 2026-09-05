@@ -411,12 +411,24 @@ tokens e nomes privados.
 **Objetivo.** A única entrada de domínio: rajada → `NormalizedTurn` limpo, segmentado, rotulado e
 auditável. Single-shot, papel `NORMALIZER`, **sem** extração de séries.
 
-**Spec.** §8.3, §9.2, §9.3, §12.3, §22.3; AD-17, AD-42; invariantes 4 e 7.
+**Spec.** §8.3, §9.2, §9.3, §12.3, §22.3; AD-17, AD-42; ADR-0012; invariantes 1, 4 e 7.
 
-**Depende de:** S03-T06; interface de `GraphState` da trilha A.
+**Depende de:** S03-T06; interface de `GraphState` da trilha A; ADR-0012 (onda 0).
 
 **Arquivos previstos:** criar `agents/normalizer.py`, `agents/prompts.py`, `config/prompts/normalizer.md`,
-`tests/unit/test_normalizer.py`, `evals/golden/normalization.jsonl`.
+`domain/provenance.py`, `graph/nodes/normalizer.py`,
+`src/fittrack/db/migrations/versions/_0006_raw_message_text_extract.py`,
+`tests/unit/test_normalizer.py`, `tests/unit/test_provenance_alignment.py`,
+`evals/golden/normalization.jsonl`; modificar `services/webhook.py`
+(`SqlRawMessageStore.persist`).
+
+**Migração (`_0006`, uma coluna, independente das outras da onda 0 — ver a nota de colisão de
+numeração na T15).** `ALTER TABLE raw_message ADD COLUMN text_extract BYTEA;` — cifrada,
+`NULL` quando a mensagem não carrega texto plano. Nenhuma coluna existente é, byte a byte,
+`raw_fragment.text`: `payload` é o evento inteiro do canal serializado (ADR-0012, contexto #2).
+`SqlRawMessageStore.persist` passa a cifrar `message.text` nesta coluna com o mesmo `column_aad` de
+linha que já usa para `payload`, no mesmo `INSERT` — sem tocar `_envelope()` nem o formato do
+Redis.
 
 **Plano de implementação:** schemas Pydantic estritos para `TurnSegment` e `NormalizedTurn`; delimitar
 fragmentos, transcrições, histórico e `pending_clarification` como dados não confiáveis — `clean_text`
@@ -424,6 +436,18 @@ fragmentos, transcrições, histórico e `pending_clarification` como dados não
 índices existentes e que não há anáfora resolvida sem âncora; carregar `normalizer.md` no boot —
 texto instrucional não fica em Python; golden set para fragmentação, STT, anáfora, interrupt pendente
 e injection.
+
+**`domain/provenance.py` nasce aqui, não na T09** (movido pela ADR-0012 após a revisão do PR): define
+`SourceSpan` e duas funções determinísticas, `align_segment_spans` e `resolve_spans` — ver a ADR para
+a assinatura completa. O motivo de nascer na T08: é o nó do normalizador, em
+`graph/nodes/normalizer.py`, quem tem acesso simultâneo ao `raw_fragments` bruto do `GraphState`
+(nunca exposto ao prompt) e ao `NormalizedTurn` que o LLM acabou de devolver. Logo depois da
+validação Pydantic da saída do `NORMALIZER` — e antes de o nó devolver o estado — o nó chama
+`align_segment_spans(segment, raw_fragments)` para cada `TurnSegment` e grava o resultado em
+`segment.source_spans`, escolhendo `text_extract` ou `transcript` conforme `raw_fragment.was_audio`. É
+código determinístico (`difflib.SequenceMatcher`, sem chamada de LLM): o passo que faz o
+`extraction_agent` (T09) e o `guardrail_agent` (T23) poderem citar span sem nunca ter visto o texto
+bruto — eles citam **índice de segmento**, este nó já resolveu o span de verdade.
 
 **Contrato que a trilha A precisa:** `answers_clarification: bool` no `NormalizedTurn` — é o que
 decide `Command(resume=...)` vs. invocação normal na T05.
@@ -433,7 +457,10 @@ decide `Command(resume=...)` vs. invocação normal na T05.
 
 **Critérios de aceite:** rejeita saída fora dos `Literal`s e `source_fragments` inexistentes; teste de
 injection confirma que instrução em fragmento não altera schema, papel, rota nem contexto; o prompt
-existe, não é vazio, e não há instrução equivalente inline no módulo.
+existe, não é vazio, e não há instrução equivalente inline no módulo; `align_segment_spans` prova
+`0 <= start < end <= len(texto-fonte)` em todo caso, inclusive quando a similaridade cai abaixo do
+limiar e o resultado é o fragmento inteiro; um segmento gerado a partir de um fragmento
+`was_audio=True` resolve contra `transcript`, nunca contra `payload` (o envelope inteiro).
 
 **Tamanho:** M.
 
@@ -442,26 +469,61 @@ existe, não é vazio, e não há instrução equivalente inline no módulo.
 **Objetivo.** Turno normalizado → `ExtractionResult` validado, sem inventar campos. Single-shot, papel
 `EXTRACTOR`. Representa `3x10` como `repeat=3`; a **persistência** expande em três linhas.
 
-**Spec.** §9.1, §9.5, §9.6, §9.10, §22.3; AD-07, AD-35, AD-42; invariantes 4, 6 e 7.
+**Spec.** §9.1, §9.5, §9.6, §9.10, §22.3; AD-07, AD-35, AD-42; ADR-0012 e ADR-0018;
+invariantes 1, 4, 6 e 7.
 
-**Depende de:** S03-T06, S03-T08.
+**Depende de:** S03-T06, S03-T08, ADR-0012 e ADR-0018 (onda 0).
 
-**Arquivos previstos:** criar `agents/extraction.py`, `domain/rpe.py`, `config/prompts/extraction.md`,
-`tests/unit/test_extraction.py`, `tests/unit/test_rpe.py`, `evals/golden/extraction.jsonl`.
+**Arquivos previstos:** criar `agents/extraction.py`, `domain/rpe.py`, `domain/units.py`,
+`config/prompts/extraction.md`, `tests/unit/test_extraction.py`, `tests/unit/test_rpe.py`,
+`tests/unit/test_units.py`, `evals/golden/extraction.jsonl`. **Usa** (não recria)
+`domain/provenance.py` — nasce na T08, ver ADR-0012.
 
-**Plano de implementação:** schemas da §9.5 com `extra="forbid"`, limites de RPE, `repeat >= 1`,
-`confidence` em 0..1 e `source_text` obrigatório; **exigir que `source_text` venha de fragmento bruto,
-não de `clean_text`** — a validação pós-LLM confere essa proveniência; codificar no prompt as unidades,
-peso corporal, notação de séries e o mapa da §9.6; aplicar `RIR ≈ 10 − RPE` **somente para inferência
-derivada**, preservando explicitamente o RIR informado; produzir `missing_fields` em vez de preencher
-o que não foi dito (invariante 6).
+**Plano de implementação:** schemas da §9.5 com `extra="forbid"`, limites de RPE, `repeat >= 1` e
+`confidence` em 0..1. A saída crua do LLM não carrega `source_text`, `source_spans` nem valores já
+convertidos: o extrator nunca viu o texto bruto (só o `NormalizedTurn`, §9.3) e um offset de
+caractere que ele "adivinha" contra um literal que não leu não é verificável (ADR-0012). Cada
+`ExtractedSet` carrega, em vez disso, `source_segments: list[int]` não vazia — índices em
+`NormalizedTurn.segments`, o único texto que o prompt de fato recebeu por inteiro. Cargas, distâncias
+e métricas que exigem normalização usam `QuantityLiteral(value: Decimal, unit:
+Literal["kg", "lb", "m", "km", "cm", "h", "s", "min",
+"scale_0_10"], unit_origin: Literal["explicit", "defaulted"])` — `s`/`min` cobrem `duration_s`,
+`hold_s` e `rest_s` (ADR-0018): `"correu 40 minutos"` nunca chega como `duration_s=2400` calculado
+pelo modelo. A validação pós-LLM confere que cada
+índice de `source_segments` existe e então chama `domain/provenance.resolve_spans(...)` — os
+`SourceSpan` já computados pela T08 para aqueles segmentos — para materializar `source_spans`
+canônicos, ordenados e sem sobreposição; só então a proveniência imutável da ADR-0012 é passada
+adiante para a T12. `source_text` não é prova de uma série: para um único span resolvido pode
+receber aquele recorte literal; para múltiplos spans fica `NULL`, nunca uma concatenação de
+`clean_text` ou a escolha enganosa de um fragmento.
 
-**Primeiro teste que deve falhar.** `test_extracts_repeat_and_rir_from_natural_language` com
-`assert result.sets[0].repeat == 3`, `reps == 10`, `rir == 2`, `rpe == 8`.
+`domain/units.py` é a única fronteira que converte `QuantityLiteral` em DTO de persistência
+(`load_kg`, `distance_m`, `duration_s`/`hold_s`/`rest_s` ou métrica): usa `Decimal("0.45359237")`
+para lb → kg, `Decimal("1000")` para km → m, `Decimal("60")` para min → s, e
+`quantize(Decimal("0.01"), ROUND_HALF_UP)` **uma vez**, no limite de armazenamento — para os campos
+`INTEGER` de tempo, `to_integral_value(ROUND_HALF_UP)` no lugar de `quantize` (ADR-0018). O prompt só
+classifica e devolve o número literal mais a unidade; ele não calcula, não arredonda e não emite
+`load_kg` para entrada em lb nem `duration_s` para entrada em minutos. `domain/rpe.py`, **e só ele** (ADR-0018), também aplica
+`RIR ≈ 10 − RPE` apenas depois da resposta, para inferência derivada, preservando o RIR explícito.
+Peso corporal, notação de séries e o mapa da §9.6 continuam no prompt; campo não dito vira
+`missing_fields`, não chute (invariantes 1 e 6).
+
+**Primeiros testes que devem falhar.** `test_extracts_repeat_and_rir_from_natural_language` com
+`assert result.sets[0].repeat == 3`, `reps == 10`, `rir == 2`, `rpe == 8`; e
+`test_set_assembled_from_three_fragments_resolves_ordered_validated_spans`, para `"supino"`, `"80 kg"`,
+`"8 reps"`, onde o fake do LLM devolve só `source_segments` e o teste prova que `resolve_spans`
+produz os três `SourceSpan` esperados, rejeitando `source_text` sintético.
+`test_normalize_100_lb_with_decimal_half_up` afirma `Decimal("45.36")` no DTO de persistência e que o
+fake do LLM devolveu somente `100` + `"lb"`.
 
 **Critérios de aceite:** "muito fácil" → RPE 3; "falhei" → 10; RPE/RIR numérico explícito prevalece
 sobre adjetivo; `3x10` continua uma unidade de extração (as três linhas físicas são provadas na T12);
-saída com campo inventado, fonte não literal ou valor inválido é recusada **antes de tocar o banco**.
+`source_segments` inexistente, spans resolvidos fora do fragmento, sobrepostos ou fora de ordem,
+campo inventado e valor inválido são
+recusados **antes de tocar o banco**; testes de unidades cobrem kg/lb/km e min/s, constante e
+arredondamento fixos (`quantize` para carga/distância, `to_integral_value` para os `INTEGER` de
+tempo), e provam que nenhuma saída do LLM em lb ou em minutos chega a `load_kg`/`duration_s` sem
+passar por `domain/units.py`.
 
 **Tamanho:** M. Ver [ambiguidade #2](#2-rpe-e-rir-explícitos-e-contraditórios).
 
@@ -532,27 +594,60 @@ referenciado ou persistido; nome com injection permanece dado delimitado.
 tenant-scoped. `repeat=3` gera **três** `exercise_set` com índices distintos (AD-07), não uma linha
 agregada.
 
-**Spec.** §5.2, §6.1, §6.2, §8.5, §9.2, §9.5, §9.10; AD-06, AD-07; ADR-0003; invariantes 3, 5 e 6.
+**Spec.** §5.2, §6.1, §6.2, §8.5, §9.2, §9.5, §9.10; AD-06, AD-07; ADR-0003; ADR-0012 (onda 0);
+invariantes 3, 5 e 6.
 
-**Depende de:** S03-T09, S03-T11 e o contrato do subgrafo `ingestion` (T03).
+**Depende de:** S03-T09, S03-T11, ADR-0012 e o contrato do subgrafo `ingestion` (T03).
 
-**Arquivos previstos:** criar `domain/session.py`, `repositories/workouts.py`, `services/ingestion.py`,
-`tests/unit/test_session_manager.py`, `tests/integration/test_workout_persistence.py`.
+**Arquivos previstos:** criar `domain/session.py`, `repositories/workouts.py`, `repositories/set_source.py`,
+`services/ingestion.py`, `src/fittrack/db/migrations/versions/_0006_exercise_set_source.py`,
+`tests/unit/test_session_manager.py`, `tests/integration/test_workout_persistence.py`,
+`tests/integration/test_provenance_retention.py`.
+
+**Migração (`_0006`, exigida pela ADR-0012 — esta é a peça que a versão anterior deste plano
+omitia).** Cria `exercise_set_source` com as duas FKs tenant-qualificadas (`exercise_set_id` e
+`raw_message_id`, a segunda com `ON DELETE SET NULL (raw_message_id)`), as chaves candidatas
+`uq_exercise_set_id_tenant` em `exercise_set` e `uq_raw_message_id_tenant` em `raw_message`, e as
+colunas novas em `exercise_set`: `provenance_hash BYTEA NOT NULL` e
+`expansion_ordinal SMALLINT NOT NULL DEFAULT 0`. Substitui `ux_set_idempotency` — ver SQL completo na
+ADR-0012.
 
 **Plano de implementação:** criar/reabrir sessão conforme §6 — **somente `closed_auto` reabre até
 15 min; `closed_explicit` não reabre**; derivar `is_bodyweight`, escopo e equipamento do registro no
-banco; expandir `repeat`, calcular `set_index` sem colisão, marcar `inferred=True` nas repetições
-implícitas e usar a chave de idempotência existente; inserir série e atualizar `last_activity_at` na
-**mesma transação**; `status='complete'` só quando o `CHECK ck_set_payload` puder ser satisfeito.
+banco; expandir `repeat` em `expansion_ordinal = 0..repeat-1`, marcar `inferred=True` nas repetições
+implícitas. **A chave de idempotência não é a antiga.** `set_index` (exibição/ordenação) e
+`provenance_hash`+`expansion_ordinal` (idempotência) são calculados separadamente e inseridos no
+mesmo `INSERT`, mas só os dois últimos entram no alvo do `ON CONFLICT (session_id, exercise_id,
+provenance_hash, expansion_ordinal) DO NOTHING` — **nunca** `ON CONFLICT` sobre `set_index`, porque
+`set_index` é derivado da contagem atual de linhas da sessão, que o próprio INSERT anterior já
+alterou: se o commit da tentativa 1 for bem-sucedido mas o checkpoint do grafo falhar antes de
+persistir, a tentativa 2 (retry do mesmo batch) recalcula um `set_index` **diferente** — mas
+`provenance_hash` e `expansion_ordinal` são funções só do conteúdo já validado da extração, então
+continuam iguais, o `ON CONFLICT` colide e a tentativa 2 não insere nada (ver ADR-0012, seção
+"Idempotência"). O `INSERT` de `exercise_set` usa `RETURNING id`; quando o conflito zera o
+`RETURNING` (linha já existe de uma tentativa anterior), `repositories/workouts.py` faz um `SELECT`
+pela mesma chave `(session_id, exercise_id, provenance_hash, expansion_ordinal)` para obter o `id`
+existente — nunca insere `exercise_set_source` para um `exercise_set_id` inventado. Depois de cada
+série resolvida (nova ou reencontrada), com `status='complete'` só quando o `CHECK ck_set_payload`
+puder ser satisfeito, `repositories/set_source.py` insere uma linha em `exercise_set_source` por span
+resolvido — mesma transação, mesmo `INSERT ... ON CONFLICT (exercise_set_id, position) DO NOTHING`,
+para que o mesmo retry que reencontrou o `exercise_set` também não duplique a proveniência.
 
 **Primeiro teste que deve falhar.** `test_persistence_expands_3x10_to_three_complete_rows` com
 `assert rows == [(1, 10), (2, 10), (3, 10)]`.
 
 **Critérios de aceite:** reprocessar a mesma entrada **não aumenta volume**; exercício global grava
 escopo global e privado grava o do próprio tenant, com tentativa cruzada falhando; `v_set_volume`
-contém as três séries completas e nunca uma incompleta.
+contém as três séries completas e nunca uma incompleta; um teste de integração commita o `INSERT` de
+`exercise_set` e simula falha de checkpoint **antes** de inserir `exercise_set_source` — o retry do
+batch não duplica a série (prova direta do bug do `set_index` corrigido); FK cruzada entre tenants
+para `exercise_set_id` e para `raw_message_id` reprovam nos dois sentidos; um teste de integração
+apaga o `raw_message` referenciado (simulando a purga de 90 dias) e prova que `exercise_set_source`
+sobrevive com `raw_message_id IS NULL`, `tenant_id` intacto e o snapshot (`channel`, `occurred_at`)
+preservado.
 
-**Tamanho:** M. **Bloqueado pela [ambiguidade crítica #7](#7-crítico-uma-série-pode-vir-de-vários-fragmentos-mas-source_message_id-é-escalar).**
+**Tamanho:** M/G — cresceu com a migração da ADR-0012. **Bloqueado pela
+[ambiguidade crítica #7](#7-crítico-uma-série-pode-vir-de-vários-fragmentos-mas-source_message_id-é-escalar).**
 
 #### S03-T13 — Clarification and incomplete recording · **adiada para a Sprint 04**
 
@@ -642,8 +737,14 @@ que revoga qualquer membro do papel, para o `BYPASSRLS` não ficar alcançável 
 `tests/integration/test_outbound_claim.py`; modificar `services/outbound.py` (`claim_due` no store e
 no protocolo).
 
-> **Colisão de numeração de migração:** T04 e T15 propõem ambas `_0006`. Quem mergear primeiro fica
-> com `_0006`; a segunda vira `_0007`, e a T18 vira `_0008`. Resolver no merge, não na branch.
+> **Colisão de numeração de migração:** cinco tarefas de trilhas paralelas propõem migração sem
+> coordenar número entre si — T04 (`_0006_langgraph_grants`), T15 (`_0006_outbound_claim`), T08
+> (`_0006_raw_message_text_extract`, ADR-0012) e T12 (`_0006_exercise_set_source`, ADR-0012), além
+> de T23 (`_0007_health_report_idempotency`) e T18 (`_0007_membership_identity_resolution`). Nenhuma
+> delas depende do conteúdo de outra, então não há ordem "correta" — só ordem de merge. **Resolver
+> no merge, não na branch:** a primeira PR a mergear fica com o número que já tem; cada PR seguinte
+> cujo número colide renumeia o próprio arquivo (nome e `down_revision`) para o próximo livre antes
+> de abrir o merge. É renumeração mecânica, nunca reordenação de conteúdo.
 
 **Desenho.** A função executa a query da §18.4 (elegível = `sent_at IS NULL AND dead_at IS NULL AND
 scheduled_at <= now AND next_retry_at <= now`, mais o `NOT EXISTS` que só libera `seq n+1` quando
@@ -973,13 +1074,14 @@ inválida de modo reprovam;
 **Objetivo.** Produzir um `RoutingPlan` com o vocabulário fechado da §9.4 e transformar a proposta do
 LLM em estágios seguros para `dispatch`/`Send`, **sempre** pondo escrita de ingestão antes de leitura.
 
-**Spec:** §§8.2–8.4 (`Send`), 8.8, 9.1–9.4, 20.3, 22.3.
+**Spec:** §§8.2–8.4 (`Send`), 8.8, 9.1–9.4, 19.3, 20.3, 22.3.
 
-**Depende de:** S03-T21, S03-T08 (normalizer), S03-T02 (root/`dispatch`), S03-T06 (gateway).
+**Depende de:** S03-T21, S03-T08 (normalizer), S03-T02 (root/`dispatch`), S03-T06 (gateway) e
+S03-T07 (quota).
 
 **Arquivos previstos:** criar `graph/staging.py`, `graph/nodes/router.py`, `config/prompts/router.md`,
-`tests/unit/test_router.py`; modificar `agents/router.py`, `graph/root.py`, `llm/roles.py`, golden set
-de roteamento.
+`tests/unit/test_router.py`, `tests/unit/test_stage_quota.py`; modificar `agents/router.py`,
+`graph/root.py`, `llm/roles.py`, golden set de roteamento.
 
 **Plano.** Uma chamada ao gateway com `agent="router"`, `role=LLMRole.ROUTER`; nunca texto cru, nunca
 `channel_caps`. **`stage_plan()` ignora qualquer ordenação sugerida pelo LLM:** se há `ingestion`, ela
@@ -988,12 +1090,66 @@ de `stage_plan()`. Truncamento em quatro passos registra em `errors` e na métri
 sem inventar destino alternativo. `pending_clarification` tem precedência: o worker retoma por
 `Command(resume=…)` e o router se recusa a executar.
 
-**Primeiro teste que deve falhar.** `test_stage_plan_puts_ingestion_before_readers` — plano com
-`analysis` antes de `ingestion` sai estagiado com ingestão sozinha no estágio 1.
+Antes do primeiro `Send` de **cada** estágio, `dispatch` chama
+`QuotaService.reserve_stage(tenant_id, batch_id, stage_cursor, estimates)`. `estimates` enumera cada
+passo e o máximo de invocações que seu contrato permite (incluindo as 3 voltas de `analysis` e
+tentativas/fallback); usa teto de tokens/configuração e o provider mais caro elegível, nunca uma
+média otimista. Cada item explicita custo `0` quando o papel é rápido; os itens `ANALYST`/`COACH`
+entram na reserva de USD e `analysis_calls`.
+
+**A reserva é por passo, nunca por estágio inteiro.** A versão anterior deste plano somava todos os
+passos do estágio (`total_stage`) numa única checagem atômica e, sem saldo, suprimia o `Send` de
+**todo** o estágio — inclusive os passos de custo `0`. Isso viola a própria regra da §19.3 que o
+parágrafo cita ("não bloquear registro"): um estágio paralelo mistura livremente ramos caros
+(`analysis`/`recommendation`) com ramos gratuitos (`admin/change_persona`, smalltalk), porque
+`stage_plan()` os agrupa por *estágio de leitura*, não por custo. `reserve_stage` particiona
+`estimates` em dois grupos antes de reservar: passos com custo `0` são incluídos no `Send` list
+incondicionalmente, sem entrar no script atômico — não há o que reservar; passos `ANALYST`/`COACH`
+passam pelo script Redis atômico sobre `quota:{tenant_id}:{yyyy-mm}`, que confere e reserva, numa
+única operação, `used + reserved + total_priced` e `analysis_calls` **só da soma dos passos
+cobrados**. Falta de saldo omite **apenas os passos cobrados** do `Send` list daquele estágio — os
+zero-custo do mesmo estágio saem normalmente — e registra `QuotaExceeded` só para o que foi omitido.
+A chave idempotente `(tenant_id, batch_id, stage_cursor)` retorna a mesma reserva (ou a mesma
+omissão) em retomada de checkpoint, sem cobrar duas vezes nem reavaliar saldo que já mudou. O
+`reservation_id` e a parcela do ramo seguem no payload privado do `Send` de cada passo cobrado; o
+gateway consome e confere cada chamada contra essa parcela, lança a verificação individual como
+defesa em profundidade e liquida custo real ou libera o saldo não usado quando o ramo termina.
+Retry do mesmo batch reutiliza a reserva até o estágio fechar; falha terminal do ramo ou do batch libera
+somente a parcela ainda reservada, para que uma queda de worker não transforme quota em crédito preso.
+
+**A liberação acima depende de algo rodar até o fim — e um worker morto no meio (kill -9, OOM, última
+tentativa do ARQ perdida) não roda nada.** Sem mais nada, a reserva fica presa no hash mensal
+`quota:{tenant_id}:{yyyy-mm}` pelo resto do período, bloqueando o saldo pago do tenant sem ele ter
+consumido nada. `reserve_stage` também grava o `reservation_id` num ZSET
+`quota:reservations:{tenant_id}:{yyyy-mm}`, pontuado pelo deadline do lease (mesmo idioma do
+`interrupts:pending` da T05 — ver [ambiguidade #6](#6-um-interrupt-expirado-no-redis-não-é-varrível)),
+com um lease fixo (15 min — folgado acima do pior caso de duas tentativas + fallback + overhead de
+avaliação de um estágio). `reserve_stage` começa **sempre** varrendo `ZRANGEBYSCORE 0 now` do próprio
+ZSET do tenant que está chamando — sem varrer outros tenants, sem precisar de scheduler nem de
+`SECURITY DEFINER`, porque cada tenant só varre a própria fila ao fazer sua própria próxima chamada —
+e libera atomicamente, no mesmo script Lua, qualquer reserva vencida antes de conceder uma nova. Isso
+autocura o caso comum: um tenant ativo que manda outra mensagem depois da falha já limpa o crédito
+preso antes de gastar de novo. Um tenant que nunca mais manda mensagem naquele mês não perde nada além
+do já perdido (o hash mensal expira sozinho na virada); o `ADR-0010`/scheduler da T14 (Sprint 04) pode
+somar uma varredura periódica como reforço, mas o lease + autocura no próprio `reserve_stage` já fecha
+o caso descrito pela revisão sem exigir a fronteira cross-tenant desta sprint.
+
+**Primeiros testes que devem falhar.** `test_stage_plan_puts_ingestion_before_readers` — plano com
+`analysis` antes de `ingestion` sai estagiado com ingestão sozinha no estágio 1; e
+`test_dispatch_reserves_only_priced_steps_before_any_send`, com duas estimativas cobradas que,
+juntas, excedem o saldo e `assert priced_sends == []`.
 
 **Critérios de aceite:** os cinco alvos e todos os intents permitidos passam, intent incompatível
-reprova; `test_graph_topology` prova `router → dispatch` e os cinco destinos; `test_channel_isolation`
-passa.
+reprova; teste concorrente prova que duas tentativas de reservar o mesmo último saldo não passam
+ambas, e teste de retomada prova que a reserva idempotente não duplica `reserved_usd`; `test_graph_topology`
+prova `router → dispatch` e os cinco destinos; `test_channel_isolation` passa. T07 mantém testes do
+gateway para chamada sem parcela ou acima dela: a reserva pré-fan-out complementa, não substitui, a
+guarda por chamada; falha terminal libera saldo não consumido; `test_reservation_past_lease_is_reclaimed_on_next_call`
+prova que uma reserva com deadline vencido é liberada atomicamente na chamada seguinte de
+`reserve_stage` do mesmo tenant, antes de qualquer checagem de saldo nova;
+`test_zero_cost_step_dispatches_when_priced_sibling_is_unaffordable` prova que um estágio com
+`analysis` (sem saldo) e `admin/change_persona` (custo `0`) despacha o segundo mesmo quando o
+primeiro é omitido por `QuotaExceeded`.
 
 **Tamanho:** M.
 
@@ -1003,27 +1159,84 @@ passa.
 `Command[Literal["router", "voice"]]` e **preservando o registro de treino** quando houver
 `HEALTH_REPORT`.
 
-**Spec:** §§8.3, 8.4 (`Command`), 9.2, 12.1–12.3, 13.2, 19.5, 20.2, 22.3.
+**Spec:** §§8.3, 8.4 (`Command`), 9.2, 12.1–12.3, 13.1, 13.2, 19.5, 20.2, 22.3. Invariante 2.
 
-**Depende de:** S03-T02, S03-T06, S03-T08, S03-T21; T26 para a verbalização final.
+**Depende de:** S03-T02, S03-T06, S03-T08, S03-T21, ADR-0012; T26 para a verbalização final.
 
 **Arquivos previstos:** criar `agents/guardrail.py`, `graph/nodes/guardrail.py`,
-`config/prompts/guardrail.md`, `tests/unit/test_guardrail.py`; modificar `graph/root.py`,
-`graph/state.py`, `tests/test_graph_topology.py`. **Condicional:** ADR de topologia do
-`HEALTH_REPORT` (ambiguidade #19).
+`repositories/health_reports.py`, `config/prompts/guardrail.md`,
+`src/fittrack/db/migrations/versions/_0007_health_report_idempotency.py`,
+`tests/unit/test_guardrail.py`, `tests/integration/test_health_report_persistence.py`; modificar
+`graph/root.py`, `graph/state.py`, `tests/test_graph_topology.py`. **Condicional:** ADR de topologia
+do `HEALTH_REPORT` (ambiguidade #19).
+
+**Migração (`_0007`).** `ALTER TABLE processing_batch ADD CONSTRAINT uq_processing_batch_id_tenant
+UNIQUE (id, tenant_id);` seguido de `ALTER TABLE health_report ADD COLUMN batch_id BIGINT, ADD
+CONSTRAINT fk_health_report_batch_tenant FOREIGN KEY (batch_id, tenant_id) REFERENCES
+processing_batch(id, tenant_id);` e `CREATE UNIQUE INDEX ux_health_report_idempotency ON
+health_report(tenant_id, batch_id) WHERE batch_id IS NOT NULL;` — `batch_id` sozinho (sem a
+composta) deixaria a policy de RLS validar só a linha própria de `health_report`, não o `batch_id`
+referenciado, e um tenant A poderia gravar proveniência apontando para um `processing_batch` de
+tenant B (mesma classe de bug que a T12/ADR-0012 já corrigiu para `exercise_set_source` — nenhuma FK
+tenant-scoped nesta sprint fica de fora desse padrão). Nullable para não travar uma inserção manual
+futura fora do fluxo de batch, mas todo `INSERT` desta tarefa sempre preenche.
 
 **Plano.** Veredito Pydantic fechado (`PASS`, `HEALTH_REPORT`, `MEDICAL_ADVICE`, `EXTREME_DIET`,
-`OFF_TOPIC`, `ABUSE`), `extra="forbid"`. `PASS` → `Command(goto="router")`. Bloqueios →
-`Command(goto="voice", update={"health_flag": …, "outbound": [bloco semântico]})`. **`HEALTH_REPORT`
-grava o relato mínimo sob tenant e segue para `router`**, para que um `ingestion/log_workout` no mesmo
-turno ainda registre a série — a §12.1 exige registrar a série mesmo com relato de dor. Disclaimer é
-marcado no estado para não se repetir a cada mensagem; o texto final continua sendo decisão de T26.
+`OFF_TOPIC`, `ABUSE`), `extra="forbid"`. Em `HEALTH_REPORT`, o schema devolve
+`source_segments: list[int]` não vazia — índices em `NormalizedTurn.segments`, nunca um offset de
+caractere: o mesmo problema e a mesma solução da T09 (ADR-0012) — o guardrail também só vê o turno
+normalizado, nunca o fragmento bruto. Python resolve `source_segments` via
+`domain/provenance.resolve_spans(...)` para os `SourceSpan` que a T08 já calculou, decifra
+`text_extract` ou `transcript` conforme `source_field` de cada span e reconstrói **somente** o
+relato literal, nunca `clean_text` e nunca uma reprodução escrita pelo próprio LLM.
 
-**Primeiro teste que deve falhar.** `test_medical_advice_skips_router` — `assert result.goto == "voice"`.
+Três ramos, não dois — a versão anterior deste plano colapsava `HEALTH_REPORT` dentro do mesmo
+`Command` que `PASS`, e por isso nunca escrevia o aviso em `outbound`:
+
+- `PASS` → `Command(goto="router")`, sem `update`.
+- Categorias bloqueantes (`MEDICAL_ADVICE`, `EXTREME_DIET`, `OFF_TOPIC`, `ABUSE`) →
+  `Command(goto="voice", update={"health_flag": …, "outbound": [bloco semântico]})`.
+- `HEALTH_REPORT` → `Command(goto="router", update={"health_flag": …, "outbound":
+  [{"kind": "health_notice", "region": …}]})`. Vai para `router`, não para `voice` (ADR-0014, §12.1:
+  a série do mesmo turno precisa continuar sendo registrada), **mas** ainda assim escreve o bloco
+  `health_notice` em `outbound` — a mesma chave com reducer que `ingestion` escreve o `ack` no mesmo
+  estágio. Sem isso, uma mensagem mista ("dói o ombro, supino 80x8") persistia a série e o relato e
+  respondia só com o `ack`, nunca entregando a orientação profissional que a §12.2 exige; o
+  `voice_agent` (T26) só sabe formatar o que está em `outbound`, não sabe que um `health_flag` sozinho
+  precisa virar texto — ele nunca lê `health_flag` diretamente, só os blocos (invariante 2: um único
+  caminho de saída, e é `outbound`).
+
+`HEALTH_REPORT` grava o relato **antes** de seguir para `router`. A reserva de
+`health_report_id_seq` continua existindo — o AAD do `ColumnCipher` precisa do `row_id` para cifrar
+`verbatim` **antes** de qualquer `INSERT`, então não há como evitar reservar um candidato primeiro.
+**O que muda é que reservar um id deixou de ser, sozinho, a garantia de não-duplicação:** o repositório
+insere com `INSERT ... (id, tenant_id, batch_id, region, severity, category, verbatim, key_version)
+VALUES (candidate_id, ...) ON CONFLICT (tenant_id, batch_id) WHERE batch_id IS NOT NULL DO NOTHING
+RETURNING id` — o predicado repete o de `ux_health_report_idempotency` porque é um índice parcial;
+sem repeti-lo o Postgres não o infere como alvo do conflito e o `INSERT` falha. Se o
+`RETURNING` vier vazio, a linha já existe — este `batch_id` já foi processado antes, e o checkpoint do
+grafo é que não sobreviveu — e o `candidate_id` recém-reservado fica só como gap na sequência
+(inofensivo, Postgres não garante sequência sem buracos). O repositório então faz
+`SELECT id ... WHERE tenant_id = … AND batch_id = …` e usa **esse** `id` — o da linha que já existe,
+cifrada com o AAD correspondente a ela — para o `health_flag` que segue no `update`; nunca o
+`candidate_id` descartado. Sem o `ON CONFLICT`, um node que roda de novo por retry inseria uma segunda
+linha com um `id` novo e duplicava o relato ativo — o que reaparece depois como dois check-ins de
+acompanhamento (§12.2 regra 4) para o mesmo evento. Disclaimer é marcado no estado para não se repetir
+a cada mensagem; o texto final do `health_notice` continua sendo decisão de T26.
+
+**Primeiros testes que devem falhar.** `test_medical_advice_skips_router` — `assert result.goto == "voice"`;
+`test_health_report_persists_with_batch_idempotency_key`, que decifra o valor somente com o AAD do
+tenant/linha original; e `test_health_report_retry_after_uncommitted_checkpoint_does_not_duplicate`,
+que insere, simula falha de checkpoint e reprocessa o mesmo `batch_id`, provando `COUNT(*) == 1`.
 
 **Critérios de aceite:** as seis categorias passam, incluindo dor fragmentada normalizada e injeção
-delimitada; `test_graph_topology` prova `normalizer → guardrail`, `guardrail → router` e
-`guardrail → voice`; o caso `HEALTH_REPORT` prova `goto == "router"` **e** `health_flag` preenchido.
+delimitada; a integração prova que `health_report.verbatim` é ciphertext `BYTEA` sem o literal, que
+decifra com o AAD exato e que tanto RLS quanto a cópia do blob para outra linha/tenant recusam o acesso
+ou a autenticação; `test_graph_topology` prova `normalizer → guardrail`, `guardrail → router` e
+`guardrail → voice`; o caso `HEALTH_REPORT` prova `goto == "router"`, `health_flag` preenchido **e**
+`"health_notice"` presente em `outbound["kind"]`; um teste de mensagem mista (relato de dor + série
+válida no mesmo turno) prova que a série persiste **e** `outbound` carrega os dois blocos
+(`ack` e `health_notice`) até o `voice`, não só um deles.
 
 **Tamanho:** M.
 
@@ -1210,7 +1423,7 @@ Numeração ≠ ordem. As três trilhas avançam em paralelo depois do dia 1.
 
 | # | Branch | Tarefa | Trilha | Paraleliza com |
 | --- | --- | --- | --- | --- |
-| **0** | `doc/sprint-03-adrs` | ADR-0010 a ADR-0015 + erratas | — | **antes de qualquer código** |
+| **0** | `doc/sprint-03-adrs` | ADR-0010 a ADR-0015, ADR-0018 + erratas | — | **antes de qualquer código** |
 | 1 | `feat/graph-state` | S03-T01 | A | T06, T10, T18 |
 | 1 | `feat/llm-gateway` | S03-T06 | B | T01, T10, T18 |
 | 1 | `feat/exercise-catalog` | S03-T10 | B | T01, T06, T18 |
@@ -1234,9 +1447,11 @@ Numeração ≠ ordem. As três trilhas avançam em paralelo depois do dia 1.
 | 7 | `feat/graph-worker-handoff` | S03-T05 | A | — |
 | 8 | `feat/retire-adr-0009` | S03-T28 | D | nada — **fecha a sprint** |
 
-**A onda 0 não é burocracia.** Seis ADRs bloqueiam tarefas concretas: o 0011 bloqueia a T06, o 0013 a
-T09, o 0012 a T12, o 0014 a T23, o 0015 a T26, e o 0010 as T04 e T15. Escrevê-los depois é escrever a
-justificativa de uma decisão que já virou código — que é o oposto de um ADR.
+**A onda 0 não é burocracia.** Sete ADRs bloqueiam tarefas concretas: o 0011 bloqueia a T06, os 0013 e
+0018 a T09, o 0012 a T08/T09/T12/T23 (o `domain/provenance.py` que a T08 cria e a resolução
+determinística de spans que a T09 e a T23 consomem, além da migração que a T12 executa), o 0014 a
+T23, o 0015 a T26, e o 0010 as T04 e T15. Escrevê-los depois é escrever a justificativa de uma decisão
+que já virou código — que é o oposto de um ADR.
 
 **T18 sobe primeiro.** É bug latente de produção, não tem dependência de código com nada, e é a única
 tarefa da sprint que corrige algo que já está acontecendo.
@@ -1277,7 +1492,7 @@ Duas tarefas foram declaradas não-cortáveis, e a razão é factual, não prefe
 
 ## Decisões tomadas
 
-Todas as 26 ambiguidades foram decididas em 2026-09-04. Esta tabela é a autoridade; a seção seguinte
+Todas as 27 ambiguidades foram decididas em 2026-09-04. Esta tabela é a autoridade; a seção seguinte
 preserva o raciocínio que levou a cada uma.
 
 | # | Decisão | Vira |
@@ -1288,7 +1503,7 @@ preserva o raciocínio que levou a cada uma.
 | 4 | `current_step` vive no schema privado de cada subgrafo | suposição no PR |
 | 5 | A fronteira do checkpoint é o `thread_id` + principal dedicado | **ADR-0010** |
 | 6 | ZSET `interrupts:pending` pontuado pelo deadline | suposição no PR |
-| 7 | Proveniência **plural e imutável** da série, com chave canônica de idempotência | **ADR-0012** |
+| 7 | Proveniência **plural e imutável** por spans validados, com chave canônica de idempotência | **ADR-0012** |
 | 8 | Fronteira de manutenção cross-tenant por `SECURITY DEFINER` estreita | **ADR-0010** |
 | 9 | Delta de empate próximo no trigram: `0.06` | errata da §10 |
 | 10 | `config/prompts/resolver.md` deve existir | errata da §23 |
@@ -1308,19 +1523,21 @@ preserva o raciocínio que levou a cada uma.
 | 24 | `fallback_text` obrigatório em `mode="reaction"`, redigido pelo `voice` | **ADR-0015** |
 | 25 | Persistir a narrativa agora; indexar no Qdrant só na fase 1.1 | errata §6.4 |
 | 26 | Cortar a T17; a T28 fecha o item 3 da issue #29 | escopo |
+| 27 | LLM devolve quantidade literal + unidade; Python converte com `Decimal` e arredondamento fixo | **ADR-0018** |
 
-### Os ADRs a escrever
+### Os ADRs exigidos antes da implementação
 
 | ADR | Assunto | Decisões | Bloqueia | Quando |
 | --- | --- | --- | --- | --- |
 | 0010 | Fronteira de manutenção cross-tenant | #5, #8, #22 | T04, T15 | onda 0 |
 | 0011 | SDKs nativos em vez de LangChain | #1 | T06 | onda 0 |
-| 0012 | Proveniência plural da série | #7 | T12 | onda 0 |
+| 0012 | Proveniência plural da série por spans | #7 | T08, T09, T12, T23 | onda 0 (esta PR) |
 | 0013 | RPE e RIR contraditórios | #2 | T09 | onda 0 |
 | 0014 | `HEALTH_REPORT` segue para o router | #19 | T23 | onda 0 |
 | 0015 | `fallback_text` obrigatório em reação | #24 | T26 | onda 0 |
 | 0016 | Recusa pré-grafo pelo `voice` — substitui o ADR-0009 | #17 | — | com a T28 |
 | 0017 | Contrato de correção | #20 | T24 | **Sprint 04** |
+| 0018 | Conversão determinística de unidades fora do LLM | #27 | T09 | onda 0 (esta PR) |
 
 O ADR-0014 é o único de **segurança** da lista: ele decide que um relato de dor não faz o usuário
 perder o registro do treino. Escrever a justificação com cuidado importa mais nele do que nos outros.
@@ -1328,8 +1545,9 @@ perder o registro do treino. Escrever a justificação com cuidado importa mais 
 ### As erratas da spec
 
 Uma única PR `doc/spec-errata-sprint-03` corrige, todas com a mesma justificativa ("a spec se
-contradiz ou omite; a decisão está registrada"): §9.4 (`steps` vs. `stages`), §8.2 (`voice_output`),
-§10 (delta `0.06`), §23 (`resolver.md`) e §6.4/§24 (indexação do resumo). A emenda da §13.1
+contradiz ou omite; a decisão está registrada"): §5.2/§9.5 (proveniência plural e `source_text`),
+§9.5 (quantidade literal e conversão determinística), §9.4 (`steps` vs. `stages`), §8.2
+(`voice_output`), §10 (delta `0.06`), §23 (`resolver.md`) e §6.4/§24 (indexação do resumo). A emenda da §13.1
 (*kind* `session_summary`) fica para a Sprint 04, junto da T25 que a consome.
 
 ## A fronteira de manutenção cross-tenant
@@ -1346,6 +1564,20 @@ corretamente as impede.**
 | S03-T04 | tabelas do LangGraph | `SET LOCAL app.tenant_id` vive na conexão SQLAlchemy; o saver tem pool psycopg próprio |
 
 Resolver quatro vezes é resolver errado uma vez. **Decidido (#5, #8, #22): um único ADR — o
+[ADR-0010](#os-adrs-exigidos-antes-da-implementação), "fronteira de manutenção cross-tenant"**,
+que fixa o padrão comum
+(função `SECURITY DEFINER` estreita, `search_path` fixo, sem SQL arbitrário, retornando o mínimo, com
+role dedicada `NOLOGIN NOSUPERUSER NOBYPASSRLS` e grants coluna-a-coluna no estilo da `_0002`/`_0004`)
+e que as quatro tarefas instanciam. A fronteira do checkpointer (#5) e o fechamento automático de
+sessão (#22) são seções dele, não ADRs próprios.
+
+**Nesta sprint o ADR-0010 é instanciado por duas tarefas** — T04 (checkpointer) e T15 (claim da fila).
+As outras duas, T14 e o fechamento automático da T25, chegam na Sprint 04 e **reusam** o padrão; é
+exatamente para elas não inventarem um segundo mecanismo que o ADR é escrito agora.
+
+**O anti-padrão a proibir explicitamente no ADR:** usar o DSN de owner, ou dar `BYPASSRLS` ao runtime.
+Um teste de claim que "funciona" contra conexão de superuser é o erro mais caro possível aqui — as
+policies existem e nunca são avaliadas.
 [ADR-0010](#os-adrs-a-escrever), "fronteira de manutenção cross-tenant"**, que fixa o padrão comum
 sem confundir os dois principais. O **runtime** e o principal dedicado do saver permanecem
 `NOSUPERUSER NOBYPASSRLS`. Para varrer uma tabela de domínio sob `FORCE ROW LEVEL SECURITY`, a porta é
@@ -1424,9 +1656,11 @@ garantida. Suposição registrada no PR, sem ADR.
 
 #### 7. **crítico** — uma série pode vir de vários fragmentos, mas `source_message_id` é escalar
 Nada define qual mensagem representa `"supino"` / `"80"` / `"8 reps"` ditas em três fragmentos.
-Escolher arbitrariamente a primeira ou a última **perde a auditabilidade que a §9.3/§9.5 exigem**.
-**Exige ADR antes da PR** da T12: proveniência plural e imutável, mantendo uma chave canônica de
-idempotência.
+Escolher arbitrariamente a primeira ou a última — ou concatenar `clean_text` — **perde a
+auditabilidade que a §9.3/§9.5 exigem**. O **ADR-0012** fixa `source_spans` ordenados e validados contra
+os fragmentos brutos como prova canônica; `source_text` só pode ser o recorte literal de um único span
+ou `NULL`, nunca evidência sintética. A T12 persiste a relação imutável de cada span com o
+`raw_message` tenant-qualificado e deriva a chave de idempotência do conjunto canônico de spans.
 
 #### 8. **crítico** — o scheduler precisa varrer todos os tenants, e a RLS corretamente o impede
 Não existe hoje fronteira de manutenção autorizada. **Exige ADR antes da implementação** da T14 — ver
@@ -1556,6 +1790,14 @@ ponte, e o ADR-0009 precisa de prazo novo por escrito. **Decidido: cortar a T17.
 > do buffer; o helper existe, tem teste unitário e **nenhum caller de produção**. Qualquer das duas
 > tarefas está criando comportamento novo, não migrando comportamento existente.
 
+#### 27. **crítico** — a §9.5 manda o LLM converter unidades
+`load_kg` e a regra do prompt "libras/lbs → converte" fazem o modelo calcular e arredondar um valor
+que será armazenado e analisado depois. Isso contradiz diretamente a invariante 1: o LLM classifica o
+literal, não faz aritmética. O **ADR-0018** fixa `QuantityLiteral(value, unit)` na saída crua e a
+normalização em `domain/units.py`, com `Decimal("0.45359237")` para lb → kg, `Decimal("1000")` para
+km → m, `Decimal("60")` para min → s (a mesma lacuna existia para `duration_s`/`hold_s`/`rest_s`) e
+`ROUND_HALF_UP` no limite de persistência. Bloqueia T09 e exige errata da §9.5.
+
 ## Critério de saída da sprint
 
 - [ ] `"Supino reto com 10 kg, 8 repetições e foi fácil"` vira uma linha em `exercise_set` com
@@ -1581,7 +1823,7 @@ ponte, e o ADR-0009 precisa de prazo novo por escrito. **Decidido: cortar a T17.
   do texto, e só então a primeira nota de voz é aceita;
 - [ ] recusa de STT e mídia não suportada chegam ao usuário **passando pelo `voice`** — nenhum enqueue
   em `services/stt.py` ou `services/webhook.py`;
-- [ ] **ADR-0010 a ADR-0015 escritos e mergeados antes da primeira PR de código** — a onda 0;
+- [ ] **ADR-0010 a ADR-0015 e ADR-0018 escritos e mergeados antes da primeira PR de código** — a onda 0;
 - [ ] a PR de erratas da spec mergeada (§§9.4, 8.2, 10, 23, 6.4/24);
 - [ ] ADR-0009 resolvido pelo ADR-0016 — substituído, nunca vencido em silêncio;
 - [ ] `make fmt/lint/typecheck/test` e `make test-integration` verdes; CI obrigatório verde.
@@ -1601,7 +1843,7 @@ ponte, e o ADR-0009 precisa de prazo novo por escrito. **Decidido: cortar a T17.
 | `checkpoint_blobs` domina o banco | Médio — guarda o estado inteiro por super-step, e o `GraphState` carrega `raw_fragments` + `messages` + `outbound` | Poda diária na T04 + métrica `graph_checkpoint_bytes` como acompanhamento |
 | Determinismo de LLM em teste | Médio — suíte instável | `temperature=0` reduz variância mas não a elimina: unitários usam providers falsos; golden set mede ao vivo, separado |
 | Custo do judge em toda PR da trilha A | Baixo — o filtro do CI inclui `src/fittrack/graph/` | Não mudar o filtro; **saber**: contar o custo no encerramento e não confundir "judge não calibrado" com regressão |
-| Colisão de numeração de migração `_0006` | Baixo — T04 e T15 propõem a mesma | Resolver no merge; a segunda vira `_0007` e a T18 `_0008` |
+| Colisão de numeração de migração `_0006`/`_0007` | Baixo — T04, T15, T08 e T12 propõem `_0006`; T18 e T23 propõem `_0007` | Resolver no merge: primeira a mergear fica com o número, as demais renumeiam o próprio arquivo (nome e `down_revision`) |
 | Trilha D chegar tarde e bloquear T19 | Alto — `deliver` sem `VoiceOutput` não integra | **Mitigado:** T21 é só contrato e sobe na onda 2. T19 continua escrita contra estado fake; a colagem no grafo é PR separada |
 | T28 subir antes de `voice → deliver` estar coberto | **Crítico** — desliga o único caminho de resposta que existe hoje e o substituto não está provado; o sintoma é **silêncio**, não erro | T28 é a última PR da sprint, com teste de integração dos cinco motivos de recusa antes do merge |
 | Cortar T27 por parecer "produto" | **Crítico** — sem onboarding ninguém consente `workout_data`, e toda nota de voz é recusada para sempre | **Resolvido:** T27 declarada não-cortável no escopo decidido |
@@ -1644,7 +1886,7 @@ ponte, e o ADR-0009 precisa de prazo novo por escrito. **Decidido: cortar a T17.
 Ao concluir a sprint, registrar neste documento:
 
 - PRs mergeados por tarefa;
-- ADRs escritos — esperados ADR-0010 a ADR-0016 (o ADR-0017 fica para a Sprint 04, com a T24);
+- ADRs escritos — esperados ADR-0010 a ADR-0016 e ADR-0018 (o ADR-0017 fica para a Sprint 04, com a T24);
 - estado da PR de erratas da spec;
 - suposições efetivamente usadas e quais se mostraram erradas;
 - itens adiados e motivo;
