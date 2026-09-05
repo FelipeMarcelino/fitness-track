@@ -410,7 +410,7 @@ explicando o que foi feito e por quê. O comentário fecha o loop de rastreabili
 depois precisa entender, sem abrir o diff, por que cada apontamento virou (ou não virou) mudança.
 Um apontamento sem resposta conta como não endereçado.
 
-**No máximo 4 rodadas de `@codex review` por PR.** Cada rodada corrigida tende a expor uma camada
+**No máximo 2 rodadas de `@codex review` por PR.** Cada rodada corrigida tende a expor uma camada
 mais estreita do mesmo problema — é o padrão esperado, não sinal de que algo saiu errado — mas o
 retorno cai a cada volta, e uma revisão automática que nunca termina não é um portão de qualidade,
 é um loop. Pedir a quinta rodada não é a chamada certa: ao completar a quarta (contada pelos
@@ -423,7 +423,7 @@ para uma sexta rodada.
 
 Verificar os cinco, sempre, nesta ordem:
 
-1. **Revisão do Codex concluída, dentro do limite de 4 rodadas** — o PR recebeu `@codex review` e a
+1. **Revisão do Codex concluída, dentro do limite de 2 rodadas** — o PR recebeu `@codex review` e a
    revisão terminou. Não mergeie enquanto a revisão estiver pendente, e não peça uma quinta rodada.
 2. **Comentários lidos e endereçados** — confirme com `gh pr view --comments` e
    `gh pr view <n> --json reviews,comments`. Não mergeie por cima de comentário não respondido —
