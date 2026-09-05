@@ -29,7 +29,16 @@ GUARDED = ("fittrack/graph", "fittrack/agents")
 # The two exceptions of spec 13.5 and 18.1, by path. Named rather than
 # pattern-matched: an exception that can be earned by naming a file
 # `something_voice.py` is not an exception, it is a loophole.
-EXCEPTIONS = frozenset({"fittrack/graph/nodes/voice.py", "fittrack/graph/nodes/deliver.py"})
+IMPORT_EXCEPTIONS = frozenset({"fittrack/graph/nodes/voice.py", "fittrack/graph/nodes/deliver.py"})
+
+# Declaring is not reading (sprint 03 decision #3). `GraphState` carries the
+# capabilities descriptor as an input key (spec 8.2), and the module that
+# declares it must be exempt from the *read* check — the annotation is exactly
+# the shape `reads_channel_caps` matches, and a module with no key to declare
+# would push every node into string-literal lookups instead. The exemption is
+# bounded by `test_the_state_module_declares_the_caps_key_once_as_a_field`
+# below: one textual mention, as a field annotation, nothing else.
+CAPS_EXCEPTIONS = IMPORT_EXCEPTIONS | {"fittrack/graph/state.py"}
 
 FORBIDDEN_MODULE = "fittrack.channels"
 FORBIDDEN_SEGMENTS = FORBIDDEN_MODULE.split(".")
@@ -130,12 +139,12 @@ def reads_channel_caps(source: str) -> bool:
     return False
 
 
-def guarded_modules() -> list[Path]:
+def guarded_modules(*, exempt: frozenset[str]) -> list[Path]:
     return sorted(
         path
         for package in GUARDED
         for path in (SRC / package).rglob("*.py")
-        if path.relative_to(SRC).as_posix() not in EXCEPTIONS
+        if path.relative_to(SRC).as_posix() not in exempt
     )
 
 
@@ -205,7 +214,7 @@ def test_the_checker_allows_unrelated_attributes() -> None:
 def test_no_guarded_module_imports_a_channel() -> None:
     offenders = [
         path.relative_to(ROOT).as_posix()
-        for path in guarded_modules()
+        for path in guarded_modules(exempt=IMPORT_EXCEPTIONS)
         if imports_channels(path.read_text(encoding="utf-8"))
     ]
     assert not offenders, (
@@ -217,7 +226,7 @@ def test_no_guarded_module_imports_a_channel() -> None:
 def test_no_guarded_module_reads_the_capabilities() -> None:
     offenders = [
         path.relative_to(ROOT).as_posix()
-        for path in guarded_modules()
+        for path in guarded_modules(exempt=CAPS_EXCEPTIONS)
         if reads_channel_caps(path.read_text(encoding="utf-8"))
     ]
     assert not offenders, (
@@ -233,11 +242,36 @@ def test_the_guarded_packages_exist() -> None:
 
 
 def test_the_exceptions_are_named_and_few() -> None:
-    """Two, per spec 13.5 and 18.1. A third needs a decision, not a commit."""
+    """Two for imports, per spec 13.5 and 18.1; the declaring module for reads."""
     assert {
         "fittrack/graph/nodes/voice.py",
         "fittrack/graph/nodes/deliver.py",
-    } == EXCEPTIONS
+    } == IMPORT_EXCEPTIONS
+    assert IMPORT_EXCEPTIONS | {"fittrack/graph/state.py"} == CAPS_EXCEPTIONS
+
+
+def test_the_state_module_declares_the_caps_key_once_as_a_field() -> None:
+    """The substitute assertion that bounds the read exemption.
+
+    `state.py` may mention the capabilities key exactly once, and only as the
+    annotated field of `GraphState`. One more mention — a read, a string
+    constant, a second annotation — and this fails, so the exemption above can
+    never quietly grow into an exception with a wider reach.
+    """
+    source = (SRC / "fittrack/graph/state.py").read_text(encoding="utf-8")
+    assert source.count("channel_caps") == 1
+
+    declarations = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "channel_caps"
+    ]
+    assert len(declarations) == 1
+    assert declarations[0].value is None, (
+        "the mention must be a field annotation, not an assignment"
+    )
 
 
 # --------------------------------------------------------------------------- #
