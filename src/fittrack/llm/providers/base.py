@@ -60,6 +60,7 @@ class ProviderError(RuntimeError):
         *,
         status_code: int | None = None,
         context_limit: bool = False,
+        transport: bool = False,
         kind: str = "error",
     ) -> None:
         detail = f"HTTP {status_code}" if status_code is not None else kind
@@ -69,6 +70,16 @@ class ProviderError(RuntimeError):
         self.vendor = vendor
         self.status_code = status_code
         self.context_limit = context_limit
+        # Whether the call never reached a verdict: a timeout or a dropped
+        # connection. 7.3 retries these and nothing else that lacks a status —
+        # a `TypeError` raised while building the payload is statusless too,
+        # and retrying it would repeat the bug on a schedule. Without the flag
+        # the two are indistinguishable, and the policy would have to guess.
+        self.transport = transport
+        # The exception class, kept rather than only interpolated: it is the
+        # residual diagnosis when there is no status, and it is safe — a type
+        # name is ours or the SDK's, never the request.
+        self.kind = kind
 
 
 # The vendors' own machine-readable codes for "the prompt does not fit".
@@ -91,11 +102,26 @@ _CONTEXT_LIMIT_CODES = frozenset(
 # a loose substring scan, and §7.3 sends a context limit to the fallback while
 # refusing to send an ordinary 400 there at all: a false positive turns a
 # programming error into a paid retry that hides it.
+# Anchored at the start of the vendor's message field, not searched anywhere
+# inside it: a provider opens with its own sentence and echoes the request
+# afterwards, if at all. `search` over the whole string would match the echo.
 _CONTEXT_LIMIT_PATTERNS = (
-    re.compile(r"prompt is too long:\s*\d+"),
-    re.compile(r"\d+\s*tokens?\s*>\s*\d+"),
-    re.compile(r"maximum context length is\s*\d+"),
+    re.compile(r"^\s*prompt is too long:\s*\d+"),
+    re.compile(r"^\s*(this )?(model's )?maximum context length is\s*\d+"),
+    re.compile(r"^\s*\d+\s*tokens?\s*>\s*\d+"),
 )
+
+# The SDK transport errors, by class name. Neither vendor's subclasses a
+# stdlib exception, and importing both SDKs here to `isinstance` against them
+# would couple the port to the adapters it exists to keep apart.
+_TRANSPORT_CLASSES = frozenset({"APITimeoutError", "APIConnectionError"})
+
+
+def _is_transport(error: Exception) -> bool:
+    """Whether the request never reached a verdict (spec 7.3's retry class)."""
+    if isinstance(error, (TimeoutError, ConnectionError)):
+        return True
+    return type(error).__name__ in _TRANSPORT_CLASSES
 
 
 def _error_body(error: Exception) -> Mapping[str, Any]:
@@ -118,9 +144,16 @@ def _is_context_limit(error: Exception) -> bool:
         value = body.get(key)
         if isinstance(value, str) and value.lower() in _CONTEXT_LIMIT_CODES:
             return True
+    # Only the vendor's own message field, never `str(error)`. The latter
+    # renders the whole body, which is where the echoed request — and so the
+    # user's words — end up. An error with no parsed body gets no textual
+    # classification at all: 7.3's preflight is the primary mechanism, and a
+    # false positive here buys a paid fallback for a programming error, which
+    # is the outcome 7.3 explicitly refuses.
     message = body.get("message")
-    text = message.lower() if isinstance(message, str) else str(error).lower()
-    return any(pattern.search(text) for pattern in _CONTEXT_LIMIT_PATTERNS)
+    if not isinstance(message, str):
+        return False
+    return any(pattern.match(message.lower()) for pattern in _CONTEXT_LIMIT_PATTERNS)
 
 
 def provider_failure(vendor: str, error: Exception) -> ProviderError:
@@ -136,6 +169,7 @@ def provider_failure(vendor: str, error: Exception) -> ProviderError:
         vendor,
         status_code=status_code,
         context_limit=_is_context_limit(error),
+        transport=_is_transport(error),
         kind=type(error).__name__,
     )
 

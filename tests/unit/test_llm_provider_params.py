@@ -426,13 +426,6 @@ def test_a_context_limit_400_is_flagged_apart_from_an_ordinary_400() -> None:
     assert (plain.status_code, plain.context_limit) == (400, False)
 
 
-def test_the_anthropic_wording_for_a_long_prompt_is_recognised_too() -> None:
-    """The vendors word it differently; the policy is the same."""
-    failure = provider_failure("anthropic", FakeStatusError(400, "prompt is too long: 1M tokens"))
-
-    assert failure.context_limit is True
-
-
 def test_a_connection_failure_has_no_status() -> None:
     """Timeouts and connection errors retry by 7.3 without ever having one."""
     failure = provider_failure("anthropic", ConnectionResetError("boom"))
@@ -465,15 +458,92 @@ def test_a_structured_error_code_classifies_the_context_limit() -> None:
 
 def test_the_anthropic_message_is_matched_only_when_it_is_unmistakable() -> None:
     """Anthropic reports both 400s as `invalid_request_error`, so the code
-    alone cannot separate them and the message is the only signal left.
+    alone cannot separate them and the vendor's message field is the only
+    signal left.
 
-    Matched by an anchored pattern that carries token counts — a shape user
-    prose does not take — rather than by a bare phrase.
+    Matched only at the start of that field, and only in a shape carrying
+    token counts — the vendor writes its own sentence first and echoes the
+    request afterwards, if at all.
     """
-    over = FakeStatusError(400, "prompt is too long: 215838 tokens > 204798 maximum")
-    over.body = {"type": "error", "error": {"type": "invalid_request_error"}}
+    over = FakeStatusError(
+        400,
+        "bad request",
+        body={
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "prompt is too long: 215838 tokens > 204798 maximum",
+            },
+        },
+    )
 
     assert provider_failure("anthropic", over).context_limit is True
+
+
+def test_user_text_shaped_like_a_vendor_message_is_not_a_context_limit() -> None:
+    """The classifier never reads `str(error)`, which carries the whole body.
+
+    An error with no parsed body is not an invitation to scan the exception
+    text: that text is where the request — and so the user's own words — end
+    up, and a message *shaped* like the vendor's would otherwise buy a paid
+    fallback for what is really a programming error.
+    """
+    echoed = FakeStatusError(
+        400, 'invalid tool call; request said "prompt is too long: 123 tokens"'
+    )
+
+    assert provider_failure("groq", echoed).context_limit is False
+
+
+def test_an_echo_inside_the_vendor_message_field_is_not_matched_either() -> None:
+    """Anchored at the start: the vendor's own sentence opens the field."""
+    echoed = FakeStatusError(
+        400,
+        "bad request",
+        body={"error": {"message": 'schema invalid for "prompt is too long: 99 tokens"'}},
+    )
+
+    assert provider_failure("groq", echoed).context_limit is False
+
+
+# --------------------------------------------------------------------------- #
+# Transport failures are retriable; a bug in our own code is not (spec 7.3)
+# --------------------------------------------------------------------------- #
+
+
+def test_a_timeout_is_reported_as_a_transport_failure() -> None:
+    """7.3 retries timeout/connection and nothing else without a status.
+
+    Without a structured flag, a client-side `TypeError` raised while building
+    the payload looks exactly like a timeout — both statusless — and the
+    policy would have to either retry programming errors or drop genuine
+    transient failures.
+    """
+    failure = provider_failure("groq", TimeoutError("read timed out"))
+
+    assert failure.transport is True
+    assert failure.status_code is None
+
+
+def test_a_connection_reset_is_a_transport_failure() -> None:
+    assert provider_failure("anthropic", ConnectionResetError("boom")).transport is True
+
+
+def test_a_bug_in_our_own_code_is_not_a_transport_failure() -> None:
+    """A `TypeError` from building the payload must never be retried."""
+    failure = provider_failure("groq", TypeError("build_payload() got an unexpected keyword"))
+
+    assert failure.transport is False
+    assert failure.kind == "TypeError"
+
+
+def test_the_sdk_transport_errors_are_recognised_by_name() -> None:
+    """Neither SDK's transport error subclasses a stdlib one."""
+
+    class APITimeoutError(Exception):
+        pass
+
+    assert provider_failure("groq", APITimeoutError("slow")).transport is True
 
 
 def test_a_failure_never_carries_the_provider_message() -> None:
