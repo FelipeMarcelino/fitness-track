@@ -76,8 +76,14 @@ class AnthropicProvider:
         params = sanitize_params(provider="anthropic", model=request.model, params=request.params)
         # Both spellings mean the same thing to a role: `models.yaml` uses
         # `reasoning_effort` on the Groq primaries and `effort` on the
-        # Anthropic fallbacks.
-        effort = params.pop("reasoning_effort", None) or params.pop("effort", None)
+        # Anthropic fallbacks. Both are popped *before* one is selected — with
+        # `a or b` the second pop never runs when the first returns a value, so
+        # a spec carrying both (a partial override merged onto a fallback that
+        # already declares `effort`) would leave the alias in `params` and
+        # expand it into the payload as a keyword Anthropic does not accept.
+        by_groq_name = params.pop("reasoning_effort", None)
+        by_anthropic_name = params.pop("effort", None)
+        effort = by_groq_name or by_anthropic_name
 
         system = " ".join(
             str(message.content) for message in request.messages if message.type == "system"

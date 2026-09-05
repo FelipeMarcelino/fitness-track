@@ -30,7 +30,7 @@ from typing import Any, ClassVar, Literal
 
 import pytest
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from fittrack.config import ModelsConfig, Provider, load_config
 from fittrack.llm.gateway import LLMGateway, RoleHasNoPrimaryError
@@ -85,6 +85,29 @@ class WithEnum(BaseModel):
     model_config = {"extra": "forbid"}
 
     effort: Literal["low", "high"]
+
+
+class Echoing(BaseModel):
+    """A schema whose validator writes the rejected value into its message.
+
+    Ordinary Pydantic, and the reason `include_input=False` is not sufficient:
+    the text a custom validator raises is quoted verbatim into `msg`.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    load_kg: int
+
+    @field_validator("load_kg")
+    @classmethod
+    def _always_refuses(cls, value: int) -> int:
+        raise ValueError(f"segredo do usuario: {value}kg")
+
+
+class Lax(BaseModel):
+    """Pydantic's default — extras are ignored, not refused."""
+
+    reps: int
 
 
 def gateway(provider: Any, *, models: ModelsConfig | None = None) -> LLMGateway:
@@ -341,6 +364,79 @@ async def test_answer_that_is_not_json_fails_when_a_schema_was_required() -> Non
 # --------------------------------------------------------------------------- #
 # What the result carries, and what it must never print
 # --------------------------------------------------------------------------- #
+
+
+async def test_an_output_budget_declared_by_a_role_reaches_the_provider() -> None:
+    """The adapter can honour `max_tokens`; this proves it can *arrive*.
+
+    `_params_of()` serialises a `ModelSpec`, and `ModelSpec` forbids extras —
+    so a field the type does not declare could never travel, whatever the
+    adapter did with it. Asserting only at the adapter would have tested a
+    parameter no configuration could produce.
+    """
+    base = committed_models()
+    models = ModelsConfig.model_validate(
+        {
+            **base.model_dump(),
+            "agents": {
+                "analysis": {"role": "ANALYST", "primary": {"max_tokens": 32_000}},
+            },
+        }
+    )
+    fake = FakeProvider()
+
+    await gateway(fake, models=models).ainvoke(
+        agent="analysis", role=LLMRole.ANALYST, tenant_id=7, messages=turn()
+    )
+
+    assert fake.calls[0].params["max_tokens"] == 32_000
+
+
+async def test_a_validation_failure_never_quotes_the_rejected_value() -> None:
+    """`include_input=False` is not enough: a validator's own message can embed
+    the value it rejected.
+
+    `Value error, <whatever the validator wrote>` is model output derived from
+    the user's prompt, and it would reach a traceback here and OTel once S03-T07
+    records exceptions. Only the stable error `type` and the field location
+    survive — both are structural, neither is content.
+    """
+    fake = FakeProvider(answer='{"load_kg": 80}')
+
+    with pytest.raises(ValueError) as raised:
+        await gateway(fake).ainvoke(
+            agent="extraction",
+            role=LLMRole.EXTRACTOR,
+            tenant_id=7,
+            messages=turn(),
+            schema=Echoing,
+        )
+
+    assert "80" not in str(raised.value)
+    assert "segredo" not in str(raised.value)
+    # The diagnosis still names where and what kind.
+    assert "load_kg" in str(raised.value)
+    assert "value_error" in str(raised.value)
+
+
+async def test_a_schema_that_permits_extra_fields_is_refused() -> None:
+    """The acceptance criterion is the gateway's, not the schema author's.
+
+    Pydantic's default is `extra="ignore"`: a lax schema drops an invented
+    field silently, and the sprint's "an extra field fails" would hold only
+    because every schema so far happened to declare `forbid`. Checking the
+    schema instead of the answer moves the failure to the call site, and
+    catches nested models too — a hand-rolled key check at this boundary would
+    only ever see the top level.
+    """
+    with pytest.raises(ValueError, match="extra"):
+        await gateway(FakeProvider()).ainvoke(
+            agent="extraction",
+            role=LLMRole.EXTRACTOR,
+            tenant_id=7,
+            messages=turn(),
+            schema=Lax,
+        )
 
 
 async def test_the_result_carries_what_the_ledger_will_need() -> None:

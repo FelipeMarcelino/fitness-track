@@ -212,10 +212,40 @@ def test_without_an_effort_the_anthropic_payload_asks_for_no_thinking() -> None:
 
 
 def test_max_tokens_is_present_because_anthropic_requires_it() -> None:
-    """The SDK refuses a request without it; a default here is not a policy."""
+    """The SDK refuses a request without it; the default is a floor, not a policy."""
     payload = AnthropicProvider.build_payload(request(CLAUDE))
 
     assert payload["max_tokens"] > 0
+
+
+def test_the_role_configuration_can_raise_the_output_budget() -> None:
+    """A constant that no configuration can reach is a limit, not a default.
+
+    It bites hardest on the high-effort fallbacks: adaptive thinking spends
+    the same output budget the answer does, so a role pinned at the floor can
+    run out of tokens reasoning and never write the answer.
+    """
+    payload = AnthropicProvider.build_payload(request(CLAUDE, max_tokens=32_000))
+
+    assert payload["max_tokens"] == 32_000
+
+
+def test_both_effort_spellings_leave_the_payload_when_both_are_present() -> None:
+    """`a or b` short-circuits, and the second `pop` is what removes the alias.
+
+    A partial override that sets `reasoning_effort` on a fallback that already
+    inherits `effort` — the shape the shipped ANALYST and COACH fallbacks would
+    take — leaves both after the merge. Selecting with `or` would then never
+    run the second pop, and `effort` would ride along in `**params` as a
+    top-level keyword Anthropic does not accept.
+    """
+    payload = AnthropicProvider.build_payload(
+        request(CLAUDE, reasoning_effort="high", effort="low")
+    )
+
+    assert "effort" not in payload
+    assert "reasoning_effort" not in payload
+    assert payload["output_config"] == {"effort": "high"}
 
 
 def test_effort_never_reaches_the_groq_path() -> None:

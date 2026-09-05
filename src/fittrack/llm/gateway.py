@@ -184,20 +184,51 @@ def _params_of(spec: ModelSpec) -> dict[str, object]:
     return declared
 
 
+def _require_strict(schema: type[BaseModel]) -> None:
+    """The schema must refuse undeclared fields, and the gateway checks that.
+
+    Pydantic's default is `extra="ignore"`: a lax schema drops an invented
+    field silently, so "an answer with an extra field fails" would be a
+    property of whoever wrote the schema rather than of this boundary.
+
+    Checked on the schema rather than enforced on the answer, because the
+    alternative — scanning the parsed JSON for undeclared keys — only ever
+    sees the top level. `extra="forbid"` is enforced by Pydantic at every
+    level of nesting, and a missing declaration is a programming error that
+    should surface on the first test that calls the agent, not on the first
+    production answer that happens to invent a field.
+    """
+    if schema.model_config.get("extra") != "forbid":
+        raise SchemaViolationError(
+            f"{schema.__name__} must declare extra='forbid': the gateway "
+            "guarantees that an answer carrying an undeclared field fails "
+            "(spec 7.4 item 5), and Pydantic ignores extras by default"
+        )
+
+
 def _validated(text: str, schema: type[BaseModel] | None) -> BaseModel | None:
     """Pydantic has the last word, whatever the provider promised (7.4 item 5)."""
     if schema is None:
         return None
+    _require_strict(schema)
     try:
         return schema.model_validate_json(text)
     except ValidationError as error:
-        # The errors carry field names and the offending values, and the
-        # offending value is model output derived from the user's text. The
-        # field locations are the diagnosis; the inputs are not ours to print.
-        locations = "; ".join(
-            ".".join(str(part) for part in detail["loc"]) + f": {detail['msg']}"
+        # The location and the error *type*, never the message. `msg` is
+        # written by the validator, and a custom one embeds the value it
+        # rejected — `Value error, <the model's text>` — which is content
+        # derived from the user's prompt. `include_input=False` does not
+        # remove it, because it is not the input field: it is the sentence
+        # the validator wrote about the input.
+        #
+        # `type` is a stable machine-readable code (`extra_forbidden`,
+        # `int_parsing`, `value_error`) and `loc` is structure. Together they
+        # say where and what kind, which is the whole diagnosis worth having
+        # here — the answer itself belongs in Langfuse (spec 20.1), on purpose.
+        failures = "; ".join(
+            ".".join(str(part) for part in detail["loc"]) + f": {detail['type']}"
             for detail in error.errors(include_url=False, include_input=False)
         )
         raise SchemaViolationError(
-            f"answer does not satisfy {schema.__name__}: {locations}"
+            f"answer does not satisfy {schema.__name__}: {failures}"
         ) from None
