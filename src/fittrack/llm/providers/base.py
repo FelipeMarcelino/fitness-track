@@ -18,6 +18,7 @@ accepts, which the gateway has to know to build a legal request at all.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Protocol, runtime_checkable
@@ -70,39 +71,71 @@ class ProviderError(RuntimeError):
         self.context_limit = context_limit
 
 
-# What each vendor says when the prompt does not fit. Substrings rather than
-# exact messages: the wording is theirs and changes without notice.
-#
-# This is a net, not the mechanism. Spec 7.3 puts a token-count preflight ahead
-# of the call precisely because discovering the limit from an error costs a
-# wasted call — but the estimate uses a different tokenizer than the provider,
-# so an estimate that runs low still lands here.
-_CONTEXT_LIMIT_MARKERS = (
-    "context_length_exceeded",
-    "context length",
-    "context window",
-    "prompt is too long",
-    "too many tokens",
-    "maximum context",
-    "request too large",
+# The vendors' own machine-readable codes for "the prompt does not fit".
+# These are the authoritative signal: a code is chosen by the provider, never
+# echoed from the request.
+_CONTEXT_LIMIT_CODES = frozenset(
+    {
+        "context_length_exceeded",
+        "string_above_max_length",
+        "request_too_large",
+    }
 )
+
+# Anthropic reports a context limit and a malformed request under the same
+# `invalid_request_error` type, so for that vendor the message is the only
+# signal left — and the message is the part that quotes the request back.
+#
+# Anchored on the token counts the vendors emit rather than on a bare phrase.
+# A user writing "meu context window de treino" in a workout log would match
+# a loose substring scan, and §7.3 sends a context limit to the fallback while
+# refusing to send an ordinary 400 there at all: a false positive turns a
+# programming error into a paid retry that hides it.
+_CONTEXT_LIMIT_PATTERNS = (
+    re.compile(r"prompt is too long:\s*\d+"),
+    re.compile(r"\d+\s*tokens?\s*>\s*\d+"),
+    re.compile(r"maximum context length is\s*\d+"),
+)
+
+
+def _error_body(error: Exception) -> Mapping[str, Any]:
+    """The parsed error object both SDKs attach, or an empty mapping."""
+    body = getattr(error, "body", None)
+    if isinstance(body, Mapping):
+        inner = body.get("error")
+        return inner if isinstance(inner, Mapping) else body
+    return {}
+
+
+def _is_context_limit(error: Exception) -> bool:
+    """Whether this is the one 400 another provider's window can resolve.
+
+    Structured first, message second — never the message alone, and never the
+    whole `str(error)`, which carries the request body.
+    """
+    body = _error_body(error)
+    for key in ("code", "type"):
+        value = body.get(key)
+        if isinstance(value, str) and value.lower() in _CONTEXT_LIMIT_CODES:
+            return True
+    message = body.get("message")
+    text = message.lower() if isinstance(message, str) else str(error).lower()
+    return any(pattern.search(text) for pattern in _CONTEXT_LIMIT_PATTERNS)
 
 
 def provider_failure(vendor: str, error: Exception) -> ProviderError:
     """Classify an SDK exception into the categories 7.3 routes on.
 
-    Reads the message to set the flag and then drops it: the classification is
-    the only part safe to carry forward.
+    Reads the error to set the flag and then drops everything but the
+    classification, which is the only part safe to carry forward.
     """
     status_code = getattr(error, "status_code", None)
     if not isinstance(status_code, int):
         status_code = None
-    message = str(error).lower()
-    context_limit = any(marker in message for marker in _CONTEXT_LIMIT_MARKERS)
     return ProviderError(
         vendor,
         status_code=status_code,
-        context_limit=context_limit,
+        context_limit=_is_context_limit(error),
         kind=type(error).__name__,
     )
 

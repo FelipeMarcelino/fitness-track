@@ -39,6 +39,10 @@ DEFAULT_MAX_TOKENS = 4096
 # what the API reads.
 _THINKING = {"type": "adaptive"}
 
+# Spec 7.4, cache row: Anthropic's prompt cache is explicit, unlike Groq's.
+# `ephemeral` is the only lifetime the API offers today.
+_CACHE_BREAKPOINT = {"type": "ephemeral"}
+
 _ROLES = {"human": "user", "ai": "assistant", "tool": "user"}
 
 
@@ -99,7 +103,15 @@ class AnthropicProvider:
             **params,
         }
         if system:
-            payload["system"] = system
+            # A content block with an explicit breakpoint, not a bare string.
+            # Groq caches repeated prefixes automatically; Anthropic charges
+            # full price for every one unless a block carries `cache_control`
+            # (spec 7.4, cache row). The system prompt is the stable prefix of
+            # every call for a role, so sending it unmarked means
+            # `cache_read_input_tokens` can only ever report zero.
+            payload["system"] = [
+                {"type": "text", "text": system, "cache_control": dict(_CACHE_BREAKPOINT)}
+            ]
         if effort:
             payload["thinking"] = dict(_THINKING)
         # One object carries both halves (`OutputConfigParam`), so the schema

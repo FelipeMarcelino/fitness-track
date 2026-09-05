@@ -25,6 +25,7 @@ role uses tools (7.4 item 3), and tracing has no consumer until T07.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from typing import get_args
 
 from langchain_core.messages import BaseMessage
 from pydantic import BaseModel, ValidationError
@@ -33,6 +34,10 @@ from fittrack.config import ModelsConfig, ModelSpec
 from fittrack.llm.providers.base import LLMProvider, ProviderRequest
 from fittrack.llm.roles import AGENT_ROLES, LLMRole
 from fittrack.llm.types import LLMResult, TokenUsage
+
+# What replaces a location component the answer invented. A constant so the
+# redaction is greppable and cannot be mistaken for a real field name.
+_REDACTED = "<redacted>"
 
 __all__ = [
     "LLMGateway",
@@ -99,6 +104,12 @@ class LLMGateway:
         every call site later, and the alternative — resolving it from the
         graph state inside the gateway — is what invariant 3 forbids.
         """
+        if schema is not None:
+            # Before the call, not after: a lax schema is a programming error
+            # the gateway can see without asking anyone, and validating it in
+            # `_validated` would spend a paid invocation and then discard the
+            # answer it just bought.
+            _require_strict(schema)
         spec = self._primary_for(agent=agent, role=role)
         provider = self._providers.get(spec.provider)
         if provider is None:
@@ -184,33 +195,88 @@ def _params_of(spec: ModelSpec) -> dict[str, object]:
     return declared
 
 
-def _require_strict(schema: type[BaseModel]) -> None:
-    """The schema must refuse undeclared fields, and the gateway checks that.
+def _models_in(annotation: object) -> list[type[BaseModel]]:
+    """Every `BaseModel` mentioned by a type annotation, containers included."""
+    found: list[type[BaseModel]] = []
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        found.append(annotation)
+    for argument in get_args(annotation):
+        found.extend(_models_in(argument))
+    return found
 
-    Pydantic's default is `extra="ignore"`: a lax schema drops an invented
+
+def _schema_tree(schema: type[BaseModel]) -> list[type[BaseModel]]:
+    """The schema and every model reachable from it, each once.
+
+    `list[ExtractedSet]`, `Inner | None` and `dict[str, Block]` all hide a
+    model inside a generic, and the rules below have to reach all of them.
+    """
+    seen: dict[type[BaseModel], None] = {}
+    pending = [schema]
+    while pending:
+        model = pending.pop()
+        if model in seen:
+            continue
+        seen[model] = None
+        for info in model.model_fields.values():
+            pending.extend(_models_in(info.annotation))
+    return list(seen)
+
+
+def _require_strict(schema: type[BaseModel]) -> None:
+    """Every model in the schema tree must refuse undeclared fields.
+
+    Pydantic's default is `extra="ignore"`: a lax model drops an invented
     field silently, so "an answer with an extra field fails" would be a
     property of whoever wrote the schema rather than of this boundary.
 
-    Checked on the schema rather than enforced on the answer, because the
-    alternative — scanning the parsed JSON for undeclared keys — only ever
-    sees the top level. `extra="forbid"` is enforced by Pydantic at every
-    level of nesting, and a missing declaration is a programming error that
-    should surface on the first test that calls the agent, not on the first
-    production answer that happens to invent a field.
+    **The whole tree, not just the root.** `extra="forbid"` is not inherited
+    by nested models, and the contracts of 9.4 are nested by construction —
+    `ExtractionResult.sets: list[ExtractedSet]` puts the field that actually
+    carries the extraction one level down. A check that stopped at the root
+    would guarantee nothing about exactly the part that matters.
+
+    Checked on the schema rather than by scanning the answer, because a key
+    scan only ever sees the top level too — and because a lax schema is a
+    programming error that should surface on the first test that calls the
+    agent, not on the first production answer that invents a field.
     """
-    if schema.model_config.get("extra") != "forbid":
+    lax = [
+        model.__name__
+        for model in _schema_tree(schema)
+        if model.model_config.get("extra") != "forbid"
+    ]
+    if lax:
         raise SchemaViolationError(
-            f"{schema.__name__} must declare extra='forbid': the gateway "
+            f"{', '.join(sorted(lax))} must declare extra='forbid': the gateway "
             "guarantees that an answer carrying an undeclared field fails "
             "(spec 7.4 item 5), and Pydantic ignores extras by default"
         )
+
+
+def _safe_location(parts: tuple[object, ...], declared: frozenset[str]) -> str:
+    """A field path with nothing the answer invented.
+
+    Not every component of a Pydantic `loc` comes from the schema. An
+    `extra_forbidden` error reports the key the model made up, and an error
+    inside a `dict[str, ...]` reports the offending *key* — both are model
+    output derived from the user's prompt, and either can carry the user's own
+    words verbatim.
+
+    Integers are positions and always safe; names are kept only when the
+    schema declares them somewhere.
+    """
+    return ".".join(
+        str(part) if isinstance(part, int) else (part if part in declared else _REDACTED)
+        for part in parts
+    )
 
 
 def _validated(text: str, schema: type[BaseModel] | None) -> BaseModel | None:
     """Pydantic has the last word, whatever the provider promised (7.4 item 5)."""
     if schema is None:
         return None
-    _require_strict(schema)
+    declared = frozenset(name for model in _schema_tree(schema) for name in model.model_fields)
     try:
         return schema.model_validate_json(text)
     except ValidationError as error:
@@ -226,7 +292,7 @@ def _validated(text: str, schema: type[BaseModel] | None) -> BaseModel | None:
         # say where and what kind, which is the whole diagnosis worth having
         # here — the answer itself belongs in Langfuse (spec 20.1), on purpose.
         failures = "; ".join(
-            ".".join(str(part) for part in detail["loc"]) + f": {detail['type']}"
+            f"{_safe_location(detail['loc'], declared)}: {detail['type']}"
             for detail in error.errors(include_url=False, include_input=False)
         )
         raise SchemaViolationError(

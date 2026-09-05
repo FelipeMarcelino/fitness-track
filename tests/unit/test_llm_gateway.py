@@ -110,6 +110,32 @@ class Lax(BaseModel):
     reps: int
 
 
+class LooseChild(BaseModel):
+    """Strict outside, permissive inside: the shape `ExtractionResult` has."""
+
+    ok: int
+
+
+class StrictOuterWithLooseChild(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    inner: LooseChild
+
+
+class StrictInner(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    ok: int
+
+
+class WithDynamicKeys(BaseModel):
+    """A mapping field: its *keys* come from the answer, not from the schema."""
+
+    model_config = {"extra": "forbid"}
+
+    tags: dict[str, int]
+
+
 def gateway(provider: Any, *, models: ModelsConfig | None = None) -> LLMGateway:
     return LLMGateway(models=models or committed_models(), providers={provider.name: provider})
 
@@ -296,10 +322,16 @@ async def test_an_unconfigured_provider_is_refused_before_the_call() -> None:
 
 
 async def test_the_answer_is_validated_even_when_the_provider_promises_structure() -> None:
-    """An extra field is a failure, not a silently-kept extra."""
+    """An extra field is a failure, not a silently-kept extra.
+
+    The *name* of the extra field is the model's invention, so it does not
+    appear in the exception — see
+    `test_an_invented_field_name_is_redacted_from_the_location`. What survives
+    is the error type, which is what says an undeclared field arrived.
+    """
     fake = FakeProvider(answer='{"reps": 8, "invented": "by the model"}')
 
-    with pytest.raises(ValueError, match="invented"):
+    with pytest.raises(ValueError, match="extra_forbidden"):
         await gateway(fake).ainvoke(
             agent="extraction",
             role=LLMRole.EXTRACTOR,
@@ -417,6 +449,81 @@ async def test_a_validation_failure_never_quotes_the_rejected_value() -> None:
     # The diagnosis still names where and what kind.
     assert "load_kg" in str(raised.value)
     assert "value_error" in str(raised.value)
+
+
+async def test_a_dynamic_key_in_a_location_is_redacted() -> None:
+    """`loc` is not always schema-defined: a mapping key comes from the answer.
+
+    Pydantic puts the offending key straight into `loc`, so a model that used
+    the user's own words as a key would push them into the exception — and
+    into OTel once S03-T07 records failures. Only names the schema declares,
+    and structural indices, survive.
+    """
+    secret = "supino reto com 80kg"
+    fake = FakeProvider(answer=f'{{"tags": {{"{secret}": "nao numero"}}}}')
+
+    with pytest.raises(ValueError) as raised:
+        await gateway(fake).ainvoke(
+            agent="extraction",
+            role=LLMRole.EXTRACTOR,
+            tenant_id=7,
+            messages=turn(),
+            schema=WithDynamicKeys,
+        )
+
+    assert secret not in str(raised.value)
+    # The declared field still names itself, or the message says nothing.
+    assert "tags" in str(raised.value)
+
+
+async def test_an_invented_field_name_is_redacted_from_the_location() -> None:
+    """The name of an extra field is the model's invention, not the schema's."""
+    fake = FakeProvider(answer='{"reps": 8, "supino reto com 80kg": 1}')
+
+    with pytest.raises(ValueError) as raised:
+        await gateway(fake).ainvoke(
+            agent="extraction",
+            role=LLMRole.EXTRACTOR,
+            tenant_id=7,
+            messages=turn(),
+            schema=Extracted,
+        )
+
+    assert "supino" not in str(raised.value)
+    assert "extra_forbidden" in str(raised.value)
+
+
+async def test_a_nested_schema_that_permits_extras_is_refused() -> None:
+    """`extra="forbid"` on the outer model says nothing about the inner one.
+
+    `ExtractionResult.sets: list[ExtractedSet]` (spec 9.4) has exactly this
+    shape, so a check that stopped at the top level would guarantee nothing
+    for the field that actually carries the extraction.
+    """
+    with pytest.raises(ValueError, match="LooseChild"):
+        await gateway(FakeProvider()).ainvoke(
+            agent="extraction",
+            role=LLMRole.EXTRACTOR,
+            tenant_id=7,
+            messages=turn(),
+            schema=StrictOuterWithLooseChild,
+        )
+
+
+async def test_a_lax_schema_is_refused_before_the_provider_is_called() -> None:
+    """A programming error must not cost a paid call whose answer is discarded."""
+    fake = FakeProvider()
+
+    with pytest.raises(ValueError):
+        await gateway(fake).ainvoke(
+            agent="extraction",
+            role=LLMRole.EXTRACTOR,
+            tenant_id=7,
+            messages=turn(),
+            schema=Lax,
+        )
+
+    assert fake.calls == []
 
 
 async def test_a_schema_that_permits_extra_fields_is_refused() -> None:

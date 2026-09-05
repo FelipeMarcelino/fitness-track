@@ -49,15 +49,19 @@ class Answer(BaseModel):
 
 
 class FakeStatusError(Exception):
-    """An SDK status error, in the only two attributes the policy reads.
+    """An SDK status error, in the three attributes the classifier reads.
 
     Both vendors' SDKs raise `APIStatusError` subclasses carrying
-    `status_code`; the message is theirs and may quote the request back.
+    `status_code` and the parsed `body`. The message is theirs and may quote
+    the request back; the body's `code`/`type` are chosen by the provider.
     """
 
-    def __init__(self, status_code: int, message: str) -> None:
+    def __init__(
+        self, status_code: int, message: str, body: dict[str, object] | None = None
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.body = body
 
 
 def request(model: str, **params: object) -> ProviderRequest:
@@ -171,8 +175,33 @@ def test_the_anthropic_payload_lifts_system_out_of_the_message_list() -> None:
     """Anthropic takes the system prompt as its own argument, not as a turn."""
     payload = AnthropicProvider.build_payload(request(CLAUDE))
 
-    assert payload["system"] == "regras"
+    assert payload["system"][0]["text"] == "regras"
     assert payload["messages"] == [{"role": "user", "content": "oi"}]
+
+
+def test_the_anthropic_system_prompt_is_marked_cacheable() -> None:
+    """Anthropic's prompt cache is explicit (spec 7.4, cache row).
+
+    Groq caches automatically; Anthropic charges full price for every repeated
+    prefix unless a block carries the breakpoint. The system prompt is the
+    stable prefix of every call for a role — sending it as a bare string means
+    `cache_read_input_tokens` can only ever report zero.
+    """
+    system = AnthropicProvider.build_payload(request(CLAUDE))["system"]
+
+    assert system == [{"type": "text", "text": "regras", "cache_control": {"type": "ephemeral"}}]
+
+
+def test_without_a_system_prompt_anthropic_gets_no_system_key() -> None:
+    call = ProviderRequest(
+        model=CLAUDE,
+        messages=(HumanMessage(content="oi"),),
+        params={},
+        schema=None,
+        timeout_s=30,
+    )
+
+    assert "system" not in AnthropicProvider.build_payload(call)
 
 
 def test_the_anthropic_payload_never_carries_temperature() -> None:
@@ -385,11 +414,16 @@ def test_a_context_limit_400_is_flagged_apart_from_an_ordinary_400() -> None:
     Both arrive as the SDK's bad-request error, so without the flag the
     fallback either never happens or happens for programming errors too.
     """
-    over = provider_failure("groq", FakeStatusError(400, "context_length_exceeded: 140k > 131k"))
-    ordinary = provider_failure("groq", FakeStatusError(400, "invalid schema for tool"))
+    too_long = FakeStatusError(400, "this request exceeds the model's limit")
+    too_long.body = {"error": {"code": "context_length_exceeded"}}
+    ordinary = FakeStatusError(400, "invalid schema for tool")
+    ordinary.body = {"error": {"code": "invalid_request_error"}}
+
+    over = provider_failure("groq", too_long)
+    plain = provider_failure("groq", ordinary)
 
     assert (over.status_code, over.context_limit) == (400, True)
-    assert (ordinary.status_code, ordinary.context_limit) == (400, False)
+    assert (plain.status_code, plain.context_limit) == (400, False)
 
 
 def test_the_anthropic_wording_for_a_long_prompt_is_recognised_too() -> None:
@@ -405,6 +439,41 @@ def test_a_connection_failure_has_no_status() -> None:
 
     assert failure.status_code is None
     assert failure.context_limit is False
+
+
+def test_user_text_quoting_a_marker_is_not_a_context_limit() -> None:
+    """The classifier must not read attacker-influenced text.
+
+    A provider's 400 quotes the request back, and the request is the user's
+    message. An unrestricted substring scan would let a user write "context
+    window" in a workout log and have their ordinary malformed-request 400
+    routed to the fallback — which §7.3 permits only for a real context limit,
+    and which would mask the programming error behind a paid retry.
+    """
+    error = FakeStatusError(400, 'invalid tool schema; request was: "meu context window de treino"')
+
+    assert provider_failure("groq", error).context_limit is False
+
+
+def test_a_structured_error_code_classifies_the_context_limit() -> None:
+    """The authoritative signal: the vendor's own code, not its prose."""
+    error = FakeStatusError(400, "whatever")
+    error.body = {"error": {"code": "context_length_exceeded", "type": "invalid_request_error"}}
+
+    assert provider_failure("groq", error).context_limit is True
+
+
+def test_the_anthropic_message_is_matched_only_when_it_is_unmistakable() -> None:
+    """Anthropic reports both 400s as `invalid_request_error`, so the code
+    alone cannot separate them and the message is the only signal left.
+
+    Matched by an anchored pattern that carries token counts — a shape user
+    prose does not take — rather than by a bare phrase.
+    """
+    over = FakeStatusError(400, "prompt is too long: 215838 tokens > 204798 maximum")
+    over.body = {"type": "error", "error": {"type": "invalid_request_error"}}
+
+    assert provider_failure("anthropic", over).context_limit is True
 
 
 def test_a_failure_never_carries_the_provider_message() -> None:
