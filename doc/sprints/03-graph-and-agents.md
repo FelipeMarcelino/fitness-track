@@ -1152,9 +1152,10 @@ LLM em estágios seguros para `dispatch`/`Send`, **sempre** pondo escrita de ing
 **Depende de:** S03-T21, S03-T08 (normalizer), S03-T02 (root/`dispatch`), S03-T06 (gateway) e
 S03-T07 (quota).
 
-**Arquivos previstos:** criar `graph/staging.py`, `graph/nodes/router.py`, `config/prompts/router.md`,
-`tests/unit/test_router.py`, `tests/unit/test_stage_quota.py`; modificar `agents/router.py`,
-`graph/root.py`, `llm/roles.py`, golden set de roteamento.
+**Arquivos previstos:** criar `graph/nodes/router.py`, `config/prompts/router.md`,
+`tests/unit/test_router.py`, `tests/unit/test_stage_quota.py`; modificar `graph/staging.py` — a T01 o
+cria com `stage_plan()` na onda 1 e esta tarefa acrescenta a reserva de quota por passo —,
+`agents/router.py`, `graph/root.py`, `llm/roles.py`, golden set de roteamento.
 
 **Plano.** Uma chamada ao gateway com `agent="router"`, `role=LLMRole.ROUTER`; nunca texto cru, nunca
 `channel_caps`. **`stage_plan()` ignora qualquer ordenação sugerida pelo LLM:** se há `ingestion`, ela
