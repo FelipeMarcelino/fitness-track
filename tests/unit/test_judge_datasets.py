@@ -98,6 +98,19 @@ def test_baseline_examples_are_unambiguous_for_numeric_fidelity(
     assert "densidade é alta" not in responses["base-017"]
     assert "85.0 kg × 6 repetições" in responses["base-025"]
     assert "3 dias por semana" in responses["base-033"]
+    # Found by the first live CI round (PR #36): the judge blocked on
+    # numeric_fidelity because these responses omitted a unit or pointed an
+    # existing tool number at an origin the rubric does not allow.
+    assert "52 séries de empurrar" in responses["base-011"]
+    assert "meta de 4 dias por semana" in responses["base-014"]
+    assert "6 séries de perna" in responses["base-028"]
+    assert "meta de 5 sessões por semana" in responses["base-035"]
+    # Second live round (PR #36): the judge's scale item 1 rejects a
+    # prescription duration with no tool or user origin, and item 3 rejects a
+    # causal tie the tool result does not demonstrate.
+    assert "semana mais leve" not in responses["base-021"]
+    assert "costuma pedir um deload" in responses["base-021"]
+    assert "vem justamente" not in responses["base-028"]
 
 
 def test_ids_are_unique(calibration: list[JudgeCase], baseline: list[JudgeCase]) -> None:

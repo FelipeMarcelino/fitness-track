@@ -275,9 +275,16 @@ def test_the_bundle_carries_no_secret() -> None:
     """
     from fittrack.config import load_config
 
-    blob = load_config(CONFIG_DIR).model_dump_json()
+    blob = load_config(CONFIG_DIR).model_dump_json().lower()
+    # Field names that contain a marker without being one. Named one by one
+    # rather than matched by pattern, for the reason `test_channel_isolation`
+    # gives about its own exceptions: an exception that can be earned by
+    # naming a field cleverly is a loophole, not an exception. `max_tokens` is
+    # an output budget (spec 7.4, Anthropic requires one); it holds a number.
+    for benign in ('"max_tokens"',):
+        blob = blob.replace(benign, '""')
     for marker in ("api_key", "apikey", "token", "password", "secret"):
-        assert marker not in blob.lower(), f"{marker!r} appears in versioned configuration"
+        assert marker not in blob, f"{marker!r} appears in versioned configuration"
 
 
 # --------------------------------------------------------------------------- #
