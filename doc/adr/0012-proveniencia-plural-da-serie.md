@@ -118,9 +118,12 @@ o banco) resolve `source_segments` para os `SourceSpan` que `align_segment_spans
 
 ```python
 class ExtractedSet(BaseModel):
-    source_segments: list[int]  # não vazia; índices em NormalizedTurn.segments
+    source_segments: list[int] = Field(min_length=1)  # índices em NormalizedTurn.segments
     # source_spans NÃO existe neste schema — é derivado, não emitido pelo LLM
 ```
+
+`Field` vem de Pydantic como no contrato completo da §9.5; lista vazia é erro de validação, não uma
+proveniência ausente aceita pelo fluxo.
 
 Depois da resolução, código determinístico confere que cada índice de segmento existe, que os spans
 resultantes satisfazem `0 <= start < end <= len(texto-fonte)`, que estão em ordem canônica sem
@@ -185,13 +188,16 @@ CREATE INDEX ix_source_tenant      ON exercise_set_source(tenant_id);
 CREATE INDEX ix_source_raw_message ON exercise_set_source(raw_message_id)
     WHERE raw_message_id IS NOT NULL;
 
+-- A aplicação pode consultar e acrescentar evidência, mas não reescrevê-la ou
+-- apagá-la. Correções passam pelo fluxo de domínio e preservam a trilha anterior.
+REVOKE UPDATE, DELETE ON exercise_set_source FROM fittrack_app;
+
 -- RLS não é herdada e não é automática: `_0002_row_level_security.py` só habilitou as tabelas que
 -- já existiam quando rodou. `exercise_set_source` nasce depois, então esta própria migração tem de
 -- repetir exatamente a policy que a `_0002` usa para as demais — mesma expressão, mesmo texto de
--- `USING`/`WITH CHECK` — e a T12 acrescenta 'exercise_set_source' à tupla `TENANT_SCOPED` em
--- `_0002_row_level_security.py`: é essa tupla que test_tenant_isolation.py usa para varrer o schema
--- em busca de coluna `tenant_id` sem policy, então sem essa linha o teste já existente pega o
--- descuido sozinho.
+-- `USING`/`WITH CHECK`. A tupla `TENANT_SCOPED` da `_0002_row_level_security.py` é histórica e não
+-- deve ser alterada; a T12 amplia uma enumeração de cobertura do schema atual em teste próprio para
+-- incluir esta tabela e provar que ela tem RLS e policy.
 ALTER TABLE exercise_set_source ENABLE ROW LEVEL SECURITY;
 ALTER TABLE exercise_set_source FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON exercise_set_source
@@ -291,8 +297,9 @@ troca:
 - A T09 e a T23 trocam "o LLM emite spans" por "o LLM cita segmentos, o código resolve spans" —
   simplifica o schema de saída do LLM (é só `list[int]`) e move toda a superfície de erro para código
   testável determinístico.
-- A T12 ganha uma tabela (com RLS habilitada na própria migração, e a entrada correspondente em
-  `TENANT_SCOPED` em `_0002_row_level_security.py`), três colunas novas em `exercise_set`
+- A T12 ganha uma tabela append-only (com RLS habilitada na própria migração, `REVOKE UPDATE, DELETE`
+  para `fittrack_app` e entrada no inventário de cobertura do **schema atual**, sem alterar a lista
+  histórica `TENANT_SCOPED` da `_0002`), três colunas novas em `exercise_set`
   (`provenance_hash`, `extraction_ordinal`, `expansion_ordinal`), duas chaves candidatas novas (em
   `exercise_set` e em `raw_message`), um índice de idempotência substituído e uma FK que usa a
   sintaxe de coluna do `ON DELETE SET NULL` (PG15+; o `docker-compose.yml` já fixa Postgres 16).
@@ -305,7 +312,8 @@ troca:
   linhas, não uma; purga de `raw_message` aos 90 dias com `exercise_set_source` sobrevivendo com
   `raw_message_id IS NULL` e o snapshot intacto; span de fragmento de texto resolvido contra
   `text_extract` e de voz contra `transcript`, nunca contra o `payload` do envelope inteiro; ausência
-  de texto sintético.
+  de texto sintético; e tentativa do runtime de `UPDATE` ou `DELETE` em `exercise_set_source`
+  recusada por privilégio.
 
 ## Condição de revisão
 

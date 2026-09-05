@@ -892,6 +892,9 @@ CREATE TABLE exercise_set_source (
 CREATE INDEX ix_source_tenant ON exercise_set_source(tenant_id);
 CREATE INDEX ix_source_raw_message ON exercise_set_source(raw_message_id)
     WHERE raw_message_id IS NOT NULL;
+-- A proveniência é append-only para o runtime: correções criam novas séries ou
+-- usam o fluxo explícito de correção, nunca alteram ou apagam sua evidência.
+REVOKE UPDATE, DELETE ON exercise_set_source FROM fittrack_app;
 -- Esta tabela nasce depois da migração que instalou RLS. A própria migração
 -- que a cria deve executar ENABLE/FORCE ROW LEVEL SECURITY e a policy
 -- tenant_isolation da §19.1; RLS não é herdada nem aplicada automaticamente.
@@ -1423,7 +1426,7 @@ class GraphState(TypedDict):
 `extracted_sets`, `persisted_set_ids`, `outbound` e `errors`; todas usam
 `resettable_add`. `SINGLE_WRITER_KEYS` declara o ramo dono de cada outra chave escrita.
 Um teste falha se uma chave nova não pertencer a uma das duas classificações. Uma lista
-vazia comum continua sendo um update normal: só `BatchReset([])`, construído pelo runner
+vazia comum continua sendo um update normal: só `BatchReset()`, construído pelo runner
 antes de um batch novo, apaga os quatro acumuladores.
 
 **`channel_caps` é a exceção que confirma a regra.** Ele está no estado porque o `voice_agent` é um
@@ -1599,7 +1602,7 @@ def guardrail_node(state: GraphState) -> Command[Literal["router", "voice"]]:
             update={"health_flag": verdict.model_dump(),
                     "outbound": [{"kind": "health_notice", **verdict.blocks()}]},
         )
-    return Command(goto="voice", update={"outbound": verdict.blocks()})
+    return Command(goto="voice", update={"health_flag": verdict.model_dump(), "outbound": [verdict.blocks()]})
 ```
 
 `HEALTH_REPORT` é o único não-`PASS` que continua para o router: uma mensagem pode trazer dor e
@@ -2113,6 +2116,7 @@ interpretáveis, e o que permite ao `dispatch` falhar cedo num alvo inexistente 
 
 ```python
 from decimal import Decimal
+from pydantic import Field
 
 class QuantityLiteral(BaseModel):
     value: Decimal
@@ -2126,7 +2130,9 @@ class ExtractedSet(BaseModel):
     load: QuantityLiteral | None = None
     reps: int | None = None
     rpe: float | None = None
+    rpe_origin: Literal["explicit", "inferred"] | None = None
     rir: int | None = None
+    rir_origin: Literal["explicit"] | None = None
     distance: QuantityLiteral | None = None
     duration: QuantityLiteral | None = None
     hold: QuantityLiteral | None = None
@@ -2135,13 +2141,13 @@ class ExtractedSet(BaseModel):
     is_failure: bool = False
     technique: str | None = None
     side: Literal["left","right","both"] | None = None
-    source_segments: list[int]   # não vazia; índices em NormalizedTurn.segments
+    source_segments: list[int] = Field(min_length=1)  # índices em NormalizedTurn.segments
     confidence: float            # 0..1
 
 class ExtractedMetric(BaseModel):
     kind: str                    # peso | sono_h | disposicao | ...
     value: QuantityLiteral
-    source_segments: list[int]
+    source_segments: list[int] = Field(min_length=1)
 
 class ExtractionResult(BaseModel):
     is_workout_log: bool
@@ -2152,13 +2158,16 @@ class ExtractionResult(BaseModel):
     overall_confidence: float
 ```
 
+Um `model_validator` do schema rejeita qualquer par `rpe`/`rpe_origin` ou `rir`/`rir_origin` em que
+somente valor ou origem esteja presente.
+
 **Regras de extração codificadas no prompt:**
 
 1. **Unidades.** O LLM devolve o literal e a unidade, nunca um valor convertido. Números sem unidade
    em contexto de musculação usam `unit="kg"` e `unit_origin="defaulted"`; entradas explícitas
    preservam o número e normalizam apenas o rótulo (`libras`/`lbs` → `lb`). `domain/units.py` converte
-   com `Decimal` no limite de persistência: lb → kg por `0.45359237`, km → m por `1000` e min → s por
-   `60`, aplicando `ROUND_HALF_UP` uma única vez.
+   com `Decimal` no limite de persistência: lb → kg por `0.45359237`, km → m por `1000`, min → s por
+   `60` e h → s por `3600`, aplicando `ROUND_HALF_UP` uma única vez.
 2. **Notação de séries.** `3x10`, `3 séries de 10`, `3×10` → `repeat=3, reps=10`.
    `12, 10, 8` → três séries com reps distintas, `repeat=1` cada.
 3. **Peso corporal.** "barra fixa 10 reps" → `load=null`. "barra fixa com 10kg de lastro" →
@@ -2184,10 +2193,14 @@ class ExtractionResult(BaseModel):
 | "falhei", "não consegui terminar", "travei" | 10 | 0 |
 
 Quando o usuário der um número diretamente ("RPE 8", "deixei 2 na reserva"), ele prevalece sobre a
-inferência textual. Se RPE e RIR forem ambos explícitos e contraditórios, os dois são preservados e a
-extração fica `low_confidence`; o sistema não corrige um número pelo outro. `RIR ≈ 10 − RPE` é derivado
-somente quando RIR não foi informado, por código em `domain/rpe.py`. Esclarecimento só é pedido quando
-a contradição inviabilizar o registro (ADR-0013).
+inferência textual. O schema registra essa diferença: `rpe_origin="explicit"` para número dito pelo
+usuário e `rpe_origin="inferred"` para o mapa acima; `rir_origin` da saída crua só pode ser
+`"explicit"`. Valor e origem são obrigatoriamente preenchidos juntos. Se RPE e RIR forem ambos
+explícitos e contraditórios, os dois são preservados e a extração fica `low_confidence`; o sistema não
+corrige um número pelo outro. `domain/rpe.py` deriva `RIR ≈ 10 − RPE` somente quando não houve RIR
+explícito, depois da validação Pydantic; o DTO de persistência marca esse resultado como
+`rir_origin="derived"`, valor que o LLM nunca emite. Esclarecimento só é pedido quando a contradição
+inviabilizar o registro (ADR-0013).
 
 ### 9.7 Contrato do `analysis_agent`
 
@@ -2452,10 +2465,11 @@ entrada: exercise_raw = "supino reto"
 └────────────────────────────────────────────────────────────────────┘
                             │ não achou
 ┌─ Camada 2 — busca lexical (trigram) ──────────────────────────────┐
-│  SELECT e.id, similarity(a.normalized, :norm) AS s                 │
+│  SELECT e.id, max(similarity(a.normalized, :norm)) AS s            │
 │  FROM exercise_alias a JOIN exercise e ON e.id = a.exercise_id     │
 │  WHERE a.normalized % :norm                                        │
 │    AND (a.tenant_id IS NULL OR a.tenant_id = :t)                   │
+│  GROUP BY e.id                                                      │
 │  ORDER BY s DESC LIMIT 5                                           │
 │  → s >= 0.85 e gap para o 2º >= 0.06? confidence = s  ✔ FIM        │
 └────────────────────────────────────────────────────────────────────┘
@@ -2483,7 +2497,8 @@ entrada: exercise_raw = "supino reto"
 um `exercise_alias` com `source='learned'` e `tenant_id` do usuário. Depois de 3 usuários distintos
 convergirem no mesmo alias, um job promove o alias para global (`tenant_id = NULL`).
 
-O delta de empate próximo da camada trigram é `0.06`, igual ao da camada vetorial. Abaixo desse
+O delta de empate próximo da camada trigram é `0.06`, igual ao da camada vetorial. O score de cada
+candidato é o máximo entre seus aliases, e o gap compara somente exercícios distintos. Abaixo desse
 limiar o resultado segue para a próxima camada; aceitar o primeiro colocado transformaria ruído
 lexical em exercício persistido.
 
@@ -3669,7 +3684,6 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public
 -- Aplicar a cada tabela tenant-scoped, sem exceção:
 --   channel_identity, athlete_profile, consent, subscription,
 --   exercise (privados), exercise_alias, workout_session, exercise_set,
---   exercise_set_source,
 --   session_summary, body_metric, health_report, workout_plan, plan_item,
 --   training_program, program_phase, program_milestone, raw_message,
 --   processing_batch, usage_ledger, outbound_queue, conversation_window
@@ -3682,7 +3696,7 @@ DECLARE t text;
 BEGIN
   FOREACH t IN ARRAY ARRAY[
     'channel_identity','athlete_profile','consent','subscription','exercise',
-    'exercise_alias','workout_session','exercise_set','exercise_set_source','session_summary',
+    'exercise_alias','workout_session','exercise_set','session_summary',
     'body_metric','health_report','workout_plan','plan_item',
     'training_program','program_phase','program_milestone','raw_message',
     'processing_batch','usage_ledger','outbound_queue','conversation_window'
@@ -3698,6 +3712,11 @@ BEGIN
     $f$, t);
   END LOOP;
 END $$;
+
+-- Esta lista é histórica: descreve somente as tabelas existentes quando a
+-- migração inicial de RLS rodou. Uma tabela tenant-scoped criada depois dela
+-- habilita FORCE RLS e sua policy na própria migração; o teste de cobertura do
+-- schema atual a inventaria separadamente, sem reescrever esta migração.
 
 -- Linhas GLOBAIS (tenant_id IS NULL) precisam ser LEGÍVEIS por qualquer tenant:
 -- o resolver (§10) consulta `tenant_id IS NULL OR tenant_id = :t`, e sem esta
@@ -4219,15 +4238,17 @@ Cifrados **antes** de chegar ao Postgres. O banco vê apenas bytes.
 | `health_report.verbatim` | Relato de dor e lesão; dado sensível do art. 11 |
 | `body_metric.value` | Peso, medidas, sono, disposição |
 | `athlete_profile.injuries` | Histórico de lesão; JSON serializado e então cifrado |
-| `raw_message.payload` | Texto bruto do usuário |
+| `raw_message.payload` | Envelope bruto do canal, que pode conter texto do usuário |
+| `raw_message.text_extract` | Recorte literal da mensagem de texto, usado exclusivamente por spans auditáveis |
 | `raw_message.transcript` | Transcrição de áudio |
 | `processing_batch.combined_text` | Concatenação persistida das mensagens para retry |
 | `outbound_queue.payload` | Resposta pendente, que pode repetir dado de treino ou saúde |
 | `session_summary.narrative` | Narrativa da sessão, pode conter relato pessoal |
 
-Essas colunas já nascem `BYTEA` no schema da §5.2, cada uma com sua `key_version` ao lado — **não
-existe migração de conversão**, porque a criptografia entra na fase 1.0 justamente para evitá-la
-(§24). Converter depois exigiria ler, cifrar e reescrever todas as linhas com o serviço parado.
+Essas colunas nascem `BYTEA` na migração que as cria, cada uma com sua `key_version` ao lado — **não
+existe migração de conversão de texto em claro**, porque a criptografia entra na fase 1.0 justamente
+para evitá-la (§24). Converter depois exigiria ler, cifrar e reescrever todas as linhas com o serviço
+parado.
 
 **O `external_id` paga um preço que os outros não pagam: ele precisa ser pesquisável.** Todo webhook
 começa com "quem é esta conta?", e AES-GCM com nonce aleatório não permite `WHERE external_id = ?`.

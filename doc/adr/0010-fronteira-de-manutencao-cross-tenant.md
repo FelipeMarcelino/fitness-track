@@ -42,9 +42,12 @@ Para a persistência do LangGraph:
   "profile")`, cifra o valor com AAD de tenant, namespace e key, e é a única porta
   entregue ao grafo. O Store bruto nunca chega a um nó nem ao runtime.
 
-Os jobs de manutenção da Sprint 04 reutilizam a mesma função estreita. A fronteira
-pré-tenant já existente para identidade continua limitada às suas duas funções; ela
-não é uma autorização para consultas globais novas.
+Os jobs de manutenção da Sprint 04 reutilizam o padrão e a role dona, não uma função
+genérica: cada operação recebe sua própria função `SECURITY DEFINER`, com parâmetros,
+grants e retorno mínimos para aquela operação. Não existe dispatch por nome de tabela,
+SQL arbitrário ou um endpoint que escolha a operação dinamicamente. A fronteira pré-tenant
+já existente para identidade continua limitada às suas duas funções; ela não é uma
+autorização para consultas globais novas.
 
 ## Consequências
 

@@ -132,7 +132,7 @@ o teste de arquitetura que sustenta a §8.8.
    obrigatórias desta sprint: `destination_identity_id` na entrada (o `identity_id` da última mensagem
    da rajada, nunca inferido de `reply_to`) e `voice_output` na T21. As quatro listas concorrentes
    (`extracted_sets`, `persisted_set_ids`, `outbound`, `errors`) usam `resettable_add`: para updates
-   normais ele delega a `operator.add`; um único `BatchReset([])` emitido pelo runner antes de um
+   normais ele delega a `operator.add`; um único `BatchReset()` emitido pelo runner antes de um
    **batch novo** substitui o valor acumulado. Uma lista vazia comum não reseta nada. O pin 0.6 não
    oferece `Overwrite`, portanto o sentinel é nosso, fechado e testado — não um `dict` que o LLM possa
    fabricar. `messages` usa `bounded_add_messages`, que preserva a semântica de `add_messages` e poda
@@ -149,7 +149,7 @@ o teste de arquitetura que sustenta a §8.8.
    `IMPORT_EXCEPTIONS` de `CAPS_EXCEPTIONS`, e acrescentar a asserção substituta: `state.py` menciona
    `channel_caps` exatamente uma vez, e apenas como anotação de campo.
 5. O teste do reducer cobre três transições distintas: fan-out do mesmo batch concatena; entrada vazia
-   não apaga; `BatchReset([])` vindo do runner apaga exatamente uma vez antes do batch seguinte.
+   não apaga; `BatchReset()` vindo do runner apaga exatamente uma vez antes do batch seguinte.
    `bounded_add_messages` é exercitado com 13+ mensagens e nunca devolve mais de 12.
 
 **Primeiro teste que deve falhar.**
@@ -368,7 +368,7 @@ encerramento: handoff cumprido).
    `profile`, `active_session`, `now_local`, quota. É isso que mantém `load_context.py` sem uma
    menção a `channel_caps`.
 4. Antes de uma invocação normal, o runner lê o último checkpoint ainda sob o mesmo lock. Se o
-   `batch_id` mudou, envia `BatchReset([])` para `extracted_sets`, `persisted_set_ids`, `outbound` e
+   `batch_id` mudou, envia `BatchReset()` para `extracted_sets`, `persisted_set_ids`, `outbound` e
    `errors`, e sobrescreve os campos de escritor único com os defaults do batch; se é retry do mesmo
    `batch_id` ou `Command(resume=...)`, **não reseta** e retoma. Passar quatro listas vazias comuns é
    proibido porque o reducer apenas as concatena e não apagaria o batch anterior.
@@ -487,7 +487,8 @@ auditável. Single-shot, papel `NORMALIZER`, **sem** extração de séries.
 `domain/provenance.py`, `graph/nodes/normalizer.py`,
 `src/fittrack/db/migrations/versions/_0006_raw_message_text_extract.py`,
 `tests/unit/test_normalizer.py`, `tests/unit/test_provenance_alignment.py`,
-`evals/golden/normalization.jsonl`; modificar `services/webhook.py`
+`tests/integration/test_encrypted_columns.py`, `evals/golden/normalization.jsonl`; modificar
+`services/webhook.py`, `tests/integration/test_schema_contract.py`.
 (`SqlRawMessageStore.persist`).
 
 **Migração (`_0006`, uma coluna, independente das outras da onda 0 — ver a nota de colisão de
@@ -529,6 +530,8 @@ existe, não é vazio, e não há instrução equivalente inline no módulo; `al
 `0 <= start < end <= len(texto-fonte)` em todo caso, inclusive quando a similaridade cai abaixo do
 limiar e o resultado é o fragmento inteiro; um segmento gerado a partir de um fragmento
 `was_audio=True` resolve contra `transcript`, nunca contra `payload` (o envelope inteiro).
+`test_schema_contract.py` inclui `raw_message.text_extract` no inventário de colunas cifradas;
+`test_encrypted_columns.py` prova que só o round-trip com AAD de linha recupera o texto.
 
 **Tamanho:** M.
 
@@ -567,12 +570,16 @@ receber aquele recorte literal; para múltiplos spans fica `NULL`, nunca uma con
 
 `domain/units.py` é a única fronteira que converte `QuantityLiteral` em DTO de persistência
 (`load_kg`, `distance_m`, `duration_s`/`hold_s`/`rest_s` ou métrica): usa `Decimal("0.45359237")`
-para lb → kg, `Decimal("1000")` para km → m, `Decimal("60")` para min → s, e
+para lb → kg, `Decimal("1000")` para km → m, `Decimal("60")` para min → s e
+`Decimal("3600")` para h → s, e
 `quantize(Decimal("0.01"), ROUND_HALF_UP)` **uma vez**, no limite de armazenamento — para os campos
 `INTEGER` de tempo, `to_integral_value(ROUND_HALF_UP)` no lugar de `quantize` (ADR-0018). O prompt só
 classifica e devolve o número literal mais a unidade; ele não calcula, não arredonda e não emite
 `load_kg` para entrada em lb nem `duration_s` para entrada em minutos. `domain/rpe.py`, **e só ele** (ADR-0018), também aplica
 `RIR ≈ 10 − RPE` apenas depois da resposta, para inferência derivada, preservando o RIR explícito.
+O schema registra `rpe_origin` (`explicit` ou `inferred`) e `rir_origin` (`explicit` na saída crua),
+exigindo valor e origem juntos; só o DTO de persistência pode usar `rir_origin="derived"`. Assim a
+contradição é detectável sem pedir que o domínio infira a origem novamente do texto.
 Peso corporal, notação de séries e o mapa da §9.6 continuam no prompt; campo não dito vira
 `missing_fields`, não chute (invariantes 1 e 6).
 
@@ -586,12 +593,13 @@ fake do LLM devolveu somente `100` + `"lb"`.
 
 **Critérios de aceite:** "muito fácil" → RPE 3; "falhei" → 10; RPE/RIR numérico explícito prevalece
 sobre adjetivo; `3x10` continua uma unidade de extração (as três linhas físicas são provadas na T12);
-`source_segments` inexistente, spans resolvidos fora do fragmento, sobrepostos ou fora de ordem,
+`source_segments` vazio ou inexistente, spans resolvidos fora do fragmento, sobrepostos ou fora de ordem,
 campo inventado e valor inválido são
 recusados **antes de tocar o banco**; testes de unidades cobrem kg/lb/km e min/s, constante e
 arredondamento fixos (`quantize` para carga/distância, `to_integral_value` para os `INTEGER` de
-tempo), e provam que nenhuma saída do LLM em lb ou em minutos chega a `load_kg`/`duration_s` sem
-passar por `domain/units.py`.
+tempo), incluindo h → s, e provam que nenhuma saída do LLM em lb, minutos ou horas chega a
+`load_kg`/`duration_s` sem passar por `domain/units.py`; RPE/RIR explícitos contraditórios preservam
+ambos com origem explícita e baixa confiança.
 
 **Tamanho:** M. Ver [ambiguidade #2](#2-rpe-e-rir-explícitos-e-contraditórios).
 
@@ -645,11 +653,16 @@ nas camadas 2/3/LLM, e no fallback criar exercício com `status='pending_review'
 `source='user'`; **nunca copiar `exercise_tenant_id`, `is_bodyweight` ou `equipment` da saída do LLM**
 — vêm da linha resolvida.
 
+A camada trigram agrega por `exercise_id` com `max(similarity(alias, :norm))` antes de ordenar e
+calcular o gap. Dois aliases do mesmo exercício nunca ocupam as duas primeiras posições nem criam um
+empate artificial.
+
 **Primeiro teste que deve falhar.**
 `test_private_exercise_from_another_tenant_never_reaches_llm_candidates` com
 `assert other_tenant_exercise_id not in fake_gateway.candidate_ids`.
 
-**Critérios de aceite:** exato vence; trigram aceita `>=0.85`; vetor exige `>=0.88` e gap `>=0.06`;
+**Critérios de aceite:** exato vence; trigram aceita `>=0.85` e calcula o gap somente entre exercícios
+distintos (dois aliases do mesmo exercício não criam empate); vetor exige `>=0.88` e gap `>=0.06`;
 LLM exige confiança `>=0.75`; exercício privado de outro tenant não pode ser lido, sugerido,
 referenciado ou persistido; nome com injection permanece dado delimitado.
 
@@ -670,7 +683,8 @@ invariantes 3, 5 e 6.
 **Arquivos previstos:** criar `domain/session.py`, `repositories/workouts.py`, `repositories/set_source.py`,
 `services/ingestion.py`, `src/fittrack/db/migrations/versions/_0006_exercise_set_source.py`,
 `tests/unit/test_session_manager.py`, `tests/integration/test_workout_persistence.py`,
-`tests/integration/test_provenance_retention.py`.
+`tests/integration/test_provenance_retention.py`, `tests/test_tenant_isolation.py`,
+`tests/integration/test_schema_contract.py`.
 
 **Migração (`_0006`, exigida pela ADR-0012 — esta é a peça que a versão anterior deste plano
 omitia).** Cria `exercise_set_source` com as duas FKs tenant-qualificadas (`exercise_set_id` e
@@ -678,7 +692,9 @@ omitia).** Cria `exercise_set_source` com as duas FKs tenant-qualificadas (`exer
 `uq_exercise_set_id_tenant` em `exercise_set` e `uq_raw_message_id_tenant` em `raw_message`, e as
 colunas novas em `exercise_set`: `provenance_hash BYTEA NOT NULL` e
 `expansion_ordinal SMALLINT NOT NULL DEFAULT 0`. Substitui `ux_set_idempotency` — ver SQL completo na
-ADR-0012.
+ADR-0012. A mesma migração habilita e força RLS, cria `tenant_isolation` para a tabela nova e revoga
+`UPDATE` e `DELETE` de `fittrack_app`; a enumeração de cobertura do schema **atual** no teste de
+isolamento passa a incluir a tabela, sem modificar a lista histórica `TENANT_SCOPED` da `_0002`.
 
 **Plano de implementação:** criar/reabrir sessão conforme §6 — **somente `closed_auto` reabre até
 15 min; `closed_explicit` não reabre**; derivar `is_bodyweight`, escopo e equipamento do registro no
@@ -712,7 +728,8 @@ batch não duplica a série (prova direta do bug do `set_index` corrigido); FK c
 para `exercise_set_id` e para `raw_message_id` reprovam nos dois sentidos; um teste de integração
 apaga o `raw_message` referenciado (simulando a purga de 90 dias) e prova que `exercise_set_source`
 sobrevive com `raw_message_id IS NULL`, `tenant_id` intacto e o snapshot (`channel`, `occurred_at`)
-preservado.
+preservado; o runtime não consegue `UPDATE` nem `DELETE` numa linha de proveniência append-only e o
+teste de cobertura do schema atual falha se a tabela nova perder RLS ou policy.
 
 **Tamanho:** M/G — cresceu com a migração da ADR-0012. **Bloqueado pela
 [ambiguidade crítica #7](#7-crítico-uma-série-pode-vir-de-vários-fragmentos-mas-source_message_id-é-escalar).**
@@ -1863,7 +1880,8 @@ ponte, e o ADR-0009 precisa de prazo novo por escrito. **Decidido: cortar a T17.
 que será armazenado e analisado depois. Isso contradiz diretamente a invariante 1: o LLM classifica o
 literal, não faz aritmética. O **ADR-0018** fixa `QuantityLiteral(value, unit)` na saída crua e a
 normalização em `domain/units.py`, com `Decimal("0.45359237")` para lb → kg, `Decimal("1000")` para
-km → m, `Decimal("60")` para min → s (a mesma lacuna existia para `duration_s`/`hold_s`/`rest_s`) e
+km → m, `Decimal("60")` para min → s, `Decimal("3600")` para h → s (a mesma lacuna existia para
+`duration_s`/`hold_s`/`rest_s`) e
 `ROUND_HALF_UP` no limite de persistência. Bloqueia T09 e exige errata da §9.5.
 
 ## Critério de saída da sprint

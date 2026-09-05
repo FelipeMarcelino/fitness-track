@@ -17,9 +17,13 @@ sistema em dado histórico do usuário.
 ## Decisão
 
 Quando RPE e RIR forem ambos explícitos e contraditórios, o sistema preserva ambos,
-marca a extração como de baixa confiança e não aplica precedência automática. A regra
-de derivar RIR a partir de RPE só vale quando RIR não foi informado explicitamente e
-roda em `domain/rpe.py`, fora do LLM.
+marca a extração como de baixa confiança e não aplica precedência automática. A saída
+crua registra a origem: `rpe_origin` é `explicit` ou `inferred`; `rir_origin` emitido
+pelo LLM só pode ser `explicit`. Valor e origem sempre aparecem juntos, portanto uma
+camada posterior sabe se os dois valores vieram de declarações explícitas sem tentar
+reconstruir essa informação do texto. A regra de derivar RIR a partir de RPE só vale
+quando RIR não foi informado explicitamente, roda em `domain/rpe.py`, fora do LLM, e o
+DTO de persistência marca o resultado como `rir_origin="derived"`.
 
 O fluxo pede esclarecimento somente quando a contradição tornar o registro inviável;
 caso contrário, persiste o melhor registro com a sinalização de baixa confiança. A
