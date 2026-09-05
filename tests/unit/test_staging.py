@@ -12,7 +12,7 @@ bug can exist (§8.8, §9.4 rule 1).
 
 from __future__ import annotations
 
-from fittrack.graph.staging import MAX_STEPS_PER_STAGE, stage_plan
+from fittrack.graph.staging import MAX_STEPS_PER_STAGE, _capped, stage_plan
 from fittrack.graph.state import RouteStep, Target
 
 
@@ -65,41 +65,55 @@ def test_an_empty_plan_is_valid() -> None:
     assert staged.errors == []
 
 
-def test_a_reader_stage_past_the_cap_is_truncated_and_records_errors() -> None:
-    """Five reader steps, a cap of four: the fifth is dropped, never re-routed."""
-    steps = [
-        _step("analysis", "analyze_progress"),
-        _step("analysis", "compare_period"),
-        _step("analysis", "analyze_volume"),
-        _step("analysis", "explain_metric"),
-        _step("analysis", "query_history"),
+def test_a_repeated_target_in_a_stage_is_dropped_and_recorded() -> None:
+    """Two analysis steps in one stage would run two subgraphs writing the same
+    single-writer result key — the InvalidUpdateError spec 8.2 designed for
+    exactly this. Staging keeps the first and records the drop, the same
+    treatment spec 9.4 rule 4 gives a plan past the cap."""
+    staged = stage_plan(
+        [
+            _step("analysis", "analyze_progress"),
+            _step("analysis", "compare_period"),
+        ]
+    )
+
+    assert staged.stages == [[_step("analysis", "analyze_progress")]]
+    assert staged.errors == [
+        "router: a repeated step toward 'analysis' was dropped - single-writer key (spec 8.2)"
     ]
 
-    staged = stage_plan(steps)
 
-    assert staged.stages == [steps[:MAX_STEPS_PER_STAGE]]
+def test_duplicates_in_the_writers_stage_are_dropped_too() -> None:
+    """A compound burst ('anota o supino e fecha a sessão') produces two
+    ingestion steps; both would run in stage 1 in parallel. The first runs,
+    the drop is recorded, and the compound-ingestion capability is a decision
+    for the subgraph contract, not for a reducer added here."""
+    staged = stage_plan(
+        [
+            _step("ingestion", "log_workout"),
+            _step("ingestion", "close_session"),
+        ]
+    )
+
+    assert staged.stages == [[_step("ingestion", "log_workout")]]
     assert staged.errors == [
+        "router: a repeated step toward 'ingestion' was dropped - single-writer key (spec 8.2)"
+    ]
+
+
+def test_the_cap_clamp_truncates_and_records_errors() -> None:
+    """§9.4 rule 4, tested at the clamp itself.
+
+    Through `stage_plan` the clamp is dormant while `Target` has only four
+    reader values — the per-target rule bounds every stage first. It guards
+    the day `Target` grows past the cap (a new parallelizable target).
+    """
+    steps = [_step("analysis", f"intent_{number}") for number in range(5)]
+
+    errors: list[str] = []
+    kept = _capped(steps, errors)
+
+    assert kept == steps[:MAX_STEPS_PER_STAGE]
+    assert errors == [
         f"router: stage cap of {MAX_STEPS_PER_STAGE} steps dropped the step toward 'analysis'"
     ]
-
-
-def test_the_cap_binds_the_ingestion_stage_as_well() -> None:
-    steps = [_step("ingestion", f"log_{number}") for number in range(5)]
-
-    staged = stage_plan(steps)
-
-    assert staged.stages == [steps[:MAX_STEPS_PER_STAGE]]
-    assert len(staged.errors) == 1
-
-
-def test_duplicate_readers_keep_their_order_inside_the_stage() -> None:
-    """Two steps for the same target in one stage are two independent tasks."""
-    steps = [
-        _step("analysis", "analyze_progress"),
-        _step("analysis", "compare_period"),
-    ]
-
-    staged = stage_plan(steps)
-
-    assert staged.stages == [steps]
-    assert staged.errors == []
