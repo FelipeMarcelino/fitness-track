@@ -29,17 +29,35 @@ adapter, which is what lets the shape be asserted without a network or a key.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from pydantic import BaseModel
 
+from fittrack.config import load_config
 from fittrack.llm.providers.anthropic import AnthropicProvider
 from fittrack.llm.providers.base import ProviderRequest, provider_failure, sanitize_params
 from fittrack.llm.providers.groq import GroqProvider
+from fittrack.llm.roles import LLMRole
 
-GPT_OSS = "openai/gpt-oss-120b"
-OTHER_GROQ = "llama-3.3-70b-versatile"
-CLAUDE = "claude-haiku-4-5"
+# Resolved from `config/models.yaml`, never written here. Invariant 4 keeps
+# model identifiers in configuration, and `test_no_model_name_appears_in_python`
+# scans `src`, `evals` and `scripts` — not `tests`, which is exactly why these
+# constants could have drifted into stale literals without anything noticing.
+# Reading them from the file also means a model swap re-points these tests at
+# what the deployment actually uses.
+_EXTRACTOR = load_config(Path(__file__).resolve().parents[2] / "config").models.roles[
+    LLMRole.EXTRACTOR
+]
+assert _EXTRACTOR.primary is not None
+GPT_OSS = _EXTRACTOR.primary.model
+CLAUDE = _EXTRACTOR.fallback.model
+
+# Deliberately synthetic: the point of this one is to be a Groq model that is
+# *not* in the `gpt-oss` family, and `models.yaml` has no such entry to read.
+# A literal here names nothing real, so it cannot go stale.
+OTHER_GROQ = "some-other-groq-model"
 
 
 class Answer(BaseModel):
@@ -377,6 +395,32 @@ def test_an_assistant_turn_in_the_middle_survives_on_the_anthropic_path() -> Non
         "assistant",
         "user",
     ]
+
+
+def test_a_late_system_message_does_not_hide_a_trailing_assistant_turn() -> None:
+    """Order between the two rules, and it is not arbitrary.
+
+    With the system message last, a prefill check running before the lift
+    finds a system turn at the end and strips nothing — then the lift removes
+    that turn and the payload ends in `assistant` anyway. Both rules applied,
+    the guaranteed 400 still produced.
+    """
+    call = ProviderRequest(
+        model=CLAUDE,
+        messages=(
+            HumanMessage(content="oi"),
+            AIMessage(content="olá"),
+            SystemMessage(content="contexto tardio"),
+        ),
+        params={},
+        schema=None,
+        timeout_s=30,
+    )
+
+    payload = AnthropicProvider.build_payload(call)
+
+    assert payload["messages"] == [{"role": "user", "content": "oi"}]
+    assert payload["system"][0]["text"] == "contexto tardio"
 
 
 def test_a_trailing_assistant_turn_survives_on_the_groq_path() -> None:

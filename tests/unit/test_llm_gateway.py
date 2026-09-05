@@ -61,6 +61,7 @@ class FakeProvider:
     name: ClassVar[Provider] = "groq"
     answer: str = '{"reps": 8}'
     usage: tuple[int, int, int] = (11, 7, 0)
+    cache_creation: int = 0
     calls: list[ProviderRequest] = field(default_factory=list)
 
     async def complete(self, request: ProviderRequest) -> ProviderResponse:
@@ -70,6 +71,7 @@ class FakeProvider:
             input_tokens=self.usage[0],
             output_tokens=self.usage[1],
             cached_tokens=self.usage[2],
+            cache_creation_tokens=self.cache_creation,
         )
 
 
@@ -567,6 +569,27 @@ async def test_the_result_carries_what_the_ledger_will_need() -> None:
     assert result.model == resolved.primary.model
     assert (result.usage.input_tokens, result.usage.output_tokens) == (31, 12)
     assert result.usage.cached_tokens == 4
+
+
+async def test_cache_creation_tokens_survive_to_the_result() -> None:
+    """A cache *write* is reported apart from the input and the cached read.
+
+    Marking the Anthropic system prompt cacheable makes creation happen, and
+    the creation call is the expensive one. Dropping the count would let the
+    ledger row of S03-T07 report only the small uncached suffix, understating
+    the tenant's consumption exactly when it was largest.
+    """
+    fake = FakeProvider(cache_creation=2_048)
+
+    result = await gateway(fake).ainvoke(
+        agent="extraction",
+        role=LLMRole.EXTRACTOR,
+        tenant_id=7,
+        messages=turn(),
+        schema=Extracted,
+    )
+
+    assert result.usage.cache_creation_tokens == 2_048
 
 
 async def test_no_repr_of_a_result_or_a_request_carries_user_content() -> None:

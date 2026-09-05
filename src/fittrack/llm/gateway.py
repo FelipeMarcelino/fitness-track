@@ -137,6 +137,7 @@ class LLMGateway:
                 input_tokens=answer.input_tokens,
                 output_tokens=answer.output_tokens,
                 cached_tokens=answer.cached_tokens,
+                cache_creation_tokens=answer.cache_creation_tokens,
             ),
             agent=agent,
             role=role,

@@ -46,6 +46,18 @@ _CACHE_BREAKPOINT = {"type": "ephemeral"}
 _ROLES = {"human": "user", "ai": "assistant", "tool": "user"}
 
 
+def _conversation(messages: tuple[BaseMessage, ...]) -> tuple[BaseMessage, ...]:
+    """The turns Anthropic will see, with no trailing assistant among them.
+
+    The system messages are removed **first**, and the order matters: a
+    sequence ending `[human, ai, system]` has a system turn last, so a prefill
+    check running before the lift would find nothing to strip — and then the
+    lift would remove the system turn and leave the payload ending in
+    `assistant` anyway, which is the 400 this exists to prevent.
+    """
+    return _without_prefill(tuple(m for m in messages if m.type != "system"))
+
+
 def _without_prefill(messages: tuple[BaseMessage, ...]) -> tuple[BaseMessage, ...]:
     """Drop trailing assistant turns, which Anthropic reads as a prefill.
 
@@ -97,8 +109,7 @@ class AnthropicProvider:
             "max_tokens": params.pop("max_tokens", DEFAULT_MAX_TOKENS),
             "messages": [
                 {"role": _ROLES.get(message.type, "user"), "content": message.content}
-                for message in _without_prefill(request.messages)
-                if message.type != "system"
+                for message in _conversation(request.messages)
             ],
             **params,
         }
@@ -156,4 +167,8 @@ class AnthropicProvider:
             input_tokens=getattr(usage, "input_tokens", 0) or 0,
             output_tokens=getattr(usage, "output_tokens", 0) or 0,
             cached_tokens=getattr(usage, "cache_read_input_tokens", 0) or 0,
+            # The write side of the breakpoint above. Dropping it would let a
+            # cache-creation call — the expensive one — report only its small
+            # uncached suffix to the ledger of S03-T07.
+            cache_creation_tokens=getattr(usage, "cache_creation_input_tokens", 0) or 0,
         )

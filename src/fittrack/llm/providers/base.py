@@ -204,6 +204,10 @@ class ProviderResponse:
     input_tokens: int = 0
     output_tokens: int = 0
     cached_tokens: int = 0
+    # Anthropic reports a cache *write* apart from both the ordinary input
+    # count and the cached read (spec 7.4, cache row). Groq caches
+    # automatically and reports no such thing, so this stays zero there.
+    cache_creation_tokens: int = 0
 
 
 @runtime_checkable

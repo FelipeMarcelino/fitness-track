@@ -38,7 +38,15 @@ class TokenUsage:
 
     input_tokens: int = 0
     output_tokens: int = 0
+    # Read *from* the cache, at a discount.
     cached_tokens: int = 0
+    # Written *into* the cache, and reported apart from both of the above.
+    # Carried separately rather than folded into `input_tokens` because a
+    # cache write is priced differently from an ordinary input token, and
+    # `usage_ledger` (spec 5.2) has no column for it yet — folding it in
+    # would make the row add up while pricing it wrong, which is the harder
+    # error to notice. S03-T07 decides how to store and price it.
+    cache_creation_tokens: int = 0
 
 
 @dataclass(frozen=True, slots=True)
