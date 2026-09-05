@@ -44,8 +44,8 @@ Incluído:
   `test_graph_topology` — os dois testes de arquitetura que o `CLAUDE.md` promete para "a mesma PR
   que introduzir o que eles verificam";
 - grafo raiz da §8.3 completo, subgrafos com schema privado e contrato de falha parcial da §8.9;
-- `AsyncPostgresSaver`/`AsyncPostgresStore` ligados, com os grants que o `bootstrap.py` deixou
-  deliberadamente revogados, thread por tenant e poda de checkpoints;
+- `AsyncPostgresSaver`/`AsyncPostgresStore` ligados, com grants pós-`setup()`, serializer cifrado,
+  namespace injetado por tenant, principal exclusivo, thread por tenant e poda de checkpoints;
 - `process_batch` invocando o grafo — o handoff que a Sprint 02 deixou marcado em comentário;
 - `LLMGateway` com resolução por papel, retry, fallback, quota e `usage_ledger`;
 - agentes da ingestão: normalizer, extraction + mapa de RPE, resolver de exercícios;
@@ -128,10 +128,16 @@ o teste de arquitetura que sustenta a §8.8.
 
 **Plano de implementação:**
 
-1. `state.py` com `Target`, `RouteStep`, `PlanStage` e `GraphState` literalmente como a §8.2,
-   preservando a assimetria: quatro chaves com `operator.add` (`extracted_sets`, `persisted_set_ids`,
-   `outbound`, `errors`), `messages` com `add_messages`, e `analysis_result`/`recommendation`/
-   `query_result`/`health_flag` **sem** reducer porque têm escritor único.
+1. `state.py` com `Target`, `RouteStep`, `PlanStage` e a base do `GraphState` da §8.2, mais as erratas
+   obrigatórias desta sprint: `destination_identity_id` na entrada (o `identity_id` da última mensagem
+   da rajada, nunca inferido de `reply_to`) e `voice_output` na T21. As quatro listas concorrentes
+   (`extracted_sets`, `persisted_set_ids`, `outbound`, `errors`) usam `resettable_add`: para updates
+   normais ele delega a `operator.add`; um único `BatchReset([])` emitido pelo runner antes de um
+   **batch novo** substitui o valor acumulado. Uma lista vazia comum não reseta nada. O pin 0.6 não
+   oferece `Overwrite`, portanto o sentinel é nosso, fechado e testado — não um `dict` que o LLM possa
+   fabricar. `messages` usa `bounded_add_messages`, que preserva a semântica de `add_messages` e poda
+   deterministicamente para as 12 últimas. `analysis_result`/`recommendation`/`query_result`/
+   `health_flag` continuam **sem** reducer porque têm escritor único e são sobrescritas a cada batch.
 2. Declarar no mesmo módulo `CONCURRENT_KEYS` e `SINGLE_WRITER_KEYS` (com o ramo dono anotado). Uma
    chave nova que não apareça em nenhum dos dois **reprova o teste** — é o que impede o campo
    acrescentado sem decisão.
@@ -142,18 +148,24 @@ o teste de arquitetura que sustenta a §8.8.
    [ambiguidade #3](#3-channel_caps-no-graphstate-reprova-o-teste-de-isolamento-hoje). Separar
    `IMPORT_EXCEPTIONS` de `CAPS_EXCEPTIONS`, e acrescentar a asserção substituta: `state.py` menciona
    `channel_caps` exatamente uma vez, e apenas como anotação de campo.
+5. O teste do reducer cobre três transições distintas: fan-out do mesmo batch concatena; entrada vazia
+   não apaga; `BatchReset([])` vindo do runner apaga exatamente uma vez antes do batch seguinte.
+   `bounded_add_messages` é exercitado com 13+ mensagens e nunca devolve mais de 12.
 
 **Primeiro teste que deve falhar.**
 `tests/test_graph_reducers.py::test_a_parallel_stage_merges_every_concurrent_key` →
 `ModuleNotFoundError: No module named 'fittrack.graph.state'`. Depois do módulo existir, monta um
 `StateGraph` sintético com um `dispatch` devolvendo quatro `Send`, cada nó retornando todas as
 chaves de `CONCURRENT_KEYS`, e afirma `len(result["outbound"]) == 4` e `len(result["errors"]) == 4`.
-Remover um `operator.add` faz o LangGraph levantar `InvalidUpdateError`.
+Remover o reducer (ou trocar `resettable_add` por overwrite simples) faz o LangGraph levantar
+`InvalidUpdateError`; o teste separado de reset prova que o reducer ainda concatena updates normais.
 
 **Critérios de aceite:** `pytest tests/test_graph_reducers.py tests/unit/test_staging.py -v` verde;
 `make test-architecture` roda **dois** arquivos; `mypy --strict` verde sobre `GraphState`; um campo
 novo sem classificação reprova `test_every_state_key_is_classified` (demonstrado no PR com commit
-temporário revertido).
+temporário revertido); duas invocações no mesmo `thread_id` provam que as quatro listas do segundo
+batch não carregam nenhum item do primeiro, enquanto `messages`/`conversation_digest` atravessam a
+fronteira e `messages` permanece limitada a 12.
 
 **Tamanho:** M.
 
@@ -245,47 +257,80 @@ falha parcial da §8.9 — um ramo que explode não derruba o estágio.
 
 #### S03-T04 — Checkpointer, store and thread identity
 
-**Objetivo.** Ligar `AsyncPostgresSaver` e `AsyncPostgresStore`, devolver à aplicação o privilégio
-que o `bootstrap.py` revogou deliberadamente, fixar `thread_id` e podar checkpoints.
+**Objetivo.** Ligar `AsyncPostgresSaver` e `AsyncPostgresStore` por uma fronteira cifrada e escopada
+por tenant, conceder os privilégios somente depois que `setup()` criar as tabelas, fixar `thread_id`
+e podar checkpoints.
 
 **Spec.** §5.3, §8.4, §8.7, §19.1.
 
 **Depende de:** S03-T02.
 
-**Arquivos previstos:** modificar `graph/root.py`, `worker.py`, `settings.py`, `scripts/bootstrap.py`;
-criar `db/migrations/versions/_0006_langgraph_grants.py`,
+**Arquivos previstos:** modificar `graph/root.py`, `worker.py`, `settings.py`, `security/crypto.py`,
+`scripts/bootstrap.py`, `.env.example`, `docker-compose.yml`, `docker-compose.dev.yml`,
+`docker/postgres/initdb/00-roles.sh`, `scripts/init_dev_env.py`; criar `graph/persistence.py`,
+`graph/store.py`,
 `doc/adr/0010-fronteira-de-tenant-nas-tabelas-do-langgraph.md`,
-`tests/integration/test_graph_checkpoint.py`.
+`tests/unit/test_tenant_store.py`, `tests/integration/test_graph_checkpoint.py`. **Não existe migração
+de grant nas tabelas do LangGraph:** Alembic roda antes de `setup()` num banco limpo e não pode dar
+`GRANT` em relações que ainda não existem.
 
 **Plano de implementação:**
 
 1. `thread_id_for(tenant_id) -> f"tenant:{tenant_id}"` num único lugar, **nunca derivado do estado
    ou do LLM** (invariante 3). Teste por AST afirma que é a única construção no repositório.
-2. DSN do saver: psycopg fala libpq, então a URL vai como escrita, sem a tradução `asyncpg`. O
-   `bootstrap.py` já faz `.replace("+asyncpg","")` — **extrair para função compartilhada em vez de
-   duplicar**. O pool precisa de `kwargs={"autocommit": True, "row_factory": dict_row}`; sem isso o
-   saver falha na primeira gravação, em produção, não em teste.
-3. A migração `_0006` reverte o `REVOKE ALL` com `GRANT SELECT, INSERT, UPDATE, DELETE` nas seis
-   tabelas, e o `bootstrap.py` deixa de revogar.
-4. Retenção (§5.3, "não é opcional"): cron ARQ diário no padrão do `sweep_voice_audio` já existente,
+2. Um principal de login exclusivo, `fittrack_graph`, recebe `LANGGRAPH_DATABASE_URL` próprio, não é
+   membro de `fittrack_app`, é `NOSUPERUSER NOBYPASSRLS` e não recebe privilégio em tabela de domínio.
+   O saver/store nunca usam `DATABASE_URL` nem `MIGRATION_DATABASE_URL`. psycopg fala libpq, então a
+   URL perde apenas o sufixo `+asyncpg` por função compartilhada. O pool usa
+   `kwargs={"autocommit": True, "row_factory": dict_row}`.
+3. A ordem idempotente do bootstrap fica explícita e coberta por integração: **Alembic →
+   `saver.setup()`/`store.setup()` como owner → revogar o DML herdado por `fittrack_app` →
+   `configure_langgraph_grants()` conceder ao `fittrack_graph` o DML mínimo nas quatro relações
+   operacionais** (`checkpoints`, `checkpoint_blobs`, `checkpoint_writes`, `store`); as duas tabelas de
+   migração interna permanecem exclusivas do owner, pois o runtime nunca chama `setup()`. A função
+   pós-`setup()` valida as seis relações realmente descobertas e falha alto se a lista esperada e a
+   lista criada divergirem. Rodar de novo refaz revoke/grant sem erro; nenhuma migração referencia
+   essas relações.
+4. `PersistenceFactory.for_tenant(tenant_id)` constrói, sobre pools compartilhados, um
+   `TenantEncryptedSaver`: adaptador da porta pública de checkpointer que envolve **todo** valor de
+   canal — inclusive `str`/`int`/`bool`, que o PostgresSaver 2.0.25 embute no JSONB e não entrega ao
+   serializer — num envelope não primitivo antes de delegar. O delegate usa `EncryptedSerializer` do
+   próprio `langgraph-checkpoint` e `TenantCheckpointCipher` ligado a `thread_id_for(tenant_id)`; na
+   leitura o adaptador decifra e remove o envelope antes de o grafo ver o valor. O AAD inclui o
+   tenant/thread derivados pelo código; ler o blob com a fronteira de outro tenant falha autenticação.
+   `checkpoint`/`metadata` ficam restritos a versões, ids e uma allowlist de metadados sem conteúdo. A
+   fábrica compila a instância do grafo para aquela invocação, sem cache mutável de processo, e nunca
+   chama `setup()` no runtime.
+5. O `AsyncPostgresStore` bruto nunca é entregue a nó ou `Runtime`. `TenantScopedStore` implementa a
+   porta do LangGraph e prefixa **toda** operação `get/search/put/delete` com
+   `("tenant", str(tenant_id), "profile")`; o namespace fornecido pelo chamador é sempre sufixo e não
+   pode substituir nem escapar do prefixo. O wrapper também cifra o valor antes do JSONB com AAD
+   canônico de tenant + namespace + key e só ele decifra na leitura.
+6. Testes com dois tenants usam a mesma `key`, tentam deliberadamente um namespace com prefixo alheio
+   e provam resultados disjuntos. Uma consulta feita como owner confirma que o literal do usuário não
+   aparece em `checkpoint_blobs.blob`, `checkpoint_writes.blob` nem `store.value`; trocar os blobs
+   entre tenants falha autenticação. O teste procura o literal também no JSONB de
+   `checkpoints.checkpoint`/`metadata` e usa um `conversation_digest` escalar para provar que o
+   adaptador não deixa o atalho de primitivos furar o serializer. O teste inspeciona o banco bruto —
+   round-trip pela API sozinho não prova criptografia.
+7. Retenção (§5.3, "não é opcional"): cron ARQ diário no padrão do `sweep_voice_audio` já existente,
    apagando checkpoints antigos **exceto o último de cada thread** — é ele que carrega um `interrupt`
-   pendente.
-5. Fronteira das tabelas do LangGraph: ver
-   [ambiguidade #5](#5-rls-não-alcança-as-tabelas-do-langgraph) → **ADR-0010**.
+   pendente. Toda a fronteira acima fica registrada no **ADR-0010**.
 
 **Primeiro teste que deve falhar.**
-`test_the_application_principal_can_write_a_checkpoint` →
-`InsufficientPrivilege: permission denied for table checkpoints`, contra o banco saído do
-`make bootstrap`. **Falha pelo motivo que o próprio bootstrap previu** — é o teste mais barato de
-justificar da sprint.
+`test_the_graph_principal_can_write_only_after_post_setup_grants` →
+`InvalidAuthorizationSpecification: role "fittrack_graph" does not exist` (ou `permission denied`)
+contra o banco saído do `make bootstrap`. O teste executa o caminho de banco limpo; inverter a ordem e
+voltar a aplicar grant por Alembic produz `UndefinedTable` antes de `setup()` e reprova explicitamente.
 
-**Critérios de aceite:** `make bootstrap` duas vezes continua idempotente;
-`test_alembic_did_not_create_the_langgraph_tables` **continua verde** (a `_0006` concede privilégio,
-não cria tabela); `test_the_graph_principal_cannot_read_a_domain_table` verde; poda deixa exatamente
-1 checkpoint por thread.
+**Critérios de aceite:** `make bootstrap` duas vezes e a partir de banco vazio continua idempotente;
+`test_alembic_did_not_create_or_grant_the_langgraph_tables` verde; `fittrack_graph` grava/retoma estado
+cifrado (inclusive primitivos), não lê tabela de domínio e `fittrack_runtime` continua sem acesso
+direto às tabelas do LangGraph; namespace forjado não cruza tenant; literal sensível não aparece em
+nenhuma coluna do banco bruto; poda deixa exatamente 1 checkpoint por thread.
 
-**Tamanho:** G. Se a revisão da migração alongar, dividir em T04a (grants + ADR + principal) e T04b
-(retenção) — as metades são independentes.
+**Tamanho:** G. Se alongar, dividir em T04a (bootstrap pós-`setup()` + ADR + principal) e T04b
+(serializer + store escopado + retenção) — T04b depende da fronteira criada pela primeira metade.
 
 #### S03-T05 — Worker integration: `process_batch` invokes the graph
 
@@ -295,10 +340,12 @@ degradação.
 
 **Spec.** §4, §4.1, §4.2, §8.4, §8.7, §17.1, §9.4 regra 3.
 
-**Depende de:** S03-T02, S03-T03, S03-T04. **É a última da trilha A e a que B e C consomem.**
+**Depende de:** S03-T02, S03-T03, S03-T04, S03-T08 e S03-T26. **É a última da trilha A e cola as
+trilhas B, C e D no worker real.**
 
 **Arquivos previstos:** modificar `services/batch.py`, `graph/nodes/load_context.py`, `worker.py`;
-criar `graph/runner.py`, `tests/integration/test_graph_handoff.py`,
+criar `graph/runner.py`, `services/conversation_history.py`,
+`tests/integration/test_graph_handoff.py`, `tests/integration/test_conversation_state.py`,
 `tests/unit/test_initial_state.py`; modificar `doc/sprints/02-telegram-pipeline.md` (relatório de
 encerramento: handoff cumprido).
 
@@ -306,26 +353,43 @@ encerramento: handoff cumprido).
 
 1. Decifrar `combined_text` com o AAD correto e mapear para `raw_fragments`, **descartando
    `external_id_hash` e `media_ref`** — o primeiro por invariante 10, o segundo porque é referência
-   de acesso reutilizável (§20.6) e nada a jusante o lê.
-2. **Quem monta `channel_caps` é o worker, não o grafo.** A §4 põe o carregamento de capacidades
+   de acesso reutilizável (§20.6) e nada a jusante o lê. `raw_message_id` permanece como referência
+   interna auditável; o serializer tenant-bound da T04 garante que texto e turno nunca chegam em
+   claro às tabelas de checkpoint.
+2. Sob o lock do tenant, resolver o último `raw_message_id` do batch por query tenant-scoped e carregar
+   juntos `identity_id`, `channel` e `channel_message_id`. Esses valores originam
+   `destination_identity_id`, `origin_channel` e `reply_to`; se a linha não existir ou não pertencer ao
+   tenant, o batch falha antes do grafo. Nunca recuperar a identidade a partir de `reply_to`: dois
+   chats podem ter o mesmo `channel_message_id` e um tenant pode ter várias identidades.
+3. **Quem monta `channel_caps` é o worker, não o grafo.** A §4 põe o carregamento de capacidades
    antes do `ainvoke`; a §9.2 também lista um nó `load_context`. A leitura que concilia as duas com o
    AD-39: o **worker** (fora de `graph/`, logo autorizado a importar `channels/`) resolve
    `origin_channel`, `reply_to` e `channel_caps`; o **nó `load_context`** carrega o que é domínio —
    `profile`, `active_session`, `now_local`, quota. É isso que mantém `load_context.py` sem uma
    menção a `channel_caps`.
-3. `reply_to` e `origin_channel` vêm do **último item da rajada** (§4.2: "responde no canal da última
-   mensagem, que é onde o usuário está olhando").
-4. `astream(stream_mode=["updates","custom"])` em vez de `ainvoke` — é o que a §8.4 pede e o que a
+4. Antes de uma invocação normal, o runner lê o último checkpoint ainda sob o mesmo lock. Se o
+   `batch_id` mudou, envia `BatchReset([])` para `extracted_sets`, `persisted_set_ids`, `outbound` e
+   `errors`, e sobrescreve os campos de escritor único com os defaults do batch; se é retry do mesmo
+   `batch_id` ou `Command(resume=...)`, **não reseta** e retoma. Passar quatro listas vazias comuns é
+   proibido porque o reducer apenas as concatena e não apagaria o batch anterior.
+5. `messages` atravessa batches pelo mesmo thread, mas `bounded_add_messages` da T01 nunca deixa mais
+   de 12. A cada 20 interações concluídas, `ConversationHistoryService` carrega as 20 referências
+   canônicas de entrada/saída das tabelas de domínio, decifra só em memória, chama o papel `SUMMARY`
+   e faz `aupdate_state` de `conversation_digest` antes de `mark_done`; um watermark cifrado no
+   `TenantScopedStore` torna a atualização idempotente. Assim as oito mensagens que saem da janela
+   curta não precisam permanecer em claro nem crescer no checkpoint para alimentar o resumo.
+6. `astream(stream_mode=["updates","custom"])` em vez de `ainvoke` — é o que a §8.4 pede e o que a
    §20.1 consome depois. Nesta sprint o consumidor de `updates` é só o log estruturado.
-5. `durability` síncrono (§8.7) — **verificar a grafia contra a versão fixada** e testar o
+7. `durability` síncrono (§8.7) — **verificar a grafia contra a versão fixada** e testar o
    comportamento (checkpoint legível entre super-steps), nunca o nome do kwarg. Ver
    [risco #5](#riscos-e-mitigação).
-6. `interrupt`: gravar `interrupt:{tenant_id}` com TTL de 20 min (§17.1); no lote seguinte, se
+8. `interrupt`: gravar `interrupt:{tenant_id}` com TTL de 20 min (§17.1); no lote seguinte, se
    `turn.answers_clarification`, retomar por `Command(resume=...)`. A decisão é do normalizer
    (trilha B); a trilha A entrega a **máquina**. Ver
    [ambiguidade #6](#6-um-interrupt-expirado-no-redis-não-é-varrível).
-7. `GraphRecursionError` e `QuotaExceeded` → degradação graciosa + alerta, nunca silêncio.
-8. `mark_done` só depois do `astream` completar; falha vira `Retry` do ARQ, e o checkpointer garante
+9. `GraphRecursionError` e `QuotaExceeded` → degradação graciosa + alerta, nunca silêncio.
+10. `mark_done` só depois do `astream` e da manutenção do digest completarem; falha vira `Retry` do
+   ARQ, e o checkpointer garante
    que o retry não repete o trabalho já feito (§4.1).
 
 **Primeiro teste que deve falhar.**
@@ -333,13 +397,17 @@ encerramento: handoff cumprido).
 `TypeError: process_batch() got an unexpected keyword argument 'runner'`. Depois, com um spy:
 `assert spy.config["configurable"]["thread_id"] == f"tenant:{tenant_id}"`,
 `assert spy.config["recursion_limit"] == 40`,
+`assert spy.state["destination_identity_id"] == last_raw.identity_id` e
 `assert "external_id_hash" not in spy.state["raw_fragments"][0]`.
 
 **Critérios de aceite:** batch fica `done` só depois de o grafo terminar; matar o processo no meio do
 `astream` e reprocessar o mesmo `batch_id` **retoma do último super-step**; nenhum `external_id`,
 `external_id_hash`, `media_ref` ou `file_path` aparece no estado **serializado no checkpoint** (não
-só no log); o lock por tenant cobre o `astream` inteiro e o auto-extend de 30s sobrevive a um grafo
-de 60s.
+só no log), e nenhum texto do usuário aparece no banco bruto; dois batches consecutivos no mesmo
+thread não compartilham acumuladores, retry do mesmo batch não os apaga, 25 interações deixam no
+máximo 12 mensagens e atualizam o digest exatamente uma vez no marco 20; duas identidades com o mesmo
+`channel_message_id` entregam para a identidade do último `raw_message_id`; o lock por tenant cobre o
+`astream` inteiro e o auto-extend de 30s sobrevive a um grafo de 60s.
 
 **Tamanho:** G. Não dá para encolher: `ainvoke` sem construção de estado é intestável, e construção de
 estado sem `ainvoke` não prova nada.
@@ -737,8 +805,8 @@ que revoga qualquer membro do papel, para o `BYPASSRLS` não ficar alcançável 
 `tests/integration/test_outbound_claim.py`; modificar `services/outbound.py` (`claim_due` no store e
 no protocolo).
 
-> **Colisão de numeração de migração:** cinco tarefas de trilhas paralelas propõem migração sem
-> coordenar número entre si — T04 (`_0006_langgraph_grants`), T15 (`_0006_outbound_claim`), T08
+> **Colisão de numeração de migração:** quatro tarefas de trilhas paralelas propõem migração sem
+> coordenar número entre si — T15 (`_0006_outbound_claim`), T08
 > (`_0006_raw_message_text_extract`, ADR-0012) e T12 (`_0006_exercise_set_source`, ADR-0012), além
 > de T23 (`_0007_health_report_idempotency`) e T18 (`_0007_membership_identity_resolution`). Nenhuma
 > delas depende do conteúdo de outra, então não há ordem "correta" — só ordem de merge. **Resolver
@@ -925,9 +993,11 @@ junto com a trilha A, `channels/telegram/adapter.py` e `tests/unit/test_telegram
 
 **Plano de implementação.** `scheduled_at = now + Σ delays` implementa o espaçamento do §13.6 (o rate
 limiter por chat é o piso de 1s em runtime); reação de ack vira `OutboundBlock(kind="reaction",
-emoji=…, text=fallback_text, reply_to=…)`; ao fim, enfileira `drain:kick` por porta injetada —
-**best-effort**: kick que falha loga e não derruba o nó, porque o cron do drain (T16) é a rede de
-recuperação e um kick re-disparado pelo retry é inócuo.
+emoji=…, text=fallback_text, reply_to=…)`; toda chamada a `enqueue_response()` recebe
+`identity_id=state["destination_identity_id"]`, carregado do último `raw_message_id` pela T05 — nunca
+faz lookup por `(channel, reply_to)`. Ao fim, enfileira `drain:kick` por porta injetada — **best-effort**:
+kick que falha loga e não derruba o nó, porque o cron do drain (T16) é a rede de recuperação e um kick
+re-disparado pelo retry é inócuo.
 
 **A degradação de reação fecha no adaptador.** `deliver` copia `VoiceOutput.fallback_text` para
 `OutboundBlock.text` e persiste o campo cifrado com o restante do payload. Quando o Telegram rejeita
@@ -949,7 +1019,8 @@ no-op, não em bolha nova. Mesmo padrão do `_reply_group` do STT (`stt.py:1122`
 
 **Primeiro teste que deve falhar.**
 `test_deliver_enqueues_one_group_per_response_with_staggered_bubble_scheduling` — 3 bolhas → 1
-`group_id`, `seq` 0..2, `scheduled_at` crescente com piso de 1s, `reply_to` presente, kick disparado.
+`group_id`, `seq` 0..2, `scheduled_at` crescente com piso de 1s, `reply_to` e
+`destination_identity_id` presentes, kick disparado.
 
 **Critérios de aceite:** nenhum enfileiramento fora de `deliver` — `make test-architecture` verde com
 o nó presente; e2e (com A+B+D): rajada → batch → grafo → `voice_agent` → `deliver` → drain → bolhas no
@@ -957,7 +1028,8 @@ fake de canal, na ordem e espaçadas; o nó que falha **depois** do enqueue (kic
 repetido não cria segundo grupo — a segunda execução cai no `ON CONFLICT (group_id, seq) DO NOTHING`;
 `RetryPolicy(max_attempts=3)` no registro do nó; reação rejeitada pelo conjunto do Telegram e reação
 cujo alvo desapareceu enviam o `fallback_text` redigido pelo `voice`; `mode="media"` inesperado falha
-alto e não enfileira nem descarta silenciosamente.
+alto e não enfileira nem descarta silenciosamente; duas identidades com o mesmo
+`channel_message_id` provam que o enqueue recebe exatamente a identidade da última mensagem da rajada.
 
 **Tamanho:** M isolado; G contando a integração.
 
@@ -1007,7 +1079,8 @@ Chave nova no estado, **escritor único, sem reducer**:
 ```python
 # src/fittrack/graph/state.py
 class GraphState(TypedDict):
-    outbound: Annotated[list[dict], operator.add]   # entrada do voice, muitos escritores
+    destination_identity_id: int                    # entrada, identidade da última mensagem
+    outbound: Annotated[list[dict], resettable_add] # entrada do voice, muitos escritores
     voice_output: dict[str, object] | None          # saída do voice, um escritor
 ```
 
@@ -1501,7 +1574,7 @@ preserva o raciocínio que levou a cada uma.
 | 2 | RPE e RIR contraditórios: preservar os dois, marcar baixa confiança, nunca corrigir em silêncio | **ADR-0013** |
 | 3 | Separar `IMPORT_EXCEPTIONS` de `CAPS_EXCEPTIONS` no teste de isolamento | decisão na T01 |
 | 4 | `current_step` vive no schema privado de cada subgrafo | suposição no PR |
-| 5 | A fronteira do checkpoint é o `thread_id` + principal dedicado | **ADR-0010** |
+| 5 | A fronteira do checkpoint é `thread_id` + principal dedicado + cifra ligada ao tenant; o Store sempre injeta namespace de tenant | **ADR-0010** |
 | 6 | ZSET `interrupts:pending` pontuado pelo deadline | suposição no PR |
 | 7 | Proveniência **plural e imutável** por spans validados, com chave canônica de idempotência | **ADR-0012** |
 | 8 | Fronteira de manutenção cross-tenant por `SECURITY DEFINER` estreita | **ADR-0010** |
@@ -1547,8 +1620,10 @@ perder o registro do treino. Escrever a justificação com cuidado importa mais 
 Uma única PR `doc/spec-errata-sprint-03` corrige, todas com a mesma justificativa ("a spec se
 contradiz ou omite; a decisão está registrada"): §5.2/§9.5 (proveniência plural e `source_text`),
 §9.5 (quantidade literal e conversão determinística), §9.4 (`steps` vs. `stages`), §8.2
-(`voice_output`), §10 (delta `0.06`), §23 (`resolver.md`) e §6.4/§24 (indexação do resumo). A emenda da §13.1
-(*kind* `session_summary`) fica para a Sprint 04, junto da T25 que a consome.
+(`voice_output`, `destination_identity_id`, reset dos acumuladores e janela de 12 mensagens), §5.3/§8.4
+(serializer cifrado e Store com namespace injetado), §10 (delta `0.06`), §23 (`resolver.md`) e
+§6.4/§24 (indexação do resumo). A emenda da §13.1 (*kind* `session_summary`) fica para a Sprint 04,
+junto da T25 que a consome.
 
 ## A fronteira de manutenção cross-tenant
 
@@ -1563,22 +1638,8 @@ corretamente as impede.**
 | S03-T14 | `workout_session` de todos os tenants | scheduler não pode usar repository sem tenant |
 | S03-T04 | tabelas do LangGraph | `SET LOCAL app.tenant_id` vive na conexão SQLAlchemy; o saver tem pool psycopg próprio |
 
-Resolver quatro vezes é resolver errado uma vez. **Decidido (#5, #8, #22): um único ADR — o
-[ADR-0010](#os-adrs-exigidos-antes-da-implementação), "fronteira de manutenção cross-tenant"**,
-que fixa o padrão comum
-(função `SECURITY DEFINER` estreita, `search_path` fixo, sem SQL arbitrário, retornando o mínimo, com
-role dedicada `NOLOGIN NOSUPERUSER NOBYPASSRLS` e grants coluna-a-coluna no estilo da `_0002`/`_0004`)
-e que as quatro tarefas instanciam. A fronteira do checkpointer (#5) e o fechamento automático de
-sessão (#22) são seções dele, não ADRs próprios.
-
-**Nesta sprint o ADR-0010 é instanciado por duas tarefas** — T04 (checkpointer) e T15 (claim da fila).
-As outras duas, T14 e o fechamento automático da T25, chegam na Sprint 04 e **reusam** o padrão; é
-exatamente para elas não inventarem um segundo mecanismo que o ADR é escrito agora.
-
-**O anti-padrão a proibir explicitamente no ADR:** usar o DSN de owner, ou dar `BYPASSRLS` ao runtime.
-Um teste de claim que "funciona" contra conexão de superuser é o erro mais caro possível aqui — as
-policies existem e nunca são avaliadas.
-[ADR-0010](#os-adrs-a-escrever), "fronteira de manutenção cross-tenant"**, que fixa o padrão comum
+Resolver quatro vezes é resolver errado uma vez. **Decidido (#5, #8, #22): um único
+[ADR-0010](#os-adrs-exigidos-antes-da-implementação), "fronteira de manutenção cross-tenant"**, que fixa o padrão comum
 sem confundir os dois principais. O **runtime** e o principal dedicado do saver permanecem
 `NOSUPERUSER NOBYPASSRLS`. Para varrer uma tabela de domínio sob `FORCE ROW LEVEL SECURITY`, a porta é
 uma função `SECURITY DEFINER` estreita, com `search_path` fixo, sem SQL arbitrário e retornando o
@@ -1586,11 +1647,15 @@ mínimo; seu dono é uma role separada `NOLOGIN NOSUPERUSER BYPASSRLS`, sem memb
 grants de tabela/coluna/sequence possíveis, no padrão efetivo da `fittrack_identity` da `_0002`. O
 runtime recebe apenas `EXECUTE` na função e **não** herda a role dona. Sem o `BYPASSRLS` do dono, a
 função global continua sujeita à policy, não tem `app.tenant_id` e vê zero linhas. Já as tabelas do
-LangGraph usam o segundo padrão do mesmo ADR: `thread_id` construído pelo código mais um principal
-`NOBYPASSRLS` com DML limitado às seis tabelas, sem poder sobre tabelas de domínio; ali não existe
-razão para atravessar uma policy de tenant. As quatro tarefas instanciam a seção correspondente. A
-fronteira do checkpointer (#5) e o fechamento automático de sessão (#22) são seções dele, não ADRs
-próprios.
+LangGraph usam o segundo padrão do mesmo ADR: `thread_id` construído pelo código, principal de login
+`fittrack_graph NOBYPASSRLS` com DML limitado às tabelas operacionais e **sem** poder sobre tabelas de
+domínio, `TenantEncryptedSaver` + `EncryptedSerializer` ligados ao tenant/thread e
+`TenantScopedStore` que injeta o namespace antes de toda operação e cifra o valor. Ali não existe RLS
+porque o schema é da biblioteca; isolamento lógico, menor privilégio e confidencialidade contra dump
+são três camadas distintas e testadas. O grant é obrigatoriamente pós-`setup()` no bootstrap — nunca
+Alembic tentando referenciar tabela inexistente.
+As quatro tarefas instanciam a seção correspondente. A fronteira do checkpointer (#5) e o fechamento
+automático de sessão (#22) são seções dele, não ADRs próprios.
 
 **Nesta sprint o ADR-0010 é instanciado diretamente por duas tarefas** — T04 usa o padrão do saver
 `NOBYPASSRLS`; T15 usa a função com dono `BYPASSRLS` e runtime apenas com `EXECUTE`. A T18 estende a
@@ -1642,10 +1707,13 @@ subgrafo — no pai ele viajaria em todo checkpoint e criaria campo com dois esc
 #### 5. RLS não alcança as tabelas do LangGraph
 Uma policy ingênua (`thread_id = 'tenant:' || current_setting(...)`) bloquearia **todo** acesso ao
 checkpoint, não só o cruzado, porque o saver tem pool psycopg próprio sem gancho para `SET LOCAL`.
-**Leitura recomendada:** a fronteira é o `thread_id`, com defesa em profundidade por principal
-dedicado com DML restrito às seis tabelas. **Exige ADR** — ver
-[fronteira de manutenção](#a-fronteira-de-manutenção-cross-tenant). Alternativa recusada: GUC fixada
-no DSN, incompatível com pool.
+**Leitura recomendada:** a fronteira tem quatro peças inseparáveis: `thread_id` derivado pelo código;
+principal `fittrack_graph` com DML restrito às tabelas operacionais; `TenantEncryptedSaver` que força
+todo valor de estado pelo `EncryptedSerializer` ligado ao tenant; e `TenantScopedStore` que prefixa
+cada namespace e cifra seus valores. O Store bruto nunca chega ao grafo. **Exige ADR** — ver
+[fronteira de manutenção](#a-fronteira-de-manutenção-cross-tenant).
+Alternativas recusadas: GUC fixada no DSN, incompatível com pool; confiar só no `thread_id`, que não
+escopa `AsyncPostgresStore`; e persistir texto decifrado em blobs legíveis num dump.
 
 #### 6. Um `interrupt` expirado no Redis não é varrível
 A §8.7 diz "grava-se `interrupt:{tenant_id}` com TTL de 20 min. O scheduler varre expirados a cada
@@ -1810,12 +1878,19 @@ km → m, `Decimal("60")` para min → s (a mesma lacuna existia para `duration_
 - [ ] `make test-architecture` roda **três** arquivos — `test_channel_isolation`, `test_graph_reducers`
   e `test_graph_topology` — e passa;
 - [ ] `thread_id` é construído em exatamente um lugar, a partir do código;
-- [ ] a aplicação escreve e retoma checkpoint; a poda deixa 1 por thread;
+- [ ] `fittrack_graph` escreve e retoma checkpoint cifrado, não lê domínio, e os grants só são aplicados
+  pelo bootstrap depois de `setup()`; a poda deixa 1 por thread;
 - [ ] matar o worker no meio do grafo e reprocessar retoma do último super-step;
+- [ ] duas rajadas consecutivas no mesmo thread não repetem `outbound`, `errors`, séries extraídas nem
+  IDs persistidos da anterior; `messages` nunca passa de 12 e o digest avança a cada 20 interações;
+- [ ] toda operação do Store recebe namespace injetado pelo código; dois tenants com a mesma key não
+  se enxergam e o Store bruto não é exposto ao grafo;
 - [ ] nenhum nome de modelo em Python; nenhum prompt embutido em string;
 - [ ] `external_id`, `external_id_hash`, `file_path` e `media_ref` provados ausentes **do estado
   serializado no checkpoint** (trilha A). *A prova equivalente para log e span do Datadog é a T20, que
   foi adiada — ver [Riscos](#riscos-e-mitigação);*
+- [ ] texto de usuário/turno/saída provado ausente em claro de `checkpoint_blobs`,
+  `checkpoint_writes` e `store`; mover um blob entre tenants falha autenticação;
 - [ ] exercício privado de outro tenant não é lido, sugerido nem persistido;
 - [ ] um relato de dor no mesmo turno de um registro de treino **grava a série** e recebe o aviso
   (§12.1 + invariante 6);
@@ -1837,13 +1912,15 @@ km → m, `Decimal("60")` para min → s (a mesma lacuna existia para `duration_
 | `recursion_limit=40` é mais apertado do que parece | Alto — ingestão + clarificação + 2 estágios chega a 20–25 super-steps | Teste na T02 medindo o caminho mais profundo e afirmando margem ≥ 40% |
 | `durability` mudou de grafia dentro do pin `>=0.6,<0.8` | **Crítico** — kwarg errado não levanta erro, degrada para assíncrono em silêncio, e o super-step perdido pode ser o `persistence` de uma série | Teste de **comportamento** (ler checkpoint entre super-steps), nunca asserção sobre o nome do argumento |
 | Pool psycopg sem `autocommit=True, row_factory=dict_row` | Alto — falha só na primeira gravação, em produção | T04 com teste de integração que grava de fato |
+| Grant do LangGraph em Alembic | **Crítico** — num banco limpo a migração referencia tabelas que só o `setup()` seguinte criaria e o bootstrap para antes de criá-las | Grant exclusivamente no passo pós-`setup()` do bootstrap; integração parte de banco vazio e roda duas vezes |
+| Saver sem envelope de primitivos/serializer ou Store bruto exposto | **Crítico** — conteúdo decifrado reaparece nos blobs/JSONB (o saver 2.0.25 embute primitivos antes do serializer) e um namespace omitido cruza tenants | T04 inspeciona todas as colunas como owner, testa digest escalar e falha de autenticação cross-tenant e entrega ao grafo somente wrappers ligados ao tenant |
 | Lease expirando com o envio em voo | Médio — bolha duplicada | Lease generoso (300s) > pior espera do limiter + timeout HTTP, documentado com teste; a §17.4 já assume at-least-once |
 | Teste de claim rodando como superuser/owner | **Crítico** — policies existem e nunca são avaliadas; "funciona" e não protege | Testes de claim rodam como `fittrack_runtime` e **provam o negativo** |
 | `try/except` largo do subgrafo engolindo `NameError` | Alto — bug vira "não consegui agora" para sempre | Registrar tipo e traceback em log estruturado; alerta separa `TransientLLMError` do resto |
-| `checkpoint_blobs` domina o banco | Médio — guarda o estado inteiro por super-step, e o `GraphState` carrega `raw_fragments` + `messages` + `outbound` | Poda diária na T04 + métrica `graph_checkpoint_bytes` como acompanhamento |
+| `checkpoint_blobs` domina o banco | Médio — guarda o estado inteiro cifrado por super-step, e o `GraphState` carrega `raw_fragments` + `messages` + `outbound` | Janela de 12 mensagens + poda diária na T04 + métrica `graph_checkpoint_bytes` como acompanhamento |
 | Determinismo de LLM em teste | Médio — suíte instável | `temperature=0` reduz variância mas não a elimina: unitários usam providers falsos; golden set mede ao vivo, separado |
 | Custo do judge em toda PR da trilha A | Baixo — o filtro do CI inclui `src/fittrack/graph/` | Não mudar o filtro; **saber**: contar o custo no encerramento e não confundir "judge não calibrado" com regressão |
-| Colisão de numeração de migração `_0006`/`_0007` | Baixo — T04, T15, T08 e T12 propõem `_0006`; T18 e T23 propõem `_0007` | Resolver no merge: primeira a mergear fica com o número, as demais renumeiam o próprio arquivo (nome e `down_revision`) |
+| Colisão de numeração de migração `_0006`/`_0007` | Baixo — T15, T08 e T12 propõem `_0006`; T18 e T23 propõem `_0007` | Resolver no merge: primeira a mergear fica com o número, as demais renumeiam o próprio arquivo (nome e `down_revision`) |
 | Trilha D chegar tarde e bloquear T19 | Alto — `deliver` sem `VoiceOutput` não integra | **Mitigado:** T21 é só contrato e sobe na onda 2. T19 continua escrita contra estado fake; a colagem no grafo é PR separada |
 | T28 subir antes de `voice → deliver` estar coberto | **Crítico** — desliga o único caminho de resposta que existe hoje e o substituto não está provado; o sintoma é **silêncio**, não erro | T28 é a última PR da sprint, com teste de integração dos cinco motivos de recusa antes do merge |
 | Cortar T27 por parecer "produto" | **Crítico** — sem onboarding ninguém consente `workout_data`, e toda nota de voz é recusada para sempre | **Resolvido:** T27 declarada não-cortável no escopo decidido |
@@ -1857,9 +1934,16 @@ km → m, `Decimal("60")` para min → s (a mesma lacuna existia para `duration_
 - Os cinco alvos do router existem desde esta sprint; `analysis` e `recommendation` degradam
   honestamente em vez de não existirem (ambiguidade #14).
 - `current_step` vive no schema privado de cada subgrafo, não no `GraphState` do pai.
-- O worker monta `channel_caps`, `origin_channel` e `reply_to`; o nó `load_context` carrega só domínio
-  — é o que mantém o AD-39 e o `load_context.py` limpos.
-- `reply_to` vem do último item da rajada (§4.2).
+- O worker monta `channel_caps` e resolve `destination_identity_id`, `origin_channel` e `reply_to` a
+  partir do último `raw_message_id`; o nó `load_context` carrega só domínio — é o que mantém o AD-39 e
+  o `load_context.py` limpos. `reply_to` nunca é usado para descobrir a identidade.
+- Os quatro acumuladores com reducer recebem `BatchReset` somente quando o checkpoint anterior tem
+  outro `batch_id`; retry/resume do batch corrente preserva o estado.
+- `messages` usa reducer limitado a 12; o digest a cada 20 interações é reconstruído das referências
+  canônicas cifradas, não de uma janela de checkpoint que cresça até 20.
+- `TenantEncryptedSaver` força inclusive primitivos pelo serializer cifrado ligado ao tenant/thread;
+  todo acesso ao Store passa por wrapper que injeta namespace e cifra valores; os objetos brutos não
+  são dependência de nó.
 - O lease do claim reusa `next_retry_at`; nenhuma coluna nova.
 - `group_id` derivado do `raw_message_id` + motivo é o padrão de idempotência para toda resposta em
   caminho reentregável. Um grupo aleatório fresco nesse caminho é bug.
